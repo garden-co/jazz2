@@ -9,16 +9,15 @@
 //!
 //! - `MemoryStorage`/`OpfsBTreeStorage` provide synchronous storage (from jazz_tools::storage)
 //! - `WasmScheduler` implements `Scheduler` using `spawn_local` (debounced)
-//! - `JsSyncSender` implements `SyncSender` bridging to a JS callback (worker-bridge only; server sync via `connect()`)
 //! - `WasmRuntime` wraps `Rc<RefCell<RuntimeCore<...>>>`
 
-use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Once;
 
 use jazz_tools::binding_support::parse_external_object_id;
+#[cfg(target_arch = "wasm32")]
 use js_sys::Function;
 use js_sys::Uint8Array;
 use serde::Serialize;
@@ -73,7 +72,7 @@ use jazz_tools::query_manager::session::{Session, WriteContext};
 #[cfg(target_arch = "wasm32")]
 use jazz_tools::query_manager::types::{Row, RowDescriptor};
 use jazz_tools::query_manager::types::{SchemaHash, Value};
-use jazz_tools::runtime_core::{ReadDurabilityOptions, RuntimeCore, Scheduler, SyncSender};
+use jazz_tools::runtime_core::{ReadDurabilityOptions, RuntimeCore, Scheduler};
 #[cfg(target_arch = "wasm32")]
 use jazz_tools::runtime_core::{SubscriptionDelta, SubscriptionHandle};
 #[cfg(target_arch = "wasm32")]
@@ -84,8 +83,7 @@ use jazz_tools::storage::OpfsBTreeStorage;
 use jazz_tools::storage::{MemoryStorage, Storage};
 use jazz_tools::sync_manager::QueryPropagation;
 use jazz_tools::sync_manager::{
-    ClientId, Destination, DurabilityTier, InboxEntry, OutboxEntry, ServerId, Source, SyncManager,
-    SyncPayload,
+    ClientId, DurabilityTier, InboxEntry, ServerId, Source, SyncManager, SyncPayload,
 };
 
 use crate::query::parse_query;
@@ -371,85 +369,6 @@ impl Scheduler for WasmScheduler {
 }
 
 // ============================================================================
-// JsSyncSender
-// ============================================================================
-
-/// Bridges outbound sync messages from the Rust runtime to a JS callback.
-///
-/// This sender is intentionally kept for the **worker-bridge path only**:
-/// the worker WASM runtime routes `"client"`-destination outbox messages
-/// back to the main thread via postMessage. Server-bound messages go through
-/// the Rust-owned WebSocket transport (`WasmRuntime::connect`) instead; any
-/// `"server"` destination that arrives here is silently dropped by the JS
-/// callback registered in `jazz-worker.ts`.
-struct JsSyncSenderInner {
-    callback: RefCell<Option<Function>>,
-    use_binary_encoding: bool,
-}
-
-#[derive(Clone)]
-pub struct JsSyncSender {
-    inner: Rc<JsSyncSenderInner>,
-}
-
-// SAFETY: WASM is single-threaded; the JS callback never crosses threads.
-// `Send` is required only because `RuntimeCore::sync_sender` is typed
-// `Box<dyn SyncSender + Send>` for the multi-threaded Tokio backend.
-unsafe impl Send for JsSyncSender {}
-
-impl JsSyncSender {
-    fn new(use_binary_encoding: bool) -> Self {
-        Self {
-            inner: Rc::new(JsSyncSenderInner {
-                callback: RefCell::new(None),
-                use_binary_encoding,
-            }),
-        }
-    }
-
-    fn set_callback(&self, callback: Function) {
-        *self.inner.callback.borrow_mut() = Some(callback);
-    }
-}
-
-impl SyncSender for JsSyncSender {
-    fn send_sync_message(&self, message: OutboxEntry) {
-        if let Some(ref callback) = *self.inner.callback.borrow() {
-            let is_catalogue = message.payload.is_catalogue();
-            let (destination_kind, destination_id) = match message.destination {
-                Destination::Server(server_id) => ("server", server_id.0.to_string()),
-                Destination::Client(client_id) => ("client", client_id.0.to_string()),
-            };
-            if self.inner.use_binary_encoding || destination_kind == "client" {
-                if let Ok(payload_bytes) = message.payload.to_bytes() {
-                    let payload_js = Uint8Array::from(payload_bytes.as_slice());
-                    let _ = callback.call4(
-                        &JsValue::NULL,
-                        &JsValue::from_str(destination_kind),
-                        &JsValue::from_str(&destination_id),
-                        &payload_js.into(),
-                        &JsValue::from_bool(is_catalogue),
-                    );
-                }
-            } else {
-                let payload_json = message.payload.to_json().unwrap();
-                let _ = callback.call4(
-                    &JsValue::NULL,
-                    &JsValue::from_str(destination_kind),
-                    &JsValue::from_str(&destination_id),
-                    &JsValue::from_str(&payload_json),
-                    &JsValue::from_bool(is_catalogue),
-                );
-            }
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// ============================================================================
 // WasmRuntime
 // ============================================================================
 
@@ -461,12 +380,6 @@ impl SyncSender for JsSyncSender {
 #[wasm_bindgen]
 pub struct WasmRuntime {
     core: Rc<RefCell<WasmCoreType>>,
-    /// JS callback holder for outbound sync messages (worker-bridge path only).
-    ///
-    /// `on_sync_message_to_send` installs the JS-side callback here. The worker
-    /// WASM runtime uses it to forward `"client"`-destination outbox messages to
-    /// the main thread via postMessage. Server sync goes through `connect()`.
-    sync_sender: JsSyncSender,
     upstream_server_id: RefCell<Option<ServerId>>,
     /// Label for tracing (e.g. "local", "edge", or "client").
     tier_label: &'static str,
@@ -485,8 +398,10 @@ impl WasmRuntime {
     /// * `user_branch` - User's branch name (e.g., "main")
     /// * `tier` - Optional node durability tier ("local", "edge", "global").
     ///            Set for server nodes to enable ack emission.
-    /// * `use_binary_encoding` - Optional outgoing sync payload encoding mode.
-    ///   `Some(true)` emits postcard bytes (`Uint8Array`), otherwise JSON strings.
+    /// * `use_binary_encoding` - Deprecated: previously controlled sync payload encoding
+    ///   for the JS callback path (JsSyncSender). Outbox routing is now handled by
+    ///   `WorkerClient::installOnRuntime` which always uses postcard bytes.  This
+    ///   parameter is retained for API compatibility and is ignored.
     #[wasm_bindgen(constructor)]
     pub fn new(
         schema_json: &str,
@@ -494,7 +409,7 @@ impl WasmRuntime {
         env: &str,
         user_branch: &str,
         tier: Option<String>,
-        use_binary_encoding: Option<bool>,
+        _use_binary_encoding: Option<bool>,
     ) -> Result<WasmRuntime, JsError> {
         #[cfg(feature = "console_error_panic_hook")]
         console_error_panic_hook::set_once();
@@ -544,14 +459,10 @@ impl WasmRuntime {
         // Create components
         let storage: Box<dyn Storage> = Box::new(MemoryStorage::new());
         let scheduler = WasmScheduler::new();
-        let sync_sender = JsSyncSender::new(use_binary_encoding.unwrap_or(false));
 
         // Create RuntimeCore
         let mut core = RuntimeCore::new(schema_manager, storage, scheduler);
         core.set_tier_label(tier_label);
-        // Install the JS-callback sender so `batched_tick` drains outbox
-        // entries to the worker bridge (no transport handle here).
-        core.set_sync_sender(Box::new(sync_sender.clone()));
 
         // Wrap in Rc<RefCell>
         let core_rc = Rc::new(RefCell::new(core));
@@ -569,7 +480,6 @@ impl WasmRuntime {
 
         Ok(WasmRuntime {
             core: core_rc,
-            sync_sender,
             upstream_server_id: RefCell::new(None),
             tier_label,
         })
@@ -677,12 +587,6 @@ impl WasmRuntime {
             ));
         }
         Ok(Some(sequence as u64))
-    }
-
-    /// Register a callback for outgoing sync messages.
-    #[wasm_bindgen(js_name = onSyncMessageToSend)]
-    pub fn on_sync_message_to_send(&self, callback: Function) {
-        self.sync_sender.set_callback(callback);
     }
 
     // =========================================================================
@@ -1632,7 +1536,7 @@ impl WasmRuntime {
         user_branch: &str,
         db_name: &str,
         tier: Option<String>,
-        use_binary_encoding: bool,
+        _use_binary_encoding: bool,
     ) -> Result<WasmRuntime, JsError> {
         #[cfg(feature = "console_error_panic_hook")]
         console_error_panic_hook::set_once();
@@ -1697,14 +1601,10 @@ impl WasmRuntime {
         }
 
         let scheduler = WasmScheduler::new();
-        let sync_sender = JsSyncSender::new(use_binary_encoding);
 
         // Create RuntimeCore
         let mut core = RuntimeCore::new(schema_manager, storage, scheduler);
         core.set_tier_label(tier_label);
-        // Install the JS-callback sender so `batched_tick` drains outbox
-        // entries to the worker bridge (no transport handle here).
-        core.set_sync_sender(Box::new(sync_sender.clone()));
 
         // Wrap in Rc<RefCell>
         let core_rc = Rc::new(RefCell::new(core));
@@ -1722,7 +1622,6 @@ impl WasmRuntime {
 
         Ok(WasmRuntime {
             core: core_rc,
-            sync_sender,
             upstream_server_id: RefCell::new(None),
             tier_label,
         })
@@ -1833,6 +1732,19 @@ impl WasmRuntime {
                 let reason_js = JsValue::from_str(&reason);
                 let _ = send_fn.0.call1(&JsValue::NULL, &reason_js);
             });
+    }
+}
+
+// ============================================================================
+// WasmRuntime — crate-internal accessors (not exposed to JS)
+// ============================================================================
+
+#[cfg(target_arch = "wasm32")]
+impl WasmRuntime {
+    /// Expose the inner `Rc<RefCell<WasmCoreType>>` to crate-internal consumers
+    /// (e.g. `worker_host::WorkerHost`).  Not exported to JS.
+    pub(crate) fn inner_core(&self) -> &Rc<RefCell<WasmCoreType>> {
+        &self.core
     }
 }
 

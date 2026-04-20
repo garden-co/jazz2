@@ -48,6 +48,7 @@ otel = [
 
 [dependencies]
 opfs-btree = { path = "../opfs-btree", version = "0.1.0" }
+bincode = "1"
 futures = "0.3"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }

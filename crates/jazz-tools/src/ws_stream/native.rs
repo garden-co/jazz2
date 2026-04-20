@@ -16,8 +16,8 @@ impl StreamAdapter for NativeWsStream {
         Ok(Self { inner: ws })
     }
 
-    async fn send(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        self.inner.send(Message::Binary(data.to_owned())).await
+    async fn send(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        self.inner.send(Message::Binary(data)).await
     }
 
     async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -66,7 +66,7 @@ mod tests {
             .await
             .unwrap();
         ready_rx.await.unwrap();
-        stream.send(b"hello ws").await.unwrap();
+        stream.send(b"hello ws".to_vec()).await.unwrap();
         assert_eq!(stream.recv().await.unwrap().unwrap(), b"hello ws".to_vec());
     }
 

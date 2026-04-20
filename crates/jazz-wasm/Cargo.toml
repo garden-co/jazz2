@@ -48,6 +48,17 @@ web-sys = { version = "0.3", features = [
   "WorkerNavigator",
 ] }
 
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "Worker",
+  "DedicatedWorkerGlobalScope",
+  "MessageEvent",
+  "MessagePort",
+  "MessageChannel",
+  "ErrorEvent",
+]
+
 [features]
 default = ["console_error_panic_hook"]
 

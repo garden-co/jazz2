@@ -24,6 +24,7 @@ pub mod sync_tracer;
 #[cfg(test)]
 mod test_row_history;
 pub mod wire_types;
+pub mod worker_frame;
 
 #[cfg(feature = "runtime-tokio")]
 pub mod runtime_tokio;
@@ -32,6 +33,7 @@ pub use runtime_tokio as jazz_tokio;
 
 pub mod transport_protocol;
 pub use transport_protocol as jazz_transport;
+pub mod peer_stream_pump;
 pub mod transport_manager;
 #[cfg(feature = "transport-websocket")]
 pub mod ws_stream;

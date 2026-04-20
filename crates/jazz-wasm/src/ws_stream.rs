@@ -14,8 +14,8 @@ impl StreamAdapter for WasmWsStream {
         Ok(Self { inner: ws })
     }
 
-    async fn send(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        self.inner.send(WsMessage::Binary(data.to_vec())).await
+    async fn send(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        self.inner.send(WsMessage::Binary(data)).await
     }
 
     async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {

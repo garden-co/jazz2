@@ -85,7 +85,6 @@ function makeClient(runtimeOverrides: Partial<Runtime> = {}) {
     executeSubscription: () => {},
     unsubscribe: () => {},
     onSyncMessageReceived: () => {},
-    onSyncMessageToSend: () => {},
     addServer: () => {},
     removeServer: () => {},
     addClient: () => "00000000-0000-0000-0000-000000000001",

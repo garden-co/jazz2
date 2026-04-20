@@ -33,6 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use tracing::{debug, debug_span, info, trace, trace_span};
 
@@ -116,6 +117,15 @@ impl SyncSender for VecSyncSender {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Channel-based outbox path for the Rust `WorkerHost`.
+///
+/// When installed via `set_client_outbox`, all outbox entries that are not
+/// claimed by a transport are sent over this channel instead of going through
+/// `SyncSender`. Takes priority over `sync_sender`.
+pub struct ClientOutboxHandle {
+    pub tx: UnboundedSender<OutboxEntry>,
 }
 
 /// Handle to a subscription managed by RuntimeCore.
@@ -255,6 +265,9 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     /// the server side, where the runtime fans out via `ConnectionEventHub`
     /// instead of a WebSocket connection).
     pub(crate) sync_sender: Option<Box<dyn SyncSender + Send>>,
+    /// Channel-based outbox path used by the Rust `WorkerHost` (Task 6).
+    /// Takes priority over `sync_sender` when installed.
+    pub(crate) client_outbox: Option<ClientOutboxHandle>,
 
     /// Parked sync messages (from network).
     parked_sync_messages: Vec<InboxEntry>,
@@ -304,6 +317,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             storage_write_pending_flush: false,
             transport: None,
             sync_sender: None,
+            client_outbox: None,
             parked_sync_messages: Vec::new(),
             parked_sync_messages_by_server_seq: HashMap::new(),
             next_expected_server_seq: HashMap::new(),
@@ -530,6 +544,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// the per-connection `ConnectionEventHub` channels.
     pub fn set_sync_sender(&mut self, sender: Box<dyn SyncSender + Send>) {
         self.sync_sender = Some(sender);
+    }
+
+    /// Install a channel-based outbox path used by the Rust `WorkerHost`.
+    ///
+    /// When installed, outbox entries not claimed by the transport are sent over
+    /// this channel instead of `sync_sender`. Takes priority over `sync_sender`.
+    pub fn set_client_outbox(&mut self, handle: ClientOutboxHandle) {
+        self.client_outbox = Some(handle);
     }
 
     #[cfg(test)]

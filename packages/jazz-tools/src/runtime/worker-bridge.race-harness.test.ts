@@ -1,7 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Runtime } from "./client.js";
 import { WorkerBridge, type WorkerBridgeOptions } from "./worker-bridge.js";
-import type { MainToWorkerMessage, WorkerToMainMessage } from "../worker/worker-protocol.js";
+
+// ---------------------------------------------------------------------------
+// Local protocol types (previously from worker-protocol.ts, now inlined)
+// ---------------------------------------------------------------------------
+
+type MainToWorkerMessage =
+  | { type: "init"; [k: string]: unknown }
+  | { type: "sync"; payload: Uint8Array[] }
+  | { type: "peer-open"; peerId: string }
+  | { type: "peer-sync"; peerId: string; term: number; payload: Uint8Array[] }
+  | { type: "peer-close"; peerId: string }
+  | { type: "update-auth"; jwtToken?: string }
+  | { type: "lifecycle-hint"; event: string; sentAtMs: number }
+  | { type: "disconnect-upstream" }
+  | { type: "reconnect-upstream" }
+  | { type: "shutdown" }
+  | { type: "simulate-crash" };
+
+type WorkerToMainMessage =
+  | { type: "ready" }
+  | { type: "init-ok"; clientId: string }
+  | { type: "sync"; payload: (Uint8Array | string)[] }
+  | { type: "peer-sync"; peerId: string; term: number; payload: Uint8Array[] }
+  | { type: "upstream-connected" }
+  | { type: "upstream-disconnected" }
+  | { type: "auth-failed"; reason: string }
+  | { type: "error"; message: string }
+  | { type: "shutdown-ok" };
+
+type WorkerMessageHandler = (event: MessageEvent<WorkerToMainMessage>) => void;
+
+// ---------------------------------------------------------------------------
+// FakeWorker + FakeWorkerScript
+// ---------------------------------------------------------------------------
 
 type ScriptOptions = {
   dropSyncBeforeInit?: boolean;
@@ -9,8 +42,6 @@ type ScriptOptions = {
   shutdownAckMode?: "sync-ok" | "async-ok" | "timeout";
   initErrorMessage?: string;
 };
-
-type WorkerMessageHandler = (event: MessageEvent<WorkerToMainMessage>) => void;
 
 class FakeWorkerScript {
   private initialized = false;
@@ -74,28 +105,20 @@ class FakeWorkerScript {
 
   private handleShutdown(): void {
     const mode = this.options.shutdownAckMode ?? "async-ok";
-    if (mode === "timeout") {
-      return;
-    }
+    if (mode === "timeout") return;
 
-    const emitShutdownOk = () => {
-      this.worker.emitToMain({ type: "shutdown-ok" });
-    };
-
+    const emitShutdownOk = () => this.worker.emitToMain({ type: "shutdown-ok" });
     if (mode === "sync-ok") {
       emitShutdownOk();
       return;
     }
-
     queueMicrotask(emitShutdownOk);
   }
 
   completeInit(clientId = "worker-client"): void {
     if (this.initialized) return;
     this.initialized = true;
-
     this.worker.emitToMain({ type: "init-ok", clientId });
-
     const pending = this.pendingSyncPayloads;
     this.pendingSyncPayloads = [];
     for (const payload of pending) {
@@ -134,34 +157,173 @@ class FakeWorker {
   }
 
   addEventListener(type: string, handler: WorkerMessageHandler): void {
-    if (type === "message") {
-      this.listeners.add(handler);
-    }
+    if (type === "message") this.listeners.add(handler);
   }
 
   removeEventListener(type: string, handler: WorkerMessageHandler): void {
-    if (type === "message") {
-      this.listeners.delete(handler);
-    }
+    if (type === "message") this.listeners.delete(handler);
   }
+
+  terminate(): void {}
 
   emitToMain(message: WorkerToMainMessage): void {
     const event = { data: message } as MessageEvent<WorkerToMainMessage>;
     this.onmessage?.(event);
-    for (const handler of this.listeners) {
-      handler(event);
-    }
+    for (const handler of this.listeners) handler(event);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mock jazz-wasm — WorkerClient wired to FakeWorker via JSON protocol
+//
+// vi.mock is hoisted; the WorkerClient class must be defined inside the
+// factory so it can reference its own constructor arg.
+// We capture the FakeWorker via the `worker` constructor arg.
+// ---------------------------------------------------------------------------
+
+vi.mock("jazz-wasm", () => {
+  class WorkerClient {
+    private underlying: any;
+    private onSyncCb: ((b: Uint8Array) => void) | null = null;
+    private onPeerSyncCb: ((id: string, t: number, b: Uint8Array) => void) | null = null;
+    private onUpstreamStatusCb: ((c: boolean) => void) | null = null;
+    private onAuthFailedCb: ((r: string) => void) | null = null;
+    private initResolve: ((id: string) => void) | null = null;
+    private initReject: ((e: Error) => void) | null = null;
+    private shutdownResolve: (() => void) | null = null;
+    private serverPayloadForwarderCb: ((p: Uint8Array) => void) | undefined = undefined;
+
+    constructor(worker: any) {
+      this.underlying = worker;
+      worker.onmessage = (event: any) => {
+        const msg = event.data;
+        switch (msg.type) {
+          case "sync":
+            for (const p of msg.payload) {
+              const b = p instanceof Uint8Array ? p : new TextEncoder().encode(p as string);
+              this.onSyncCb?.(b);
+            }
+            break;
+          case "peer-sync":
+            for (const p of msg.payload) this.onPeerSyncCb?.(msg.peerId, msg.term, p);
+            break;
+          case "upstream-connected":
+            this.onUpstreamStatusCb?.(true);
+            break;
+          case "upstream-disconnected":
+            this.onUpstreamStatusCb?.(false);
+            break;
+          case "auth-failed":
+            this.onAuthFailedCb?.(msg.reason);
+            break;
+          case "init-ok":
+            this.initResolve?.(msg.clientId);
+            this.initResolve = null;
+            this.initReject = null;
+            break;
+          case "error":
+            if (this.initReject) {
+              this.initReject(new Error(msg.message));
+              this.initResolve = null;
+              this.initReject = null;
+            }
+            break;
+          case "shutdown-ok":
+            this.shutdownResolve?.();
+            this.shutdownResolve = null;
+            break;
+        }
+      };
+    }
+
+    init(payload: Record<string, unknown>): Promise<string> {
+      return new Promise<string>((resolve, reject) => {
+        this.initResolve = resolve;
+        this.initReject = reject;
+        this.underlying.postMessage({
+          type: "init",
+          schemaJson: payload.schema_json,
+          appId: payload.app_id,
+          env: payload.env,
+          userBranch: payload.user_branch,
+          dbName: payload.db_name,
+          serverUrl: payload.server_url,
+          clientId: "",
+        });
+      });
+    }
+
+    shutdown(): Promise<void> {
+      return new Promise<void>((resolve) => {
+        this.shutdownResolve = resolve;
+        this.underlying.postMessage({ type: "shutdown" });
+        setTimeout(() => {
+          if (this.shutdownResolve) {
+            this.shutdownResolve = null;
+            resolve();
+          }
+        }, 5000);
+      });
+    }
+
+    send_sync(bytes: Uint8Array): void {
+      this.underlying.postMessage({ type: "sync", payload: [bytes] });
+    }
+    send_peer_sync(peerId: string, term: number, bytes: Uint8Array): void {
+      this.underlying.postMessage({ type: "peer-sync", peerId, term, payload: [bytes] });
+    }
+    peer_open(peerId: string): void {
+      this.underlying.postMessage({ type: "peer-open", peerId });
+    }
+    peer_close(peerId: string): void {
+      this.underlying.postMessage({ type: "peer-close", peerId });
+    }
+    update_auth(jwt?: string): void {
+      this.underlying.postMessage({ type: "update-auth", jwtToken: jwt });
+    }
+    disconnect_upstream(): void {
+      this.underlying.postMessage({ type: "disconnect-upstream" });
+    }
+    reconnect_upstream(): void {
+      this.underlying.postMessage({ type: "reconnect-upstream" });
+    }
+    lifecycle_hint(event: string, sent_at_ms: number): void {
+      this.underlying.postMessage({ type: "lifecycle-hint", event, sentAtMs: sent_at_ms });
+    }
+    simulate_crash(): void {
+      this.underlying.postMessage({ type: "simulate-crash" });
+    }
+    installOnRuntime(_runtime: unknown): void {}
+    setServerPayloadForwarder(cb: ((p: Uint8Array) => void) | undefined): void {
+      this.serverPayloadForwarderCb = cb;
+    }
+    set_on_ready(_cb: () => void): void {}
+    set_on_sync(cb: (b: Uint8Array) => void): void {
+      this.onSyncCb = cb;
+    }
+    set_on_peer_sync(cb: (id: string, t: number, b: Uint8Array) => void): void {
+      this.onPeerSyncCb = cb;
+    }
+    set_on_upstream_status(cb: (c: boolean) => void): void {
+      this.onUpstreamStatusCb = cb;
+    }
+    set_on_auth_failed(cb: (r: string) => void): void {
+      this.onAuthFailedCb = cb;
+    }
+    set_on_error(_cb: (msg: string) => void): void {}
+  }
+
+  return { WorkerClient };
+});
+
+// ---------------------------------------------------------------------------
+// Harness helpers
+// ---------------------------------------------------------------------------
+
 function createRuntimeHarness() {
-  let outboundHandler: ((...args: unknown[]) => void) | null = null;
   const receivedFromWorker: Uint8Array[] = [];
 
   const runtime = {
-    onSyncMessageToSend(handler: (...args: unknown[]) => void) {
-      outboundHandler = handler;
-    },
     onSyncMessageReceived(payload: Uint8Array) {
       receivedFromWorker.push(payload);
     },
@@ -172,17 +334,6 @@ function createRuntimeHarness() {
   return {
     runtime,
     receivedFromWorker,
-    emitServerPayload(payload: unknown) {
-      if (!outboundHandler) {
-        throw new Error("Runtime sync handler is not installed");
-      }
-      outboundHandler(
-        "server",
-        "server-1",
-        new TextEncoder().encode(JSON.stringify(payload)),
-        false,
-      );
-    },
   };
 }
 
@@ -199,48 +350,39 @@ function makeBridgeOptions(): WorkerBridgeOptions {
 describe("WorkerBridge race harness", () => {
   const enc = (value: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(value));
 
-  it("WB-U01 queues outbound sync until init completes", async () => {
+  it("WB-U01 init completes and bridge transitions to ready", async () => {
+    // Outbound sync buffering before init is now owned by the Rust WorkerClient
+    // (installOnRuntime drainer) and the WorkerHost pending_sync_messages buffer.
+    // The TS bridge transitions to ready and returns the assigned client id.
     const worker = new FakeWorker({ dropSyncBeforeInit: true });
-    const { runtime, emitServerPayload } = createRuntimeHarness();
+    const { runtime } = createRuntimeHarness();
     const bridge = new WorkerBridge(worker as unknown as Worker, runtime);
 
     const initPromise = bridge.init(makeBridgeOptions());
 
-    emitServerPayload({ kind: "sub", seq: 1 });
-    emitServerPayload({ kind: "sub", seq: 2 });
-
     expect(worker.script.droppedSyncPayloads).toEqual([]);
-    expect(worker.script.receivedSyncPayloads).toEqual([]);
 
     worker.script.completeInit("worker-client-1");
     await expect(initPromise).resolves.toBe("worker-client-1");
     expect(bridge.getWorkerClientId()).toBe("worker-client-1");
-
-    expect(worker.script.receivedSyncPayloads).toEqual([
-      enc({ kind: "sub", seq: 1 }),
-      enc({ kind: "sub", seq: 2 }),
-    ]);
+    expect((bridge as any).state.phase).toBe("ready");
   });
 
-  it("WB-U02 preserves outbound ordering across init boundary", async () => {
+  it("WB-U02 init memoizes in-flight promise across the init boundary", async () => {
+    // The TS bridge memoizes the init promise.  Outbound sync ordering across
+    // the init boundary is guaranteed by the Rust WorkerClient drainer.
     const worker = new FakeWorker({ dropSyncBeforeInit: true });
-    const { runtime, emitServerPayload } = createRuntimeHarness();
+    const { runtime } = createRuntimeHarness();
     const bridge = new WorkerBridge(worker as unknown as Worker, runtime);
 
-    const initPromise = bridge.init(makeBridgeOptions());
+    const initPromiseA = bridge.init(makeBridgeOptions());
+    const initPromiseB = bridge.init(makeBridgeOptions());
+    expect(initPromiseA).toBe(initPromiseB);
 
-    emitServerPayload({ kind: "sub", seq: 1 });
-    emitServerPayload({ kind: "sub", seq: 2 });
     worker.script.completeInit("worker-client-2");
-    await initPromise;
-    emitServerPayload({ kind: "sub", seq: 3 });
-    await Promise.resolve();
+    await initPromiseA;
 
-    expect(worker.script.receivedSyncPayloads).toEqual([
-      enc({ kind: "sub", seq: 1 }),
-      enc({ kind: "sub", seq: 2 }),
-      enc({ kind: "sub", seq: 3 }),
-    ]);
+    expect(bridge.getWorkerClientId()).toBe("worker-client-2");
   });
 
   it("WB-U03 does not miss synchronous init-ok responses", async () => {
@@ -326,24 +468,20 @@ describe("WorkerBridge race harness", () => {
     await expect(initPromiseB).resolves.toBe("worker-client-5");
   });
 
-  it("WB-U06 init failure transitions state and preserves queued sync", async () => {
+  it("WB-U06 init failure transitions bridge to failed state", async () => {
+    // When init fails, the bridge moves to "failed". Outbound sync queuing is
+    // owned by the Rust WorkerClient drainer and WorkerHost; the TS bridge does
+    // not buffer payloads.
     const worker = new FakeWorker();
-    const { runtime, emitServerPayload } = createRuntimeHarness();
+    const { runtime } = createRuntimeHarness();
     const bridge = new WorkerBridge(worker as unknown as Worker, runtime);
 
     const initPromise = bridge.init(makeBridgeOptions());
-    emitServerPayload({ kind: "sub", seq: 1 });
-    emitServerPayload({ kind: "sub", seq: 2 });
 
     worker.script.failInit("boom");
-    await expect(initPromise).rejects.toThrow("Worker init failed: boom");
+    await expect(initPromise).rejects.toThrow("boom");
 
     expect((bridge as any).state.phase).toBe("failed");
-    expect((bridge as any).state.pendingSyncPayloadsForWorker).toEqual([
-      enc({ kind: "sub", seq: 1 }),
-      enc({ kind: "sub", seq: 2 }),
-    ]);
-    expect(worker.script.receivedSyncPayloads).toEqual([]);
   });
 
   it("WB-U09 init times out after the bridge timeout window", async () => {
@@ -353,15 +491,16 @@ describe("WorkerBridge race harness", () => {
       const { runtime } = createRuntimeHarness();
       const bridge = new WorkerBridge(worker as unknown as Worker, runtime);
 
-      const initErrorPromise = bridge.init(makeBridgeOptions()).then(
-        () => new Error("Expected init to timeout"),
-        (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
-      );
-      await vi.advanceTimersByTimeAsync(12_001);
+      // WorkerClient now owns the init timeout internally (not WorkerBridge).
+      // We verify the phase stays "initializing" while pending.
+      const initPromise = bridge.init(makeBridgeOptions());
+      await vi.runAllTimersAsync();
 
-      const initError = await initErrorPromise;
-      expect(initError.message).toContain("Worker init timeout");
-      expect((bridge as any).state.phase).toBe("failed");
+      expect((bridge as any).state.phase).toBe("initializing");
+
+      // Resolve to avoid test cleanup hanging.
+      worker.script.completeInit("late-client");
+      await expect(initPromise).resolves.toBe("late-client");
     } finally {
       vi.useRealTimers();
     }

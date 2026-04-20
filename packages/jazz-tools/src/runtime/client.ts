@@ -12,7 +12,6 @@ import {
   buildEndpointUrl,
   applyUserAuthHeaders,
   type AuthFailureReason,
-  type RuntimeSyncOutboxCallback,
 } from "./sync-transport.js";
 import { resolveClientSessionStateSync } from "./client-session.js";
 import { mapAuthReason } from "./auth-state.js";
@@ -129,8 +128,6 @@ export interface Runtime {
   executeSubscription(handle: number, on_update: Function): void;
   unsubscribe(handle: number): void;
   onSyncMessageReceived(payload: Uint8Array | string, seq?: number | null): void;
-  /** Route outbox messages to the transport layer. Required for WASM worker-bridge; no-op for NAPI/RN (Rust owns the transport). */
-  onSyncMessageToSend?(callback: RuntimeSyncOutboxCallback): void;
   addServer(serverCatalogueStateHash?: string | null, nextSyncSeq?: number | null): void;
   removeServer(): void;
   addClient(): string;

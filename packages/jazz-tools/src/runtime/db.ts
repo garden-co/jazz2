@@ -51,7 +51,7 @@ import {
 } from "./file-storage.js";
 import { analyzeRelations } from "../codegen/relation-analyzer.js";
 import { TabLeaderElection, type LeaderRole, type LeaderSnapshot } from "./tab-leader-election.js";
-import type { WorkerLifecycleEvent } from "../worker/worker-protocol.js";
+import type { WorkerLifecycleEvent } from "./worker-bridge.js";
 import { normalizeBuiltQuery, type BuiltRelation } from "./query-builder-shape.js";
 import {
   appendWorkerRuntimeWasmUrl,

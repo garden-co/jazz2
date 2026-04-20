@@ -1585,7 +1585,7 @@ mod install_transport_tests {
             futures::future::pending::<()>().await;
             unreachable!()
         }
-        async fn send(&mut self, _data: &[u8]) -> Result<(), Self::Error> {
+        async fn send(&mut self, _data: Vec<u8>) -> Result<(), Self::Error> {
             Ok(())
         }
         async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -8213,5 +8213,67 @@ fn remove_client_ignores_parked_messages_from_other_clients() {
             .get_client(bob)
             .is_some(),
         "bob should be preserved"
+    );
+}
+
+#[test]
+fn client_outbox_preempts_sync_sender_for_client_bound_entries() {
+    // Model: add_server_rehydrates_visible_rows_from_storage_after_restart (tests.rs:2072).
+    // Build a minimal RuntimeCore, add a server so inserts generate outbox entries,
+    // then verify entries arrive on the channel and bypass sync_sender.
+    use futures::channel::mpsc;
+
+    let app_id = crate::schema_manager::AppId::from_name("client-outbox-test");
+    let schema_manager = SchemaManager::new(
+        crate::sync_manager::SyncManager::new(),
+        test_schema(),
+        app_id,
+        "dev",
+        "main",
+    )
+    .unwrap();
+    let mut core = RuntimeCore::new(schema_manager, MemoryStorage::new(), NoopScheduler);
+    core.immediate_tick();
+
+    // Install the channel-based outbox path.
+    let (tx, mut rx) = mpsc::unbounded::<OutboxEntry>();
+    core.set_client_outbox(crate::runtime_core::ClientOutboxHandle { tx });
+
+    // Also install a VecSyncSender — it must stay empty when client_outbox wins.
+    core.set_sync_sender(Box::new(VecSyncSender::new()));
+
+    // Add a server so the runtime has someone to address outbox entries to.
+    let server_id = ServerId::new();
+    core.add_server(server_id);
+
+    // Insert a row — this generates an outbox entry destined for the server.
+    core.insert("users", user_insert_values(ObjectId::new(), "alice"), None)
+        .expect("insert should succeed");
+
+    // Drive the outbox flush.
+    core.batched_tick();
+
+    // Drain the channel synchronously.
+    let mut drained = Vec::new();
+    while let Ok(entry) = rx.try_recv() {
+        drained.push(entry);
+    }
+
+    assert!(
+        !drained.is_empty(),
+        "client_outbox should receive at least one entry; sync_sender intercepted them instead"
+    );
+
+    // sync_sender must not have received anything.
+    let vec_sender = core
+        .sync_sender
+        .as_ref()
+        .expect("VecSyncSender should still be installed")
+        .as_any()
+        .downcast_ref::<VecSyncSender>()
+        .expect("sync_sender should be VecSyncSender");
+    assert!(
+        vec_sender.take().is_empty(),
+        "sync_sender must not see entries when client_outbox is installed"
     );
 }

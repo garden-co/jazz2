@@ -549,6 +549,10 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 if let Some(handle) = self.transport.as_ref() {
                     handle.send_outbox(msg);
                 }
+            } else if let Some(client_outbox) = self.client_outbox.as_ref() {
+                if client_outbox.tx.unbounded_send(msg).is_err() {
+                    // Receiver dropped — the handle is effectively gone. Do not requeue.
+                }
             } else if let Some(sync_sender) = self.sync_sender.as_ref() {
                 sync_sender.send_sync_message(msg);
             } else {

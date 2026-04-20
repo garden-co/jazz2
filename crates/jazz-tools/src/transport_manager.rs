@@ -15,7 +15,13 @@ pub trait TickNotifier: 'static {
 pub trait StreamAdapter: Sized {
     type Error: std::fmt::Display;
     async fn connect(url: &str) -> Result<Self, Self::Error>;
-    async fn send(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    async fn send(&mut self, data: Vec<u8>) -> Result<(), Self::Error>;
+    async fn send_batch(&mut self, frames: Vec<Vec<u8>>) -> Result<(), Self::Error> {
+        for frame in frames {
+            self.send(frame).await?;
+        }
+        Ok(())
+    }
     async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
     async fn close(&mut self);
 }
@@ -377,7 +383,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
     /// - `AuthFailure` — server sent `ServerEvent::Error { code: Unauthorized }`
     /// - `NetworkError` — any other failure (network drop, parse error, etc.)
     async fn do_handshake(ws: &mut W, frame: Vec<u8>) -> HandshakeResult {
-        if let Err(e) = ws.send(&frame).await {
+        if let Err(e) = ws.send(frame).await {
             return HandshakeResult::NetworkError(e.to_string());
         }
         let resp_bytes = match ws.recv().await {
@@ -585,7 +591,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     let Some(entry) = out else { return ConnectedExit::Shutdown; };
                     let Ok(bytes) = serde_json::to_vec(&entry) else { continue; };
                     let frame = frame_encode(&bytes);
-                    if ws.send(&frame).await.is_err() { return ConnectedExit::NetworkError; }
+                    if ws.send(frame).await.is_err() { return ConnectedExit::NetworkError; }
                 }
                 incoming = ws.recv() => {
                     match incoming {
@@ -794,7 +800,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     let Some(entry) = out else { return WasmConnectedExit::Shutdown; };
                     let Ok(bytes) = serde_json::to_vec(&entry) else { continue; };
                     let frame = frame_encode(&bytes);
-                    if ws.send(&frame).await.is_err() { return WasmConnectedExit::NetworkError; }
+                    if ws.send(frame).await.is_err() { return WasmConnectedExit::NetworkError; }
                 }
                 incoming = ws.recv().fuse() => {
                     match incoming {
@@ -871,8 +877,8 @@ mod tests {
                 inbound,
             })
         }
-        async fn send(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-            self.sent.push(data.to_vec());
+        async fn send(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+            self.sent.push(data);
             Ok(())
         }
         async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -928,12 +934,8 @@ mod tests {
             })
         }
 
-        async fn send(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-            self.controller
-                .sent_frames
-                .lock()
-                .unwrap()
-                .push(data.to_vec());
+        async fn send(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+            self.controller.sent_frames.lock().unwrap().push(data);
             Ok(())
         }
 
@@ -1228,6 +1230,18 @@ mod tests {
 
         handle.disconnect();
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), task).await;
+    }
+
+    #[tokio::test]
+    async fn mock_stream_send_batch_default_fans_out() {
+        let mut s = MockStream {
+            sent: Vec::new(),
+            inbound: VecDeque::new(),
+        };
+        s.send_batch(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(s.sent, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
     }
 
     #[tokio::test]
