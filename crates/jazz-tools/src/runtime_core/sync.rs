@@ -39,6 +39,35 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .collect()
     }
 
+    pub fn request_batch_settlements(&mut self, batch_ids: Vec<crate::row_histories::BatchId>) {
+        if batch_ids.is_empty() {
+            return;
+        }
+
+        let server_ids = self
+            .schema_manager
+            .query_manager()
+            .sync_manager()
+            .connected_server_ids();
+        if server_ids.is_empty() {
+            return;
+        }
+
+        let mut unique_batch_ids = Vec::with_capacity(batch_ids.len());
+        let mut seen = std::collections::HashSet::new();
+        for batch_id in batch_ids {
+            if seen.insert(batch_id) {
+                unique_batch_ids.push(batch_id);
+            }
+        }
+
+        let sync_manager = self.schema_manager.query_manager_mut().sync_manager_mut();
+        for server_id in server_ids {
+            sync_manager.request_batch_settlements_from_server(server_id, unique_batch_ids.clone());
+        }
+        self.immediate_tick();
+    }
+
     // =========================================================================
     // Sync Operations
     // =========================================================================

@@ -335,6 +335,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Create a new RuntimeCore.
     pub fn new(mut schema_manager: SchemaManager, mut storage: S, scheduler: Sch) -> Self {
         let _ = schema_manager.ensure_current_schema_persisted(&mut storage);
+        schema_manager
+            .query_manager_mut()
+            .set_auto_apply_query_settled(false);
         let rejected_batch_ids = storage
             .scan_local_batch_records()
             .map(|records| {

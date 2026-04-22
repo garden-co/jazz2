@@ -222,6 +222,25 @@ impl SyncManager {
         });
     }
 
+    pub(super) fn mark_client_row_batch_known(
+        &mut self,
+        client_id: ClientId,
+        object_id: ObjectId,
+        branch_name: BranchName,
+        batch_id: BatchId,
+    ) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+
+        client.sent_metadata.insert(object_id);
+        client
+            .sent_batch_ids
+            .entry((object_id, branch_name))
+            .or_default()
+            .insert(batch_id);
+    }
+
     pub(super) fn queue_initial_sync_to_client_with_storage<H: Storage + ?Sized>(
         &mut self,
         storage: &H,
@@ -315,7 +334,7 @@ impl SyncManager {
             .entry((object_id, branch_name))
             .or_default()
             .insert(batch_id);
-        self.row_batch_interest
+        self.query_row_batch_interest
             .entry(RowBatchKey::new(object_id, branch_name, batch_id))
             .or_default()
             .insert(client_id);

@@ -953,6 +953,23 @@ impl RnRuntime {
         })
     }
 
+    pub fn request_batch_settlements(&self, batch_ids: Vec<String>) -> Result<(), JazzRnError> {
+        with_panic_boundary("request_batch_settlements", || {
+            let batch_ids = batch_ids
+                .into_iter()
+                .map(|batch_id| {
+                    parse_batch_id_input(&batch_id)
+                        .map_err(|message| JazzRnError::InvalidUuid { message })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            core.request_batch_settlements(batch_ids);
+            Ok(())
+        })
+    }
+
     pub fn drain_rejected_batch_ids(&self) -> Result<Vec<String>, JazzRnError> {
         with_panic_boundary("drain_rejected_batch_ids", || {
             let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {

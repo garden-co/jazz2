@@ -1,6 +1,6 @@
 use super::*;
 use crate::batch_fate::LocalBatchMember;
-use crate::row_histories::RowState;
+use crate::row_histories::{RowState, patch_row_batch_state};
 use crate::storage::metadata_from_row_locator;
 
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
@@ -155,6 +155,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 | crate::batch_fate::BatchSettlement::AcceptedTransaction {
                     visible_members, ..
                 } => {
+                    let mut visibility_changes = Vec::new();
                     for member in visible_members {
                         self.resolve_ack_watchers_for_key(
                             crate::sync_manager::RowBatchKey::new(
@@ -164,6 +165,22 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                             ),
                             acked_tier,
                         );
+                        if let Ok(Some(update)) = patch_row_batch_state(
+                            &mut self.storage,
+                            member.object_id,
+                            &member.branch_name,
+                            member.batch_id,
+                            None,
+                            Some(acked_tier),
+                        ) {
+                            visibility_changes.push(update);
+                        }
+                    }
+                    if !visibility_changes.is_empty() {
+                        let query_manager = self.schema_manager.query_manager_mut();
+                        for update in visibility_changes {
+                            query_manager.enqueue_row_visibility_change(update);
+                        }
                     }
                 }
                 crate::batch_fate::BatchSettlement::Missing { .. }
@@ -319,8 +336,23 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         //    was just processed and made the schema available).
         self.schema_manager.process(&mut self.storage);
 
-        // 2b. Release QuerySettled notifications whose upstream stream watermark
-        // has definitely been applied.
+        // 2b. Apply replayable batch settlements before collecting subscription
+        // updates so settlement-driven visibility changes land in the same tick.
+        let received_batch_settlements = self
+            .schema_manager
+            .query_manager_mut()
+            .sync_manager_mut()
+            .take_pending_batch_settlements();
+        if !received_batch_settlements.is_empty() {
+            for settlement in received_batch_settlements {
+                self.apply_received_batch_settlement(settlement);
+            }
+            self.schema_manager.process(&mut self.storage);
+        }
+
+        // 2c. Release QuerySettled notifications whose upstream stream watermark
+        // has definitely been applied, after any replayable settlements from the
+        // same turn have updated local row visibility.
         let ready_query_settled = {
             let pending = self
                 .schema_manager
@@ -362,20 +394,6 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     query_manager
                         .apply_query_settled(pending_settled.query_id, pending_settled.tier);
                 }
-            }
-            self.schema_manager.process(&mut self.storage);
-        }
-
-        // 2c. Apply replayable batch settlements before collecting subscription
-        // updates so settlement-driven visibility changes land in the same tick.
-        let received_batch_settlements = self
-            .schema_manager
-            .query_manager_mut()
-            .sync_manager_mut()
-            .take_pending_batch_settlements();
-        if !received_batch_settlements.is_empty() {
-            for settlement in received_batch_settlements {
-                self.apply_received_batch_settlement(settlement);
             }
             self.schema_manager.process(&mut self.storage);
         }

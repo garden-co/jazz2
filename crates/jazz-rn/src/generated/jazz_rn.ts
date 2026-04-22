@@ -741,6 +741,7 @@ export interface RnRuntimeInterface {
   ) /*throws*/ : string;
   loadLocalBatchRecord(batchId: string) /*throws*/ : string | undefined;
   loadLocalBatchRecords() /*throws*/ : string;
+  requestBatchSettlements(batchIds: Array<string>) /*throws*/ : void;
   /**
    * Register a callback that fires when the transport receives an auth
    * rejection from the server during the WS handshake.
@@ -1171,6 +1172,22 @@ export class RnRuntime
         },
         /*liftString:*/ FfiConverterString.lift
       )
+    );
+  }
+
+  requestBatchSettlements(batchIds: Array<string>): void /*throws*/ {
+    uniffiCaller.rustCallWithError(
+      /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+        FfiConverterTypeJazzRnError
+      ),
+      /*caller:*/ (callStatus) => {
+        return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_request_batch_settlements(
+          uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+          FfiConverterArrayString.lower(batchIds),
+          callStatus
+        );
+      },
+      /*liftString:*/ FfiConverterString.lift
     );
   }
 

@@ -65,8 +65,10 @@ pub struct SyncManager {
 
     /// This node's durability identities (empty = don't emit durability notifications).
     pub(super) my_tiers: HashSet<DurabilityTier>,
-    /// Tracks which clients are interested in row batch-member state updates.
+    /// Tracks which clients authored or explicitly track row batch-member durability.
     pub(super) row_batch_interest: HashMap<RowBatchKey, HashSet<ClientId>>,
+    /// Tracks which clients only received a row batch through synced query scope.
+    pub(super) query_row_batch_interest: HashMap<RowBatchKey, HashSet<ClientId>>,
 
     /// Tracks which clients originated each query (for relaying QuerySettled).
     pub(super) query_origin: HashMap<QueryId, HashSet<ClientId>>,
@@ -114,6 +116,7 @@ impl std::fmt::Debug for SyncManager {
             .field("next_pending_id", &self.next_pending_id)
             .field("my_tiers", &self.my_tiers)
             .field("row_batch_interest", &self.row_batch_interest)
+            .field("query_row_batch_interest", &self.query_row_batch_interest)
             .field("query_origin", &self.query_origin)
             .field("remote_query_scopes", &self.remote_query_scopes)
             .field("pending_query_settled", &self.pending_query_settled)
@@ -212,6 +215,7 @@ impl SyncManager {
             next_pending_id: 0,
             my_tiers: HashSet::new(),
             row_batch_interest: HashMap::new(),
+            query_row_batch_interest: HashMap::new(),
             query_origin: HashMap::new(),
             remote_query_scopes: HashMap::new(),
             pending_query_settled: Vec::new(),
@@ -269,6 +273,10 @@ impl SyncManager {
     /// True when this runtime currently has at least one upstream server.
     pub fn has_connected_servers(&self) -> bool {
         !self.servers.is_empty()
+    }
+
+    pub fn connected_server_ids(&self) -> Vec<ServerId> {
+        self.servers.keys().copied().collect()
     }
 
     /// Return the strongest durability tier this node can attest to locally.
@@ -330,6 +338,11 @@ impl SyncManager {
             }
         }
         for (row_batch_key, clients) in &self.row_batch_interest {
+            subscriptions += std::mem::size_of_val(row_batch_key);
+            subscriptions += clients.len() * std::mem::size_of::<ClientId>();
+            subscriptions += 48;
+        }
+        for (row_batch_key, clients) in &self.query_row_batch_interest {
             subscriptions += std::mem::size_of_val(row_batch_key);
             subscriptions += clients.len() * std::mem::size_of::<ClientId>();
             subscriptions += 48;
@@ -467,6 +480,10 @@ impl SyncManager {
         self.clients.remove(&client_id);
         // Clean up interest map
         self.row_batch_interest.retain(|_, clients| {
+            clients.remove(&client_id);
+            !clients.is_empty()
+        });
+        self.query_row_batch_interest.retain(|_, clients| {
             clients.remove(&client_id);
             !clients.is_empty()
         });
@@ -629,7 +646,7 @@ impl SyncManager {
                 client_id,
                 object_id,
                 branch_name,
-                true,
+                false,
             );
         }
 
@@ -696,10 +713,10 @@ impl SyncManager {
         }
 
         for key in removed_row_batches {
-            if let Some(clients) = self.row_batch_interest.get_mut(&key) {
+            if let Some(clients) = self.query_row_batch_interest.get_mut(&key) {
                 clients.remove(&client_id);
                 if clients.is_empty() {
-                    self.row_batch_interest.remove(&key);
+                    self.query_row_batch_interest.remove(&key);
                 }
             }
         }

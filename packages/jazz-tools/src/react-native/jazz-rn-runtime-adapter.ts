@@ -43,6 +43,7 @@ export interface JazzRnRuntimeBinding {
   ): string;
   loadLocalBatchRecord?(batchId: string): string | null;
   loadLocalBatchRecords?(): string;
+  requestBatchSettlements?(batchIds: string[]): void;
   drainRejectedBatchIds?(): string[];
   onBatchedTickNeeded(
     callback:
@@ -183,6 +184,7 @@ export class JazzRnRuntimeAdapter implements Runtime {
     T extends
       | "loadLocalBatchRecord"
       | "loadLocalBatchRecords"
+      | "requestBatchSettlements"
       | "drainRejectedBatchIds"
       | "acknowledgeRejectedBatch"
       | "sealBatch",
@@ -286,6 +288,14 @@ export class JazzRnRuntimeAdapter implements Runtime {
     try {
       const recordsJson = this.requireBatchRecordMethod("loadLocalBatchRecords")();
       return JSON.parse(recordsJson) as LocalBatchRecord[];
+    } catch (error) {
+      throw normalizeJazzRnError(error);
+    }
+  }
+
+  requestBatchSettlements(batch_ids: string[]): void {
+    try {
+      this.requireBatchRecordMethod("requestBatchSettlements")(batch_ids);
     } catch (error) {
       throw normalizeJazzRnError(error);
     }

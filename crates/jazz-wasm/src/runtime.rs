@@ -1482,6 +1482,20 @@ impl WasmRuntime {
             .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
     }
 
+    #[wasm_bindgen(js_name = requestBatchSettlements)]
+    pub fn request_batch_settlements(&self, batch_ids: JsValue) -> Result<(), JsError> {
+        let batch_ids: Vec<String> = serde_wasm_bindgen::from_value(batch_ids)
+            .map_err(|e| JsError::new(&format!("Invalid batch id list: {e:?}")))?;
+        let parsed_batch_ids = batch_ids
+            .into_iter()
+            .map(|batch_id| parse_batch_id_input(&batch_id).map_err(|err| JsError::new(&err)))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.core
+            .borrow_mut()
+            .request_batch_settlements(parsed_batch_ids);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = drainRejectedBatchIds)]
     pub fn drain_rejected_batch_ids(&self) -> Result<JsValue, JsError> {
         let mut core = self.core.borrow_mut();

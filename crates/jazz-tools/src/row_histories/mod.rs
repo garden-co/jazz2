@@ -2233,6 +2233,43 @@ pub fn patch_row_batch_state<H: Storage>(
         (None, incoming) => incoming,
     };
 
+    if state.is_none()
+        && let Some(previous_entry) = previous_entry.as_ref()
+        && previous_entry.current_row.batch_id() == batch_id
+        && previous_entry.current_row.branch.as_str() == branch_name.as_str()
+    {
+        let encoded_history =
+            crate::storage::encode_history_row_bytes_with_context(&context, &patched_row)
+                .map_err(RowHistoryError::StorageError)?;
+        let mut patched_entry = previous_entry.clone();
+        patched_entry.current_row.confirmed_tier = patched_row.confirmed_tier;
+        let encoded_visible =
+            crate::storage::encode_visible_row_bytes_with_context(&context, &patched_entry)
+                .map_err(RowHistoryError::StorageError)?;
+        io.apply_prepared_row_mutation(
+            &table,
+            std::slice::from_ref(&patched_row),
+            std::slice::from_ref(&patched_entry),
+            std::slice::from_ref(&encoded_history),
+            std::slice::from_ref(&encoded_visible),
+            &[],
+        )
+        .map_err(RowHistoryError::StorageError)?;
+
+        let current_visible = patched_entry.current_row.clone();
+        if previous_visible.as_ref() == Some(&current_visible) {
+            return Ok(None);
+        }
+
+        return Ok(Some(RowVisibilityChange {
+            object_id,
+            row_locator,
+            row: current_visible,
+            previous_row: previous_visible.clone(),
+            is_new_object: previous_visible.is_none(),
+        }));
+    }
+
     let mut history_rows = load_branch_history(io, &table, object_id, &branch)?;
     let Some(existing) = history_rows
         .iter_mut()

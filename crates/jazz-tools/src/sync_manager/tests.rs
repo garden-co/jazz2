@@ -8,7 +8,7 @@ use crate::query_manager::encoding::encode_row;
 use crate::query_manager::query::QueryBuilder;
 use crate::query_manager::types::{ColumnType, SchemaBuilder, SchemaHash, TableSchema, Value};
 use crate::row_histories::{BatchId, StoredRowBatch, VisibleRowEntry};
-use crate::storage::{MemoryStorage, Storage};
+use crate::storage::{MemoryStorage, RawTableRows, Storage, StorageError};
 use crate::test_row_history::{create_test_row_with_id, persist_test_schema};
 use std::collections::{HashMap, HashSet};
 
@@ -155,6 +155,22 @@ struct FailingHistoryPatchStorage {
     fail_sealed_submission_upsert: bool,
 }
 
+struct NoHistoryScanStorage {
+    inner: MemoryStorage,
+}
+
+impl NoHistoryScanStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut MemoryStorage {
+        &mut self.inner
+    }
+}
+
 impl FailingHistoryPatchStorage {
     fn new() -> Self {
         Self {
@@ -283,6 +299,128 @@ impl Storage for FailingHistoryPatchStorage {
             )));
         }
         self.inner.upsert_sealed_batch_submission(submission)
+    }
+}
+
+impl Storage for NoHistoryScanStorage {
+    fn apply_encoded_row_mutation(
+        &mut self,
+        table: &str,
+        history_rows: &[crate::storage::OwnedHistoryRowBytes],
+        visible_rows: &[crate::storage::OwnedVisibleRowBytes],
+        index_mutations: &[crate::storage::IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner
+            .apply_encoded_row_mutation(table, history_rows, visible_rows, index_mutations)
+    }
+
+    fn apply_prepared_row_mutation(
+        &mut self,
+        table: &str,
+        history_rows: &[StoredRowBatch],
+        visible_entries: &[crate::row_histories::VisibleRowEntry],
+        encoded_history_rows: &[crate::storage::OwnedHistoryRowBytes],
+        encoded_visible_rows: &[crate::storage::OwnedVisibleRowBytes],
+        index_mutations: &[crate::storage::IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner.apply_prepared_row_mutation(
+            table,
+            history_rows,
+            visible_entries,
+            encoded_history_rows,
+            encoded_visible_rows,
+            index_mutations,
+        )
+    }
+
+    fn raw_table_put(&mut self, table: &str, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.inner.raw_table_put(table, key, value)
+    }
+
+    fn raw_table_delete(&mut self, table: &str, key: &str) -> Result<(), StorageError> {
+        self.inner.raw_table_delete(table, key)
+    }
+
+    fn raw_table_get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.raw_table_get(table, key)
+    }
+
+    fn raw_table_scan_prefix(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<RawTableRows, StorageError> {
+        self.inner.raw_table_scan_prefix(table, prefix)
+    }
+
+    fn raw_table_scan_range(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<RawTableRows, StorageError> {
+        self.inner.raw_table_scan_range(table, start, end)
+    }
+
+    fn upsert_catalogue_entry(
+        &mut self,
+        entry: &crate::catalogue::CatalogueEntry,
+    ) -> Result<(), StorageError> {
+        self.inner.upsert_catalogue_entry(entry)
+    }
+
+    fn load_catalogue_entry(
+        &self,
+        object_id: crate::object::ObjectId,
+    ) -> Result<Option<crate::catalogue::CatalogueEntry>, StorageError> {
+        self.inner.load_catalogue_entry(object_id)
+    }
+
+    fn load_row_locator(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<crate::storage::RowLocator>, StorageError> {
+        self.inner.load_row_locator(id)
+    }
+
+    fn load_history_row_batch(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+        batch_id: crate::row_histories::BatchId,
+    ) -> Result<Option<crate::row_histories::StoredRowBatch>, StorageError> {
+        self.inner
+            .load_history_row_batch(table, branch, row_id, batch_id)
+    }
+
+    fn load_visible_region_entry(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+    ) -> Result<Option<crate::row_histories::VisibleRowEntry>, StorageError> {
+        self.inner.load_visible_region_entry(table, branch, row_id)
+    }
+
+    fn load_visible_region_row(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+    ) -> Result<Option<crate::row_histories::StoredRowBatch>, StorageError> {
+        self.inner.load_visible_region_row(table, branch, row_id)
+    }
+
+    fn scan_history_region(
+        &self,
+        _table: &str,
+        _branch: &str,
+        _scan: crate::row_histories::HistoryScan,
+    ) -> Result<Vec<crate::row_histories::StoredRowBatch>, StorageError> {
+        Err(StorageError::IoError(
+            "history scans deliberately disabled in this test".to_string(),
+        ))
     }
 }
 
@@ -514,6 +652,57 @@ fn set_query_scope_emits_query_scope_snapshot_to_client() {
 }
 
 #[test]
+fn set_query_scope_does_not_resend_already_known_row_batches() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    let query_id = QueryId(17);
+
+    add_client(&mut sm, &io, client_id);
+    sm.take_outbox();
+    seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    let client = sm.clients.get_mut(&client_id).expect("client should exist");
+    client.sent_metadata.insert(row_id);
+    client.sent_batch_ids.insert(
+        (row_id, BranchName::new("main")),
+        HashSet::from([row.batch_id()]),
+    );
+
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        query_id,
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+
+    let outbox = sm.take_outbox();
+    assert!(
+        !outbox.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchNeeded { row: needed, .. },
+            } if *id == client_id && needed.batch_id() == row.batch_id()
+        )),
+        "query scope sync should not resend a row batch the client already knows about"
+    );
+    assert!(
+        outbox.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::QueryScopeSnapshot { query_id: snapshot_query_id, .. },
+            } if *id == client_id && *snapshot_query_id == query_id
+        )),
+        "query scope sync should still emit the authoritative scope snapshot"
+    );
+}
+
+#[test]
 fn query_scope_snapshot_from_server_is_stored_for_query() {
     let mut sm = SyncManager::new();
     let mut io = MemoryStorage::new();
@@ -577,6 +766,67 @@ fn query_scope_snapshot_from_server_relays_to_interested_clients() {
             && relayed_query_id == query_id
             && scope == vec![(row_id, BranchName::new("main"))]
     )));
+}
+
+#[test]
+fn client_originated_rows_are_not_replayed_when_query_scope_bootstraps() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let row_id = ObjectId::new();
+    let query_id = QueryId(77);
+
+    seed_users_schema(&mut io);
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
+
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::RowBatchCreated {
+            metadata: Some(RowMetadata {
+                id: row_id,
+                metadata: row_metadata("users"),
+            }),
+            row: row.clone(),
+        },
+    );
+
+    sm.take_outbox();
+
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        query_id,
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+
+    let outbox = sm.take_outbox();
+    assert!(
+        outbox.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::QueryScopeSnapshot { query_id: snapshot_query_id, scope },
+            } if *id == client_id
+                && *snapshot_query_id == query_id
+                && scope == &vec![(row_id, BranchName::new("main"))]
+        )),
+        "query bootstrap should still publish the scope snapshot",
+    );
+    assert!(
+        !outbox.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchNeeded { row: replayed, .. },
+            } if *id == client_id && replayed.batch_id() == row.batch_id()
+        )),
+        "query bootstrap should not replay a row batch the client originated",
+    );
 }
 
 #[test]
@@ -829,6 +1079,36 @@ fn row_batch_state_changed_updates_row_region_confirmed_tier_monotonically() {
 }
 
 #[test]
+fn row_batch_state_changed_confirmed_tier_update_does_not_require_history_scan() {
+    let mut sm = SyncManager::new();
+    let mut io = NoHistoryScanStorage::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    let batch_id = row.batch_id;
+    seed_visible_row(&mut sm, io.inner_mut(), "users", row.clone());
+
+    sm.process_from_server(
+        &mut io,
+        ServerId::new(),
+        SyncPayload::RowBatchStateChanged {
+            row_id,
+            branch_name: BranchName::new("main"),
+            batch_id,
+            state: None,
+            confirmed_tier: Some(DurabilityTier::EdgeServer),
+        },
+    );
+
+    assert_eq!(sm.take_received_row_batch_acks().len(), 1);
+    let visible = io
+        .inner
+        .load_visible_region_row("users", "main", row_id)
+        .unwrap()
+        .expect("visible row should remain present");
+    assert_eq!(visible.confirmed_tier, Some(DurabilityTier::EdgeServer));
+}
+
+#[test]
 fn row_batch_state_changed_enqueues_pending_row_update_for_visible_row() {
     let mut sm = SyncManager::new();
     let mut io = MemoryStorage::new();
@@ -891,7 +1171,7 @@ fn row_batch_state_changed_does_not_ack_when_storage_patch_fails() {
 }
 
 #[test]
-fn row_batch_state_changed_relays_to_clients_that_received_row_batch_needed() {
+fn row_batch_state_changed_does_not_relay_to_query_only_clients() {
     let mut sm = SyncManager::new();
     let mut io = MemoryStorage::new();
     let client_id = ClientId::new();
@@ -900,6 +1180,7 @@ fn row_batch_state_changed_relays_to_clients_that_received_row_batch_needed() {
     let batch_id = row.batch_id;
 
     add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
     sm.take_outbox();
     seed_visible_row(&mut sm, &mut io, "users", row.clone());
 
@@ -933,19 +1214,126 @@ fn row_batch_state_changed_relays_to_clients_that_received_row_batch_needed() {
         },
     );
 
-    assert!(sm.take_outbox().into_iter().any(|entry| matches!(
-        entry,
-        OutboxEntry {
-            destination: Destination::Client(id),
-            payload:
-                SyncPayload::RowBatchStateChanged {
-                    row_id: changed_row_id,
-                    batch_id: changed_batch_id,
-                    confirmed_tier: Some(DurabilityTier::Local),
-                    ..
-                },
-        } if id == client_id && changed_row_id == row_id && changed_batch_id == batch_id
-    )));
+    assert!(
+        !sm.take_outbox().into_iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchStateChanged { .. },
+            } if id == client_id
+        )),
+        "query-scope row sync should not subscribe the client to per-batch durability chatter"
+    );
+}
+
+#[test]
+fn client_row_batch_write_does_not_register_durability_interest_without_request() {
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::EdgeServer);
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    let batch_id = row.batch_id;
+    let key = RowBatchKey::new(row_id, BranchName::new("main"), batch_id);
+
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
+    sm.take_outbox();
+
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::RowBatchCreated {
+            metadata: Some(RowMetadata {
+                id: row_id,
+                metadata: row_metadata("users"),
+            }),
+            row: row.clone(),
+        },
+    );
+
+    assert!(
+        !sm.row_batch_interest.contains_key(&key),
+        "originating writes should not automatically subscribe the client to future durability chatter"
+    );
+}
+
+#[test]
+fn batch_settlement_needed_registers_interest_for_future_tier_updates() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let row_id = ObjectId::new();
+    let mut row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    row.confirmed_tier = Some(DurabilityTier::Local);
+    let batch_id = row.batch_id;
+    let key = RowBatchKey::new(row_id, BranchName::new("main"), batch_id);
+
+    add_client(&mut sm, &io, client_id);
+    sm.take_outbox();
+    seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    persist_visible_row_settlement(&mut io, row_id, &row);
+
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::BatchSettlementNeeded {
+            batch_ids: vec![batch_id],
+        },
+    );
+
+    assert!(
+        sm.take_outbox().into_iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload:
+                    SyncPayload::BatchSettlement {
+                        settlement: BatchSettlement::DurableDirect {
+                            batch_id: settled_batch_id,
+                            confirmed_tier: DurabilityTier::Local,
+                            ..
+                        },
+                    },
+            } if id == client_id && settled_batch_id == batch_id
+        )),
+        "explicit settlement requests should replay the current authoritative batch settlement"
+    );
+    assert_eq!(
+        sm.row_batch_interest.get(&key),
+        Some(&HashSet::from([client_id])),
+        "explicit settlement requests should subscribe the client to later tier updates for the batch"
+    );
+
+    sm.process_from_server(
+        &mut io,
+        ServerId::new(),
+        SyncPayload::RowBatchStateChanged {
+            row_id,
+            branch_name: BranchName::new("main"),
+            batch_id,
+            state: None,
+            confirmed_tier: Some(DurabilityTier::GlobalServer),
+        },
+    );
+
+    assert!(
+        sm.take_outbox().into_iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload:
+                    SyncPayload::BatchSettlement {
+                        settlement: BatchSettlement::DurableDirect {
+                            batch_id: settled_batch_id,
+                            confirmed_tier: DurabilityTier::GlobalServer,
+                            ..
+                        },
+                    },
+            } if id == client_id && settled_batch_id == batch_id
+        )),
+        "after an explicit settlement request, later upstream tier confirmations should be forwarded to the waiting client"
+    );
 }
 
 #[test]
@@ -1247,6 +1635,13 @@ fn row_batch_state_changed_relays_direct_batch_settlement_to_interested_clients(
         HashSet::from([(row_id, BranchName::new("main"))]),
         None,
     );
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::BatchSettlementNeeded {
+            batch_ids: vec![batch_id],
+        },
+    );
     let _ = sm.take_outbox();
 
     sm.process_from_server(
@@ -1303,6 +1698,13 @@ fn row_batch_state_changed_relays_accepted_transaction_settlement_to_interested_
         QueryId(1),
         HashSet::from([(row_id, BranchName::new("main"))]),
         None,
+    );
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::BatchSettlementNeeded {
+            batch_ids: vec![batch_id],
+        },
     );
     let _ = sm.take_outbox();
 

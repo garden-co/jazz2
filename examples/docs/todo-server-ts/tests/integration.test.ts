@@ -207,68 +207,78 @@ describe("Todo Server Integration", () => {
       const dataDir = mkdtempSync(join(tmpdir(), "jazz-cold-start-"));
       const dbPath = join(dataDir, "jazz.db");
 
-      // --- First boot: create some todos ---
-      const server1 = await startServer(
-        await createServer({
-          dataPath: dbPath,
-          appId: coldStartUpstream.appId,
-          serverUrl: coldStartUpstream.url,
-          backendSecret: coldStartUpstream.backendSecret,
-          adminSecret: coldStartUpstream.adminSecret,
-        }),
-        0,
-      );
+      try {
+        // --- First boot: create some todos ---
+        const server1 = await startServer(
+          await createServer({
+            dataPath: dbPath,
+            appId: coldStartUpstream.appId,
+            serverUrl: coldStartUpstream.url,
+            backendSecret: coldStartUpstream.backendSecret,
+            adminSecret: coldStartUpstream.adminSecret,
+          }),
+          0,
+        );
 
-      const createRes1 = await fetch(`${server1.baseUrl}/todos`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Survive restart" }),
-      });
-      expect(createRes1.status).toBe(201);
-      const todo1: Todo = await createRes1.json();
+        let todo1: Todo;
+        let todo2: Todo;
+        try {
+          const createRes1 = await fetch(`${server1.baseUrl}/todos`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: "Survive restart" }),
+          });
+          expect(createRes1.status).toBe(201);
+          todo1 = await createRes1.json();
 
-      const createRes2 = await fetch(`${server1.baseUrl}/todos`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Also persist" }),
-      });
-      expect(createRes2.status).toBe(201);
-      const todo2: Todo = await createRes2.json();
+          const createRes2 = await fetch(`${server1.baseUrl}/todos`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: "Also persist" }),
+          });
+          expect(createRes2.status).toBe(201);
+          todo2 = await createRes2.json();
 
-      // Flush to disk and shut down
-      server1.flush();
-      await stopServer(server1);
+          // Flush to disk before the restart.
+          server1.flush();
+        } finally {
+          await stopServer(server1);
+        }
 
-      // --- Second boot: same data path, fresh server ---
-      const server2 = await startServer(
-        await createServer({
-          dataPath: dbPath,
-          appId: coldStartUpstream.appId,
-          serverUrl: coldStartUpstream.url,
-          backendSecret: coldStartUpstream.backendSecret,
-          adminSecret: coldStartUpstream.adminSecret,
-        }),
-        0,
-      );
+        // --- Second boot: same data path, fresh server ---
+        const server2 = await startServer(
+          await createServer({
+            dataPath: dbPath,
+            appId: coldStartUpstream.appId,
+            serverUrl: coldStartUpstream.url,
+            backendSecret: coldStartUpstream.backendSecret,
+            adminSecret: coldStartUpstream.adminSecret,
+          }),
+          0,
+        );
 
-      const listRes = await fetch(`${server2.baseUrl}/todos`);
-      expect(listRes.status).toBe(200);
-      const todos: Todo[] = await listRes.json();
+        try {
+          const listRes = await fetch(`${server2.baseUrl}/todos`);
+          expect(listRes.status).toBe(200);
+          const todos: Todo[] = await listRes.json();
 
-      // Both todos should be present
-      expect(todos.length).toBe(2);
+          // Both todos should be present.
+          expect(todos.length).toBe(2);
 
-      const found1 = todos.find((t) => t.id === todo1.id);
-      expect(found1).toBeDefined();
-      expect(found1!.title).toBe("Survive restart");
-      expect(found1!.done).toBe(false);
+          const found1 = todos.find((t) => t.id === todo1.id);
+          expect(found1).toBeDefined();
+          expect(found1!.title).toBe("Survive restart");
+          expect(found1!.done).toBe(false);
 
-      const found2 = todos.find((t) => t.id === todo2.id);
-      expect(found2).toBeDefined();
-      expect(found2!.title).toBe("Also persist");
-
-      await stopServer(server2);
-      await coldStartUpstream.stop();
+          const found2 = todos.find((t) => t.id === todo2.id);
+          expect(found2).toBeDefined();
+          expect(found2!.title).toBe("Also persist");
+        } finally {
+          await stopServer(server2);
+        }
+      } finally {
+        await coldStartUpstream.stop();
+      }
     });
   });
 

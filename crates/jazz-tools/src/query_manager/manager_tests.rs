@@ -13,6 +13,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::{Layer, Registry};
 
 use crate::metadata::{DeleteKind, MetadataKey, RowProvenance, row_provenance_metadata};
+use crate::object::BranchName;
 use crate::query_manager::encoding::{decode_row, encode_row};
 use crate::query_manager::manager::{QueryError, QueryManager};
 use crate::query_manager::query::QueryBuilder;
@@ -21,7 +22,9 @@ use crate::query_manager::types::{
     ColumnDescriptor, ColumnType, ComposedBranchName, PolicyExpr, RowDescriptor, Schema, TableName,
     TablePolicies, TableSchema, Value,
 };
-use crate::row_histories::{BatchId, HistoryScan, RowState, StoredRowBatch, VisibleRowEntry};
+use crate::row_histories::{
+    BatchId, HistoryScan, QueryRowBatch, RowState, StoredRowBatch, VisibleRowEntry,
+};
 use crate::schema_manager::encoding::encode_schema;
 use crate::storage::{
     HistoryRowBytes, IndexMutation, MemoryStorage, OpfsBTreeStorage, OwnedHistoryRowBytes,
@@ -129,6 +132,24 @@ fn get_branch(qm: &QueryManager) -> String {
 struct CountingCatalogueUpsertsStorage {
     inner: MemoryStorage,
     catalogue_upserts: Cell<usize>,
+}
+
+struct CountingQueryRowLoadsStorage {
+    inner: MemoryStorage,
+    query_row_loads: Cell<usize>,
+}
+
+impl CountingQueryRowLoadsStorage {
+    fn new(schema: &Schema) -> Self {
+        Self {
+            inner: seeded_memory_storage(schema),
+            query_row_loads: Cell::new(0),
+        }
+    }
+
+    fn query_row_loads(&self) -> usize {
+        self.query_row_loads.get()
+    }
 }
 
 impl CountingCatalogueUpsertsStorage {
@@ -240,6 +261,126 @@ impl Storage for CountingCatalogueUpsertsStorage {
         object_id: crate::object::ObjectId,
     ) -> Result<Option<crate::catalogue::CatalogueEntry>, StorageError> {
         self.inner.load_catalogue_entry(object_id)
+    }
+}
+
+impl Storage for CountingQueryRowLoadsStorage {
+    fn raw_table_put(&mut self, table: &str, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.inner.raw_table_put(table, key, value)
+    }
+
+    fn raw_table_delete(&mut self, table: &str, key: &str) -> Result<(), StorageError> {
+        self.inner.raw_table_delete(table, key)
+    }
+
+    fn apply_raw_table_mutations(
+        &mut self,
+        mutations: &[RawTableMutation<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner.apply_raw_table_mutations(mutations)
+    }
+
+    fn raw_table_get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.raw_table_get(table, key)
+    }
+
+    fn raw_table_scan_prefix(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<RawTableRows, StorageError> {
+        self.inner.raw_table_scan_prefix(table, prefix)
+    }
+
+    fn raw_table_scan_range(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<RawTableRows, StorageError> {
+        self.inner.raw_table_scan_range(table, start, end)
+    }
+
+    fn append_history_region_row_bytes(
+        &mut self,
+        table: &str,
+        rows: &[HistoryRowBytes<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner.append_history_region_row_bytes(table, rows)
+    }
+
+    fn upsert_visible_region_row_bytes(
+        &mut self,
+        table: &str,
+        rows: &[VisibleRowBytes<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner.upsert_visible_region_row_bytes(table, rows)
+    }
+
+    fn apply_encoded_row_mutation(
+        &mut self,
+        table: &str,
+        history_rows: &[OwnedHistoryRowBytes],
+        visible_rows: &[OwnedVisibleRowBytes],
+        index_mutations: &[IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner
+            .apply_encoded_row_mutation(table, history_rows, visible_rows, index_mutations)
+    }
+
+    fn apply_prepared_row_mutation(
+        &mut self,
+        table: &str,
+        history_rows: &[StoredRowBatch],
+        visible_entries: &[VisibleRowEntry],
+        encoded_history_rows: &[OwnedHistoryRowBytes],
+        encoded_visible_rows: &[OwnedVisibleRowBytes],
+        index_mutations: &[IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        self.inner.apply_prepared_row_mutation(
+            table,
+            history_rows,
+            visible_entries,
+            encoded_history_rows,
+            encoded_visible_rows,
+            index_mutations,
+        )
+    }
+
+    fn upsert_catalogue_entry(
+        &mut self,
+        entry: &crate::catalogue::CatalogueEntry,
+    ) -> Result<(), StorageError> {
+        self.inner.upsert_catalogue_entry(entry)
+    }
+
+    fn load_catalogue_entry(
+        &self,
+        object_id: crate::object::ObjectId,
+    ) -> Result<Option<crate::catalogue::CatalogueEntry>, StorageError> {
+        self.inner.load_catalogue_entry(object_id)
+    }
+
+    fn load_visible_query_row(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+    ) -> Result<Option<QueryRowBatch>, StorageError> {
+        self.query_row_loads.set(self.query_row_loads.get() + 1);
+        self.inner.load_visible_query_row(table, branch, row_id)
+    }
+
+    fn load_visible_query_row_for_tier(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+        required_tier: crate::sync_manager::DurabilityTier,
+    ) -> Result<Option<QueryRowBatch>, StorageError> {
+        self.query_row_loads.set(self.query_row_loads.get() + 1);
+        self.inner
+            .load_visible_query_row_for_tier(table, branch, row_id, required_tier)
     }
 }
 
@@ -10677,6 +10818,127 @@ fn sync_backed_subscription_without_remote_scope_snapshot_keeps_local_rows() {
         1,
         "sync-backed subscriptions should keep local rows until a remote scope snapshot arrives"
     );
+    assert_eq!(
+        results[0].1,
+        vec![Value::Text("Alice".into()), Value::Integer(100)]
+    );
+}
+
+#[test]
+fn sync_backed_subscription_holds_initial_delivery_without_reloading_on_tier_confirmations() {
+    use crate::sync_manager::{InboxEntry, QueryId, ServerId, Source, SyncPayload};
+    use uuid::Uuid;
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let mut qm = QueryManager::new(sync_manager);
+    qm.set_current_schema(schema, "dev", "main");
+    let mut storage = CountingQueryRowLoadsStorage::new(&qm.schema_context().current_schema);
+
+    let inserted = qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("Alice".into()), Value::Integer(100)],
+        )
+        .unwrap();
+    qm.process(&mut storage);
+
+    let server_id = ServerId(Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)));
+    qm.add_server_with_storage(&storage, server_id, false);
+
+    let sub_id = qm
+        .subscribe_with_sync(
+            qm.query("users").build(),
+            None,
+            Some(crate::sync_manager::DurabilityTier::Local),
+        )
+        .unwrap();
+    qm.process(&mut storage);
+    let initial_query_row_loads = storage.query_row_loads();
+
+    let subscription = qm
+        .subscriptions
+        .get(&sub_id)
+        .expect("subscription should exist");
+    assert!(
+        !subscription.query_frontier_complete,
+        "subscription should still be waiting on upstream QuerySettled"
+    );
+    assert!(
+        !subscription.settled_once,
+        "subscription should keep the first delivery held until QuerySettled arrives"
+    );
+    assert!(
+        !subscription.graph.has_dirty_nodes(),
+        "initial hold should still keep the graph settled"
+    );
+
+    for confirmed_tier in [
+        crate::sync_manager::DurabilityTier::EdgeServer,
+        crate::sync_manager::DurabilityTier::GlobalServer,
+    ] {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Server(server_id),
+            payload: SyncPayload::RowBatchStateChanged {
+                row_id: inserted.row_id,
+                branch_name: BranchName::new("main"),
+                batch_id: inserted.batch_id,
+                state: None,
+                confirmed_tier: Some(confirmed_tier),
+            },
+        });
+        qm.process(&mut storage);
+    }
+
+    assert_eq!(
+        storage.query_row_loads(),
+        initial_query_row_loads,
+        "upstream tier confirmations should not keep reloading rows whose visibility is unchanged"
+    );
+
+    let subscription = qm
+        .subscriptions
+        .get(&sub_id)
+        .expect("subscription should exist");
+    assert!(
+        !subscription.graph.has_dirty_nodes(),
+        "confirmations whose visibility is unchanged should not dirty the graph"
+    );
+    assert!(
+        !subscription.settled_once,
+        "confirmations should not release the held initial snapshot"
+    );
+
+    qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Server(server_id),
+        payload: SyncPayload::QuerySettled {
+            query_id: QueryId(sub_id.0),
+            tier: crate::sync_manager::DurabilityTier::Local,
+            through_seq: 0,
+        },
+    });
+    qm.process(&mut storage);
+
+    let subscription = qm
+        .subscriptions
+        .get(&sub_id)
+        .expect("subscription should exist");
+    assert!(
+        subscription.query_frontier_complete,
+        "QuerySettled should release the waiting frontier"
+    );
+    assert!(
+        subscription.settled_once,
+        "frontier completion should allow the held initial delivery"
+    );
+    assert!(
+        !subscription.graph.has_dirty_nodes(),
+        "frontier completion should leave the graph settled"
+    );
+
+    let results = qm.get_subscription_results(sub_id);
+    assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].1,
         vec![Value::Text("Alice".into()), Value::Integer(100)]

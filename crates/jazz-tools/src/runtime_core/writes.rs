@@ -30,6 +30,32 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .unwrap_or(DurabilityTier::Local)
     }
 
+    fn register_ack_watcher(
+        &mut self,
+        row_id: ObjectId,
+        batch_id: BatchId,
+        write_context: Option<&WriteContext>,
+        tier: DurabilityTier,
+        sender: oneshot::Sender<PersistedWriteAck>,
+    ) {
+        if self
+            .schema_manager
+            .query_manager()
+            .sync_manager()
+            .has_local_durability_at_least(tier)
+        {
+            let _ = sender.send(Ok(()));
+            return;
+        }
+
+        let row_batch_key = self.ack_watcher_key(row_id, batch_id, write_context);
+        self.ack_watchers
+            .entry(row_batch_key)
+            .or_default()
+            .push((tier, sender));
+        self.request_batch_settlements(vec![batch_id]);
+    }
+
     fn ensure_transactional_batch_is_writable(
         &self,
         write_context: Option<&WriteContext>,
@@ -458,20 +484,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             self.track_local_batch(row_id, batch_id, BatchMode::Direct, false)?;
         }
         let (sender, receiver) = oneshot::channel();
-        if self
-            .schema_manager
-            .query_manager()
-            .sync_manager()
-            .has_local_durability_at_least(tier)
-        {
-            let _ = sender.send(Ok(()));
-        } else {
-            let row_batch_key = self.ack_watcher_key(row_id, batch_id, write_context);
-            self.ack_watchers
-                .entry(row_batch_key)
-                .or_default()
-                .push((tier, sender));
-        }
+        self.register_ack_watcher(row_id, batch_id, write_context, tier, sender);
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
         Ok(((row_id, row_values), receiver))
@@ -500,20 +513,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.track_local_batch(row_id, batch_id, batch_mode, false)?;
 
         let (sender, receiver) = oneshot::channel();
-        if self
-            .schema_manager
-            .query_manager()
-            .sync_manager()
-            .has_local_durability_at_least(tier)
-        {
-            let _ = sender.send(Ok(()));
-        } else {
-            let row_batch_key = self.ack_watcher_key(row_id, batch_id, write_context);
-            self.ack_watchers
-                .entry(row_batch_key)
-                .or_default()
-                .push((tier, sender));
-        }
+        self.register_ack_watcher(row_id, batch_id, write_context, tier, sender);
 
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -554,20 +554,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.track_local_batch(object_id, batch_id, batch_mode, false)?;
 
         let (sender, receiver) = oneshot::channel();
-        if self
-            .schema_manager
-            .query_manager()
-            .sync_manager()
-            .has_local_durability_at_least(tier)
-        {
-            let _ = sender.send(Ok(()));
-        } else {
-            let row_batch_key = self.ack_watcher_key(object_id, batch_id, write_context);
-            self.ack_watchers
-                .entry(row_batch_key)
-                .or_default()
-                .push((tier, sender));
-        }
+        self.register_ack_watcher(object_id, batch_id, write_context, tier, sender);
 
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -613,20 +600,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.track_local_batch(object_id, batch_id, batch_mode, false)?;
 
         let (sender, receiver) = oneshot::channel();
-        if self
-            .schema_manager
-            .query_manager()
-            .sync_manager()
-            .has_local_durability_at_least(tier)
-        {
-            let _ = sender.send(Ok(()));
-        } else {
-            let row_batch_key = self.ack_watcher_key(object_id, batch_id, write_context);
-            self.ack_watchers
-                .entry(row_batch_key)
-                .or_default()
-                .push((tier, sender));
-        }
+        self.register_ack_watcher(object_id, batch_id, write_context, tier, sender);
 
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -653,20 +627,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.track_local_batch(object_id, batch_id, batch_mode, false)?;
 
         let (sender, receiver) = oneshot::channel();
-        if self
-            .schema_manager
-            .query_manager()
-            .sync_manager()
-            .has_local_durability_at_least(tier)
-        {
-            let _ = sender.send(Ok(()));
-        } else {
-            let row_batch_key = self.ack_watcher_key(object_id, batch_id, write_context);
-            self.ack_watchers
-                .entry(row_batch_key)
-                .or_default()
-                .push((tier, sender));
-        }
+        self.register_ack_watcher(object_id, batch_id, write_context, tier, sender);
 
         self.mark_storage_write_pending_flush();
         self.immediate_tick();

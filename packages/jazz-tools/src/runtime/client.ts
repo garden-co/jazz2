@@ -109,6 +109,7 @@ export interface Runtime {
   ): PersistedMutationResult;
   loadLocalBatchRecord?(batch_id: string): LocalBatchRecord | null;
   loadLocalBatchRecords?(): LocalBatchRecord[];
+  requestBatchSettlements?(batch_ids: string[]): void;
   drainRejectedBatchIds?(): string[];
   acknowledgeRejectedBatch?(batch_id: string): boolean;
   sealBatch?(batch_id: string): void;
@@ -1206,6 +1207,7 @@ export class JazzClient {
    */
   private readonly mutationErrorListeners = new Set<(event: MutationErrorEvent) => void>();
   private readonly acknowledgedRejectedBatchErrors = new Map<string, PersistedWriteRejectedError>();
+  private readonly requestedBatchSettlementInterest = new Set<string>();
   private pendingBatchWaitPollTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private cachedRuntimeSchemaHash: string | null = null;
@@ -2282,6 +2284,7 @@ export class JazzClient {
         this.pendingBatchWaiters.set(batchId, remaining);
       } else {
         this.pendingBatchWaiters.delete(batchId);
+        this.requestedBatchSettlementInterest.delete(batchId);
       }
     }
 
@@ -2305,10 +2308,32 @@ export class JazzClient {
       this.pendingBatchWaitPollTimer = null;
       const batchesWithPendingWaiters = new Set(this.pendingBatchWaiters.keys());
       this.flushPendingBatchWaiters();
+      this.requestBatchSettlementInterest([...this.pendingBatchWaiters.keys()]);
       this.flushUnhandledMutationErrors(this.drainRejectedBatchIds(), batchesWithPendingWaiters);
 
       this.ensurePendingBatchWaitPolling();
     }, 20);
+  }
+
+  private requestBatchSettlementInterest(batchIds: readonly string[]): void {
+    const requestBatchSettlements = this.runtime.requestBatchSettlements;
+    if (!requestBatchSettlements || batchIds.length === 0) {
+      return;
+    }
+
+    const unresolvedBatchIds = batchIds.filter(
+      (batchId) =>
+        this.pendingBatchWaiters.has(batchId) &&
+        !this.requestedBatchSettlementInterest.has(batchId),
+    );
+    if (unresolvedBatchIds.length === 0) {
+      return;
+    }
+
+    requestBatchSettlements.call(this.runtime, unresolvedBatchIds);
+    for (const batchId of unresolvedBatchIds) {
+      this.requestedBatchSettlementInterest.add(batchId);
+    }
   }
 
   private cancelPendingBatchWaitPolling(): void {
@@ -2378,6 +2403,7 @@ export class JazzClient {
       waiters.push({ tier, resolve, reject });
       this.pendingBatchWaiters.set(batchId, waiters);
       this.flushPendingBatchWaiters();
+      this.requestBatchSettlementInterest([batchId]);
       this.ensurePendingBatchWaitPolling();
     });
   }

@@ -24,6 +24,7 @@ export declare class NapiRuntime {
   deleteWithSession(objectId: string, writeContextJson?: string | undefined | null): any
   loadLocalBatchRecord(batchId: string): any | null
   loadLocalBatchRecords(): any[]
+  requestBatchSettlements(batchIds: Array<string>): void
   drainRejectedBatchIds(): string[]
   acknowledgeRejectedBatch(batchId: string): boolean
   sealBatch(batchId: string): void

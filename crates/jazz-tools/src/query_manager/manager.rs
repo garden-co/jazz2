@@ -451,6 +451,11 @@ pub struct QueryManager {
     /// Per-schema, per-table write metadata cached to avoid cloning policy
     /// trees and descriptors on every hot write.
     pub(super) write_table_cache: HashMap<(SchemaHash, TableName), Arc<WriteTableCacheEntry>>,
+
+    /// When true, `process()` applies ready `QuerySettled` messages itself.
+    /// RuntimeCore disables this so it can release them after settlement/state
+    /// changes from the same upstream turn have landed locally.
+    pub(super) auto_apply_query_settled: bool,
 }
 
 impl QueryManager {
@@ -537,6 +542,7 @@ impl QueryManager {
             catalogued_storage_namespaces: HashSet::new(),
             catalogue_app_id: None,
             write_table_cache: HashMap::new(),
+            auto_apply_query_settled: true,
         }
     }
 
@@ -1020,6 +1026,14 @@ impl QueryManager {
         &mut self.sync_manager
     }
 
+    pub(crate) fn set_auto_apply_query_settled(&mut self, enabled: bool) {
+        self.auto_apply_query_settled = enabled;
+    }
+
+    pub(crate) fn enqueue_row_visibility_change(&mut self, update: RowVisibilityChange) {
+        self.pending_row_visibility_changes.push(update);
+    }
+
     pub(crate) fn apply_query_settled(&mut self, query_id: QueryId, _tier: DurabilityTier) {
         let sub_id = QuerySubscriptionId(query_id.0);
         if let Some(sub) = self.subscriptions.get_mut(&sub_id) {
@@ -1112,18 +1126,20 @@ impl QueryManager {
         // 4c. Apply QuerySettled messages that do not depend on any earlier
         // sequenced sync updates. Watermarked settlements stay queued for
         // RuntimeCore, which tracks per-server stream progress.
-        let pending_query_settled = self.sync_manager.take_pending_query_settled();
-        if !pending_query_settled.is_empty() {
-            let mut blocked = Vec::new();
-            for pending_settled in pending_query_settled {
-                if pending_settled.through_seq == 0 {
-                    self.apply_query_settled(pending_settled.query_id, pending_settled.tier);
-                } else {
-                    blocked.push(pending_settled);
+        if self.auto_apply_query_settled {
+            let pending_query_settled = self.sync_manager.take_pending_query_settled();
+            if !pending_query_settled.is_empty() {
+                let mut blocked = Vec::new();
+                for pending_settled in pending_query_settled {
+                    if pending_settled.through_seq == 0 {
+                        self.apply_query_settled(pending_settled.query_id, pending_settled.tier);
+                    } else {
+                        blocked.push(pending_settled);
+                    }
                 }
-            }
-            if !blocked.is_empty() {
-                self.sync_manager.requeue_pending_query_settled(blocked);
+                if !blocked.is_empty() {
+                    self.sync_manager.requeue_pending_query_settled(blocked);
+                }
             }
         }
 
@@ -1173,7 +1189,15 @@ impl QueryManager {
                             && !self
                                 .sync_manager
                                 .has_remote_query_scope_snapshot(QueryId(sub_id.0));
-                        let durability_tier = if lacks_authoritative_remote_scope
+                        let has_authoritative_remote_scope = subscription.sync_backed
+                            && subscription.query_frontier_complete
+                            && self
+                                .sync_manager
+                                .has_remote_query_scope_snapshot(QueryId(sub_id.0))
+                            && (subscription.propagation == QueryPropagation::Full
+                                || !self.sync_manager.has_durability_identity());
+                        let durability_tier = if has_authoritative_remote_scope
+                            || lacks_authoritative_remote_scope
                             || (subscription.local_updates == LocalUpdates::Immediate
                                 && subscription.pending_local_row_ids.contains(&id))
                         {
@@ -1227,10 +1251,9 @@ impl QueryManager {
                 && !subscription.query_frontier_complete
                 && self.sync_manager.has_servers_or_pending_servers()
             {
-                // Graph state updated by settle(), but don't deliver until the
-                // initial upstream frontier has been replayed — or until every
-                // still-pending server has exceeded PENDING_SERVER_TIMEOUT,
-                // which means nothing upstream is going to replay.
+                // Keep the first delivery held until the initial upstream
+                // frontier is complete, but still allow settle() above to keep
+                // the graph current while rows arrive.
                 tracing::trace!("query frontier incomplete, holding first delivery");
                 self.subscriptions.insert(sub_id, subscription);
                 continue;
@@ -1604,12 +1627,18 @@ impl QueryManager {
 
         if local_update {
             self.mark_subscriptions_dirty_local(&logical_table);
+            self.mark_local_row_updated_in_subscriptions(&logical_table, update.object_id);
+        } else if let Some((previous_tier, current_tier)) =
+            Self::pure_confirmed_tier_change(&update)
+        {
+            self.mark_subscriptions_dirty_for_confirmed_tier_change(
+                &logical_table,
+                update.object_id,
+                previous_tier,
+                current_tier,
+            );
         } else {
             self.mark_subscriptions_dirty(&logical_table);
-        }
-        if local_update {
-            self.mark_local_row_updated_in_subscriptions(&logical_table, update.object_id);
-        } else {
             self.mark_row_updated_in_subscriptions(&logical_table, update.object_id);
         }
     }
@@ -1638,6 +1667,96 @@ impl QueryManager {
             if Self::subscription_involves_table(&server_sub.graph, table) {
                 server_sub.graph.mark_dirty_for_table(table);
             }
+        }
+    }
+
+    fn pure_confirmed_tier_change(
+        update: &RowVisibilityChange,
+    ) -> Option<(Option<DurabilityTier>, Option<DurabilityTier>)> {
+        let previous = update.previous_row.as_ref()?;
+        if previous.confirmed_tier == update.row.confirmed_tier {
+            return None;
+        }
+
+        let mut normalized_previous = previous.clone();
+        normalized_previous.confirmed_tier = update.row.confirmed_tier;
+        (normalized_previous == update.row)
+            .then_some((previous.confirmed_tier, update.row.confirmed_tier))
+    }
+
+    fn confirmed_tier_satisfies(
+        confirmed_tier: Option<DurabilityTier>,
+        required_tier: DurabilityTier,
+    ) -> bool {
+        confirmed_tier.is_some_and(|confirmed| confirmed >= required_tier)
+    }
+
+    fn effective_required_tier_for_subscription_row(
+        subscription: &QuerySubscription,
+        row_id: ObjectId,
+        has_remote_query_scope_snapshot: bool,
+        has_durability_identity: bool,
+    ) -> Option<DurabilityTier> {
+        let lacks_authoritative_remote_scope = subscription.sync_backed
+            && subscription.local_updates == LocalUpdates::Immediate
+            && !has_remote_query_scope_snapshot;
+        let has_authoritative_remote_scope = subscription.sync_backed
+            && subscription.query_frontier_complete
+            && has_remote_query_scope_snapshot
+            && (subscription.propagation == QueryPropagation::Full || !has_durability_identity);
+
+        if has_authoritative_remote_scope
+            || lacks_authoritative_remote_scope
+            || (subscription.local_updates == LocalUpdates::Immediate
+                && subscription.pending_local_row_ids.contains(&row_id))
+        {
+            None
+        } else {
+            subscription.durability_tier
+        }
+    }
+
+    fn mark_subscriptions_dirty_for_confirmed_tier_change(
+        &mut self,
+        table: &str,
+        id: ObjectId,
+        previous_tier: Option<DurabilityTier>,
+        current_tier: Option<DurabilityTier>,
+    ) {
+        let has_durability_identity = self.sync_manager.has_durability_identity();
+        let remote_scope_snapshots: HashSet<_> = self
+            .subscriptions
+            .keys()
+            .copied()
+            .filter(|sub_id| {
+                self.sync_manager
+                    .has_remote_query_scope_snapshot(QueryId(sub_id.0))
+            })
+            .collect();
+
+        for (sub_id, subscription) in &mut self.subscriptions {
+            if !Self::subscription_involves_table(&subscription.graph, table) {
+                continue;
+            }
+
+            let required_tier = Self::effective_required_tier_for_subscription_row(
+                subscription,
+                id,
+                remote_scope_snapshots.contains(sub_id),
+                has_durability_identity,
+            );
+            let Some(required_tier) = required_tier else {
+                continue;
+            };
+
+            let visibility_changed = Self::confirmed_tier_satisfies(previous_tier, required_tier)
+                != Self::confirmed_tier_satisfies(current_tier, required_tier);
+            if !visibility_changed {
+                continue;
+            }
+
+            subscription.graph.mark_dirty_for_table(table);
+            subscription.graph.mark_row_updated(id);
         }
     }
 

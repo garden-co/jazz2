@@ -7,6 +7,8 @@ use crate::query_manager::types::SchemaHash;
 use crate::sync_manager::types::{ClientId, InboxEntry, OutboxEntry, ServerId};
 use futures::channel::mpsc;
 
+const MAX_OUTBOX_BATCH_SIZE: usize = 128;
+
 pub trait TickNotifier: 'static {
     fn notify(&self);
 }
@@ -426,6 +428,26 @@ enum ControlOrPhase<T> {
 
 #[cfg(feature = "runtime-tokio")]
 impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, T> {
+    fn encode_sync_batch_frame(&mut self, first: OutboxEntry) -> Vec<u8> {
+        let mut payloads = Vec::with_capacity(MAX_OUTBOX_BATCH_SIZE.min(8));
+        payloads.push(first.payload);
+
+        while payloads.len() < MAX_OUTBOX_BATCH_SIZE {
+            match self.outbox_rx.try_recv() {
+                Ok(next) => payloads.push(next.payload),
+                Err(_) => break,
+            }
+        }
+
+        let payload = serde_json::to_vec(&crate::transport_protocol::SyncBatchRequest {
+            payloads,
+            client_id: self.client_id,
+        })
+        .expect("SyncBatchRequest serialisation infallible");
+
+        frame_encode(&payload)
+    }
+
     /// Drive the transport: connect, authenticate, relay frames, reconnect on failure.
     /// Returns only when the `TransportHandle` is dropped or a Shutdown control is received.
     pub async fn run(mut self) {
@@ -583,8 +605,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     // outbox closed = handle dropped; control_rx will also return None shortly.
                     // Route to Shutdown so the same clean-exit path is taken.
                     let Some(entry) = out else { return ConnectedExit::Shutdown; };
-                    let Ok(bytes) = serde_json::to_vec(&entry) else { continue; };
-                    let frame = frame_encode(&bytes);
+                    let frame = self.encode_sync_batch_frame(entry);
                     if ws.send(&frame).await.is_err() { return ConnectedExit::NetworkError; }
                 }
                 incoming = ws.recv() => {
@@ -641,6 +662,26 @@ enum WasmConnectedExit {
 
 #[cfg(not(feature = "runtime-tokio"))]
 impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, T> {
+    fn encode_sync_batch_frame(&mut self, first: OutboxEntry) -> Vec<u8> {
+        let mut payloads = Vec::with_capacity(MAX_OUTBOX_BATCH_SIZE.min(8));
+        payloads.push(first.payload);
+
+        while payloads.len() < MAX_OUTBOX_BATCH_SIZE {
+            match self.outbox_rx.try_recv() {
+                Ok(next) => payloads.push(next.payload),
+                Err(_) => break,
+            }
+        }
+
+        let payload = serde_json::to_vec(&crate::transport_protocol::SyncBatchRequest {
+            payloads,
+            client_id: self.client_id,
+        })
+        .expect("SyncBatchRequest serialisation infallible");
+
+        frame_encode(&payload)
+    }
+
     /// Drive the transport: connect, authenticate, relay frames, reconnect on failure.
     /// Returns only when the `TransportHandle` is dropped or a Shutdown control is received.
     pub async fn run(mut self) {
@@ -792,8 +833,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     // outbox closed = handle dropped; control_rx will also return None shortly.
                     // Route to Shutdown so the same clean-exit path is taken.
                     let Some(entry) = out else { return WasmConnectedExit::Shutdown; };
-                    let Ok(bytes) = serde_json::to_vec(&entry) else { continue; };
-                    let frame = frame_encode(&bytes);
+                    let frame = self.encode_sync_batch_frame(entry);
                     if ws.send(&frame).await.is_err() { return WasmConnectedExit::NetworkError; }
                 }
                 incoming = ws.recv().fuse() => {
@@ -843,6 +883,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_manager::Destination;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1251,5 +1292,73 @@ mod tests {
             .await
             .expect("dropping the handle should shut down the manager")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_transport_batches_outbox_payloads_into_one_sync_request() {
+        let controller = Arc::new(TestStreamController::default());
+        *controller.handshake_response.lock().unwrap() = Some(make_handshake_response_frame());
+        controller.recv_pending.store(true, Ordering::SeqCst);
+        install_controller(controller.clone());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (handle, manager) = create::<TestStreamAdapter, CountingTick>(
+            "mock://".to_string(),
+            AuthConfig::default(),
+            CountingTick(counter),
+        );
+        let server_id = handle.server_id;
+        let task = tokio::spawn(manager.run());
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            handle.has_ever_connected(),
+            "transport should reach connected"
+        );
+
+        handle.send_outbox(OutboxEntry {
+            destination: Destination::Server(server_id),
+            payload: crate::sync_manager::SyncPayload::QueryUnsubscription {
+                query_id: crate::sync_manager::QueryId(1),
+            },
+        });
+        handle.send_outbox(OutboxEntry {
+            destination: Destination::Server(server_id),
+            payload: crate::sync_manager::SyncPayload::QueryUnsubscription {
+                query_id: crate::sync_manager::QueryId(2),
+            },
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let frames = controller.sent_frames.lock().unwrap().clone();
+        let sync_batches = frames
+            .iter()
+            .filter_map(|frame| {
+                let payload = frame_decode(frame)?;
+                serde_json::from_slice::<crate::transport_protocol::SyncBatchRequest>(payload).ok()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sync_batches.len(),
+            1,
+            "expected one batched sync frame for the queued payloads",
+        );
+        assert_eq!(sync_batches[0].payloads.len(), 2);
+        assert!(matches!(
+            sync_batches[0].payloads.as_slice(),
+            [
+                crate::sync_manager::SyncPayload::QueryUnsubscription {
+                    query_id: crate::sync_manager::QueryId(1),
+                },
+                crate::sync_manager::SyncPayload::QueryUnsubscription {
+                    query_id: crate::sync_manager::QueryId(2),
+                },
+            ]
+        ));
+
+        handle.disconnect();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), task).await;
     }
 }

@@ -766,6 +766,20 @@ impl NapiRuntime {
         Ok(serialize_local_batch_records(&records))
     }
 
+    #[napi(js_name = "requestBatchSettlements")]
+    pub fn request_batch_settlements(&self, batch_ids: Vec<String>) -> napi::Result<()> {
+        let batch_ids = batch_ids
+            .into_iter()
+            .map(|batch_id| parse_batch_id_input(&batch_id).map_err(napi::Error::from_reason))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| napi::Error::from_reason("lock"))?;
+        core.request_batch_settlements(batch_ids);
+        Ok(())
+    }
+
     #[napi(js_name = "drainRejectedBatchIds", ts_return_type = "string[]")]
     pub fn drain_rejected_batch_ids(&self) -> napi::Result<Vec<String>> {
         let mut core = self
