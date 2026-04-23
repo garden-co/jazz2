@@ -9,9 +9,11 @@ export const PROVENANCE_MAGIC_COLUMNS = [
   "$updatedBy",
   "$updatedAt",
 ] as const;
+export const PROVENANCE_MAGIC_TIMESTAMP_COLUMNS = ["$createdAt", "$updatedAt"] as const;
 
 export type PermissionIntrospectionColumn = (typeof PERMISSION_INTROSPECTION_COLUMNS)[number];
 export type ProvenanceMagicColumn = (typeof PROVENANCE_MAGIC_COLUMNS)[number];
+export type ProvenanceMagicTimestampColumn = (typeof PROVENANCE_MAGIC_TIMESTAMP_COLUMNS)[number];
 
 export function isPermissionIntrospectionColumn(
   column: string,
@@ -21,6 +23,12 @@ export function isPermissionIntrospectionColumn(
 
 export function isProvenanceMagicColumn(column: string): column is ProvenanceMagicColumn {
   return PROVENANCE_MAGIC_COLUMNS.includes(column as ProvenanceMagicColumn);
+}
+
+export function isProvenanceMagicTimestampColumn(
+  column: string,
+): column is ProvenanceMagicTimestampColumn {
+  return PROVENANCE_MAGIC_TIMESTAMP_COLUMNS.includes(column as ProvenanceMagicTimestampColumn);
 }
 
 export function isReservedMagicColumnName(column: string): boolean {

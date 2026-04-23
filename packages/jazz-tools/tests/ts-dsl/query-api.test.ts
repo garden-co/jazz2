@@ -594,6 +594,49 @@ describe("TS Query API", () => {
       await db.shutdown();
     });
 
+    it("selects and filters provenance magic timestamp columns as JS dates", async () => {
+      const startedAt = Date.now();
+      const { id: projectId } = insertProject(db, "Announcements");
+      const { id: todoId } = insertTodo(db, {
+        title: "Draft docs",
+        done: false,
+        tags: ["dev"],
+        projectId,
+        assigneesIds: [],
+      });
+
+      const projected = await db.one(
+        app.todos.select("title", "$createdAt", "$updatedAt").where({ id: { eq: todoId } }),
+      );
+
+      assert(projected, "Result is not defined");
+      expectTypeOf(projected.$createdAt).toEqualTypeOf<Date>();
+      expectTypeOf(projected.$updatedAt).toEqualTypeOf<Date>();
+      expect(projected.title).toBe("Draft docs");
+      expect(projected.$createdAt).toBeInstanceOf(Date);
+      expect(projected.$updatedAt).toBeInstanceOf(Date);
+      expect(projected.$createdAt.getTime()).toBeGreaterThanOrEqual(startedAt - 60_000);
+      expect(projected.$createdAt.getTime()).toBeLessThanOrEqual(Date.now() + 60_000);
+      expect(projected.$updatedAt.getTime()).toBeGreaterThanOrEqual(startedAt - 60_000);
+      expect(projected.$updatedAt.getTime()).toBeLessThanOrEqual(Date.now() + 60_000);
+
+      const upperBound = new Date(Date.now() + 60_000);
+      const withinUpperBound = await db.all(
+        app.todos
+          .where({ $updatedAt: { lte: upperBound } })
+          .select("title", "$updatedAt")
+          .orderBy("title", "asc"),
+      );
+
+      expect(withinUpperBound).toContainEqual(
+        expect.objectContaining({
+          id: todoId,
+          title: "Draft docs",
+          $updatedAt: projected.$updatedAt,
+        }),
+      );
+    });
+
     it("include builders can project nested relation columns", async () => {
       const { id: projectId } = insertProject(db, "Announcements");
       const { id: ownerId } = insertUser(db);

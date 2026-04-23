@@ -257,6 +257,35 @@ describe("transformRows", () => {
     expect(result[0]?.created_at.getTime()).toBe(ts);
   });
 
+  it("scales provenance magic timestamp columns down to JS milliseconds", () => {
+    const timestampSchema: WasmSchema = {
+      events: {
+        columns: [{ name: "title", column_type: { type: "Text" }, nullable: false }],
+      },
+    };
+    const tsMicros = 1_704_067_200_123_000;
+    const rows: WasmRow[] = [
+      {
+        id: "event-1",
+        values: [
+          { type: "Text", value: "Launch" },
+          { type: "Timestamp", value: tsMicros },
+        ],
+      },
+    ];
+
+    const result = transformRows<{ id: string; title: string; $updatedAt: Date }>(
+      rows,
+      timestampSchema,
+      "events",
+      {},
+      ["title", "$updatedAt"],
+    );
+
+    expect(result[0]?.$updatedAt).toBeInstanceOf(Date);
+    expect(result[0]?.$updatedAt.getTime()).toBe(1_704_067_200_123);
+  });
+
   it("transforms Json columns to parsed values", () => {
     const jsonSchema: WasmSchema = {
       documents: {

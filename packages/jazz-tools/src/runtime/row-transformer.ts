@@ -5,7 +5,7 @@
 import type { Value as WasmValue, WasmRow, WasmSchema } from "../drivers/types.js";
 import type { ColumnType } from "../drivers/types.js";
 import { analyzeRelations, type Relation } from "../codegen/relation-analyzer.js";
-import { magicColumnType } from "../magic-columns.js";
+import { isProvenanceMagicTimestampColumn, magicColumnType } from "../magic-columns.js";
 import { normalizeIncludeEntries, type NormalizedIncludeSpec } from "./query-builder-shape.js";
 import { resolveSelectedColumns } from "./select-projection.js";
 
@@ -141,7 +141,7 @@ function transformRowValues(
     if (!col) continue;
     const value = values[i];
     if (value !== undefined) {
-      obj[col.name] = unwrapValue(value, col.columnType);
+      obj[col.name] = unwrapValue(value, col.columnType, col.name);
     }
   }
 
@@ -156,7 +156,14 @@ function transformRowValues(
   return obj;
 }
 
-export function unwrapValue(v: WasmValue, columnType?: ColumnType): unknown {
+function timestampToDate(value: number, columnName?: string): Date {
+  if (columnName && isProvenanceMagicTimestampColumn(columnName)) {
+    return new Date(Math.trunc(value / 1_000));
+  }
+  return new Date(value);
+}
+
+export function unwrapValue(v: WasmValue, columnType?: ColumnType, columnName?: string): unknown {
   switch (v.type) {
     case "Text":
       if (columnType?.type === "Json") {
@@ -178,7 +185,7 @@ export function unwrapValue(v: WasmValue, columnType?: ColumnType): unknown {
     case "Double":
       return v.value;
     case "Timestamp":
-      return new Date(v.value);
+      return timestampToDate(v.value, columnName);
     case "Bytea":
       return toByteArray((v as { value: unknown }).value);
     case "Null":

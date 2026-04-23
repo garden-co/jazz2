@@ -11,7 +11,7 @@
 import type { ColumnType, WasmSchema } from "../drivers/types.js";
 import { toJsonText } from "./json-text.js";
 import { analyzeRelations, type Relation } from "../codegen/relation-analyzer.js";
-import { magicColumnType } from "../magic-columns.js";
+import { isProvenanceMagicTimestampColumn, magicColumnType } from "../magic-columns.js";
 import {
   normalizeBuiltQuery,
   type BuiltCondition,
@@ -100,10 +100,17 @@ function toTimestampMs(value: unknown): number {
   throw new Error("Invalid timestamp condition. Expected Date, ISO string, or finite number.");
 }
 
+function toRuntimeTimestampValue(value: unknown, columnName?: string): number {
+  const timestampMs = toTimestampMs(value);
+  return columnName && isProvenanceMagicTimestampColumn(columnName)
+    ? timestampMs * 1_000
+    : timestampMs;
+}
+
 /**
  * Translate a JavaScript value to WasmValue format.
  */
-function toWasmValue(value: unknown, columnType: ColumnType): object {
+function toWasmValue(value: unknown, columnType: ColumnType, columnName?: string): object {
   if (value === null || value === undefined) {
     return { type: "Null" };
   }
@@ -111,7 +118,7 @@ function toWasmValue(value: unknown, columnType: ColumnType): object {
     return { type: "Text", value: toJsonText(value) };
   }
   if (columnType.type === "Timestamp" && value instanceof Date) {
-    return { type: "Timestamp", value: toTimestampMs(value) };
+    return { type: "Timestamp", value: toRuntimeTimestampValue(value, columnName) };
   }
   if (columnType.type === "Bytea") {
     if (value instanceof Uint8Array) {
@@ -143,14 +150,14 @@ function toWasmValue(value: unknown, columnType: ColumnType): object {
   }
   if (typeof value === "number") {
     if (columnType?.type === "Timestamp") {
-      return { type: "Timestamp", value: toTimestampMs(value) };
+      return { type: "Timestamp", value: toRuntimeTimestampValue(value, columnName) };
     }
     // Use Integer for all numbers - WASM will handle type coercion
     return { type: "Integer", value };
   }
   if (typeof value === "string") {
     if (columnType?.type === "Timestamp") {
-      return { type: "Timestamp", value: toTimestampMs(value) };
+      return { type: "Timestamp", value: toRuntimeTimestampValue(value, columnName) };
     }
     if (columnType?.type === "Uuid") {
       return { type: "Uuid", value };
@@ -228,7 +235,7 @@ function conditionToArraySubqueryFilter(
 
   const valueTypeForCondition =
     cond.op === "contains" && columnType.type === "Array" ? columnType.element : columnType;
-  const literalValue = toWasmValue(cond.value, valueTypeForCondition);
+  const literalValue = toWasmValue(cond.value, valueTypeForCondition, column);
   const isNullValue = cond.value === undefined ? true : cond.value;
 
   switch (cond.op) {
@@ -360,7 +367,7 @@ function conditionToRelPredicate(
     isFrontierRowIdToken(cond.value) && cond.op === "eq"
       ? { RowId: "Frontier" as const }
       : {
-          Literal: toWasmValue(cond.value, valueTypeForCondition),
+          Literal: toWasmValue(cond.value, valueTypeForCondition, column),
         };
   const isNullValue = cond.value === undefined ? true : cond.value;
   if (columnType.type === "Bytea" && ["gt", "gte", "lt", "lte"].includes(cond.op)) {
@@ -436,7 +443,7 @@ function conditionToRelPredicate(
         In: {
           left: columnRef,
           values: cond.value.map((value) => ({
-            Literal: toWasmValue(value, columnType),
+            Literal: toWasmValue(value, columnType, column),
           })),
         },
       };
