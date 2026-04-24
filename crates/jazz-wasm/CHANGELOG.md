@@ -1,5 +1,7 @@
 # jazz-wasm
 
+## 2.0.0-alpha.40
+
 ## 2.0.0-alpha.39
 
 ## 2.0.0-alpha.38

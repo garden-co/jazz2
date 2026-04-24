@@ -1,5 +1,11 @@
 # create-jazz
 
+## 0.0.2-alpha.1
+
+### Patch Changes
+
+- 206f0a9: The "Resolving dependencies" spinner now updates as each package resolves (e.g. `Resolving dependencies (2/5)`), so `npm create jazz` no longer appears frozen during that step.
+
 ## 0.0.2-alpha.0
 
 ### Patch Changes

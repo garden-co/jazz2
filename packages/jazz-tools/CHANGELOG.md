@@ -1,5 +1,19 @@
 # jazz-tools
 
+## 2.0.0-alpha.40
+
+### Patch Changes
+
+- 72e8727: Docs/example: document the correct Expo setup for `jazz-tools`.
+
+  `jazz-tools` emits `import.meta.url` from its runtime, so Expo apps must enable `unstable_transformImportMeta` in `babel-preset-expo` or Hermes fails to parse the bundle. `@expo/metro-config` only auto-detects `.babelrc`, `.babelrc.js`, and `babel.config.js` — `.cjs`/`.mjs` variants are silently ignored, and `config.transformer.extendsBabelConfigPath` is a no-op on Expo's pipeline. The Expo install docs and the `todo-client-localfirst-expo` example now use a plain CJS `babel.config.js` with `unstable_transformImportMeta: true`, drop the stray `.babelrc` shim, and stop declaring `"type": "module"`. `metro.config.mjs` stays ESM so it can top-level `await withJazz(...)`.
+
+- 19ab5c4: Fix JazzProvider re-initialising when an inline config object is passed on every render. The useEffect dep array previously included `config` (the object reference); it now uses `configKey` (the JSON-stringified value) so that structurally identical config objects no longer trigger a cleanup→reacquire cycle.
+- c5f0807: Wrap React `use` inside `JazzClientProvider` so it remains compatible with React 18 while preserving behavior on newer React versions.
+- 402d104: `jazzPlugin` and `jazzSvelteKit` now alias `jazz-wasm` to an absolute path resolved from `jazz-tools`'s own install location. This removes the need for Vite/SvelteKit consumers on pnpm to add `jazz-wasm` as a direct dependency just to work around pnpm's strict-isolation layout.
+  - jazz-wasm@2.0.0-alpha.40
+  - jazz-rn@2.0.0-alpha.40
+
 ## 2.0.0-alpha.39
 
 ### Patch Changes
