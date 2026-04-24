@@ -87,19 +87,37 @@ impl<S: Storage + Send + 'static> Scheduler for TokioScheduler<S> {
             let flag = self.scheduled.clone();
 
             tokio::spawn(async move {
-                // Clear the debounce flag BEFORE running batched_tick so that
-                // messages arriving while the tick executes can successfully
-                // schedule a follow-up tick.  Without this, a message parked
-                // between the drain inside batched_tick and the flag.store(false)
-                // below would be silently dropped — no tick would ever wake up
-                // to process it.
+                // Acquire the core lock FIRST, then clear the debounce flag
+                // immediately before running batched_tick.
+                //
+                // Clearing the flag before running the tick preserves the
+                // lost-wakeup fix: a message arriving while batched_tick
+                // executes finds scheduled=false and can schedule a follow-up.
+                //
+                // Clearing it only after acquiring the lock prevents task
+                // pileup: if we cleared earlier, every caller that arrived
+                // while this task was blocked on the mutex would see
+                // scheduled=false and spawn another task, all piling up
+                // behind the same lock. Holding the flag high until we
+                // actually own the core caps the queue at one pending tick.
+                let Some(core_arc) = core_ref.upgrade() else {
+                    // Core is permanently gone. Leave the flag high so any
+                    // stray scheduler clones (e.g. NativeTickNotifier) short-
+                    // circuit instead of spawning more doomed tasks.
+                    tracing::debug!("TokioScheduler: core dropped before tick could run; skipping");
+                    return;
+                };
+                let Ok(mut core) = core_arc.lock() else {
+                    // Mutex is poisoned but the core Arc still exists. Clear
+                    // the flag so we don't leave a stale "tick queued" signal
+                    // behind — callers are free to retry (and fail) on their
+                    // own terms.
+                    tracing::error!("TokioScheduler: core mutex poisoned; scheduler is unusable");
+                    flag.store(false, Ordering::SeqCst);
+                    return;
+                };
                 flag.store(false, Ordering::SeqCst);
-
-                if let Some(core_arc) = core_ref.upgrade()
-                    && let Ok(mut core) = core_arc.lock()
-                {
-                    core.batched_tick();
-                }
+                core.batched_tick();
             });
         }
     }
