@@ -53,7 +53,7 @@ function ChatShell({ user, onSignIn, onSignOut }: ChatShellProps) {
 function useWorkOsJWT() {
   const { isLoading, user, getAccessToken, signIn, signOut } = useAuth();
   const [jwt, setJWT] = React.useState<string | undefined>(undefined);
-  const [isLoadingJWT, setIsLoadingJWT] = React.useState(false);
+  const [isLoadingJWT, setIsLoadingJWT] = React.useState(true);
 
   const userId = user?.id;
 
@@ -97,8 +97,8 @@ function useWorkOsJWT() {
   };
 }
 
-const appId = import.meta.env.JAZZ_APP_ID;
-const serverUrl = import.meta.env.JAZZ_SERVER_URL;
+const appId = import.meta.env.VITE_JAZZ_APP_ID;
+const serverUrl = import.meta.env.VITE_JAZZ_SERVER_URL;
 
 function JazzApp() {
   const workos = useWorkOsJWT();

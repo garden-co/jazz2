@@ -21,7 +21,6 @@ export default function ClientTodo() {
         appId,
         serverUrl: process.env.NEXT_PUBLIC_JAZZ_SERVER_URL!,
         secret,
-        driver: { type: "memory" },
       }}
     >
       <TodoForm />

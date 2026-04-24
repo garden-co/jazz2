@@ -101,8 +101,8 @@ async function persistAppIdToEnv(envPath: string, envKey: string, appId: string)
   let content = "";
   try {
     content = await readFile(envPath, "utf8");
-  } catch {
-    // file doesn't exist yet
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
   if (content.includes(`${envKey}=`)) return;
   const line = `${envKey}=${appId}\n`;

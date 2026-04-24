@@ -4,8 +4,6 @@ import { jazzPlugin } from "jazz-tools/dev/vite";
 
 export default defineConfig({
   plugins: [react(), jazzPlugin()],
-  build: { target: "es2020" },
-  worker: { format: "es" },
   optimizeDeps: {
     exclude: ["groove-wasm"],
   },

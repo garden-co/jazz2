@@ -1,6 +1,7 @@
 "server-only";
 
 import { app as schemaApp } from "../schema";
+import permissions from "../permissions";
 
 // This is a workaround to resolve correctly NAPI modules in the monorepo
 // Real-world apps should just `import { createJazzContext } from "jazz-tools/backend"`
@@ -15,7 +16,7 @@ const { createJazzContext } = nodeRequire(
 const context = createJazzContext({
   appId: process.env.NEXT_PUBLIC_JAZZ_APP_ID!,
   app: schemaApp,
-  permissions: {},
+  permissions,
   driver: { type: "memory" },
   serverUrl: process.env.NEXT_PUBLIC_JAZZ_SERVER_URL!,
   backendSecret: process.env.BACKEND_SECRET!,

@@ -11,11 +11,6 @@ const JAZZ_PORT = 4200;
 
 export default defineConfig({
   plugins: [svelte(), basicSsl(), jazzPlugin({ server: { port: JAZZ_PORT } })],
-  build: { target: "es2020" },
-  worker: { format: "es" },
-  optimizeDeps: {
-    exclude: ["jazz-wasm"],
-  },
   server: {
     proxy: {
       "/apps": { target: `http://127.0.0.1:${JAZZ_PORT}`, ws: true },

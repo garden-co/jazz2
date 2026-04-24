@@ -121,7 +121,7 @@ import { MapController, type StopMapData } from "./lib/map-controller";
 import { findNearestStop } from "./lib/nearest-stop";
 import type { StopWithLocation } from "./lib/nearest-stop";
 import { ensureData } from "./seed-loader";
-import { appId, isPublicMode } from "./constants";
+import { isPublicMode } from "./constants";
 import Sheet from "./components/Sheet.vue";
 import StopDetail from "./components/StopDetail.vue";
 import StopPoster from "./components/StopPoster.vue";

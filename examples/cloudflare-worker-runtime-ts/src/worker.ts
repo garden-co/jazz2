@@ -7,7 +7,6 @@ import jazzWasmModule from "jazz-wasm/pkg/jazz_wasm_bg.wasm";
 import { app } from "./schema.js";
 
 const APP_ID = "cloudflare-worker-runtime-ts";
-const LOCAL_FIRST_SECRET = generateAuthSecret();
 
 let dbPromise: Promise<Db> | null = null;
 
@@ -29,7 +28,7 @@ function getDb(): Promise<Db> {
     appId: APP_ID,
     env: "dev",
     userBranch: "main",
-    auth: { localFirstSecret: LOCAL_FIRST_SECRET },
+    auth: { localFirstSecret: generateAuthSecret() },
     runtimeSources: {
       wasmModule: jazzWasmModule,
     },

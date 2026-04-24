@@ -25,15 +25,15 @@ New sign-ups receive `role = "member"` by default (configured via the `admin` pl
 cp .env.example .env
 ```
 
-The example reads these values from `.env`:
+The `.env` file only needs the values already in `.env.example`:
 
-- `NEXT_PUBLIC_JAZZ_APP_ID` — Jazz app id shared by the Next app and sync server
-- `NEXT_PUBLIC_JAZZ_SERVER_URL` — Jazz sync server URL
 - `NEXT_PUBLIC_APP_ORIGIN` — Next app origin used by Better Auth and Playwright
-- `ADMIN_SECRET` — admin secret for the local sync server
 - `BACKEND_SECRET` — backend secret used by the Better Auth Jazz context
 - `NEXT_PUBLIC_CHAT_ID` — general chat room id
 - `NEXT_PUBLIC_ANNOUNCEMENTS_CHAT_ID` — announcements chat room id
+
+`NEXT_PUBLIC_JAZZ_APP_ID`, `NEXT_PUBLIC_JAZZ_SERVER_URL`, and the sync server admin secret are
+injected automatically by `withJazz` in `next.config.ts` — you do not need to add them.
 
 `pnpm dev` and `pnpm test:e2e` both read the same `.env`.
 
