@@ -178,6 +178,40 @@ export interface DeployOptions {
 
 const SHORT_SCHEMA_HASH_LENGTH = 12;
 
+// Framework bundlers (Vite, SvelteKit, Next.js, Expo) expose public env vars
+// under their own prefix so the client bundle can read them. The CLI often
+// runs in the same project, so accept those prefixed names as fallbacks for
+// the canonical JAZZ_ form. The unprefixed JAZZ_ name always wins — it's the
+// explicit opt-in when the framework var points somewhere else (e.g. prod).
+// Admin/backend secrets stay unprefixed by design: a PUBLIC_/VITE_/NEXT_PUBLIC_
+// prefix would leak them into the client bundle.
+export const SERVER_URL_ENV_VARS = [
+  "JAZZ_SERVER_URL",
+  "PUBLIC_JAZZ_SERVER_URL",
+  "VITE_JAZZ_SERVER_URL",
+  "NEXT_PUBLIC_JAZZ_SERVER_URL",
+  "EXPO_PUBLIC_JAZZ_SERVER_URL",
+] as const;
+
+export const APP_ID_ENV_VARS = [
+  "JAZZ_APP_ID",
+  "PUBLIC_JAZZ_APP_ID",
+  "VITE_JAZZ_APP_ID",
+  "NEXT_PUBLIC_JAZZ_APP_ID",
+  "EXPO_PUBLIC_JAZZ_APP_ID",
+] as const;
+
+export function resolveEnvVar(
+  names: readonly string[],
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  for (const name of names) {
+    const value = env[name];
+    if (value) return value;
+  }
+  return undefined;
+}
+
 function getFlagValue(args: string[], flag: string): string | undefined {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -202,7 +236,7 @@ function hasFlag(args: string[], flag: string): boolean {
 function splitLeadingAppId(args: string[]): { appId?: string; args: string[] } {
   const first = args[0];
   if (!first || first.startsWith("-")) {
-    return { args };
+    return { args: args, appId: resolveEnvVar(APP_ID_ENV_VARS) };
   }
 
   return {
@@ -212,7 +246,7 @@ function splitLeadingAppId(args: string[]): { appId?: string; args: string[] } {
 }
 
 function resolveMigrationOptions(args: string[]): MigrationCommandOptions {
-  const serverUrl = getFlagValue(args, "--server-url") ?? process.env.JAZZ_SERVER_URL;
+  const serverUrl = getFlagValue(args, "--server-url") ?? resolveEnvVar(SERVER_URL_ENV_VARS);
   const adminSecret = getFlagValue(args, "--admin-secret") ?? process.env.JAZZ_ADMIN_SECRET;
   const migrationsDir = resolve(
     process.cwd(),
@@ -229,12 +263,14 @@ function resolveMigrationOptions(args: string[]): MigrationCommandOptions {
 }
 
 function resolvePermissionsOptions(args: string[]): Omit<PermissionsCommandOptions, "appId"> {
-  const serverUrl = getFlagValue(args, "--server-url") ?? process.env.JAZZ_SERVER_URL;
+  const serverUrl = getFlagValue(args, "--server-url") ?? resolveEnvVar(SERVER_URL_ENV_VARS);
   const adminSecret = getFlagValue(args, "--admin-secret") ?? process.env.JAZZ_ADMIN_SECRET;
   const schemaDir = resolve(process.cwd(), getFlagValue(args, "--schema-dir") ?? process.cwd());
 
   if (!serverUrl) {
-    throw new Error("Missing server URL. Pass --server-url <url> or set JAZZ_SERVER_URL.");
+    throw new Error(
+      "Missing server URL. Pass --server-url <url> or set JAZZ_SERVER_URL (or a framework-prefixed form such as VITE_JAZZ_SERVER_URL).",
+    );
   }
 
   if (!adminSecret) {
@@ -452,7 +488,9 @@ function requireSchemaExportServerValue(
   }
 
   if (kind === "serverUrl") {
-    throw new Error("Missing server URL. Pass --server-url <url> or set JAZZ_SERVER_URL.");
+    throw new Error(
+      "Missing server URL. Pass --server-url <url> or set JAZZ_SERVER_URL (or a framework-prefixed form such as VITE_JAZZ_SERVER_URL).",
+    );
   }
 
   throw new Error("Missing admin secret. Pass --admin-secret <secret> or set JAZZ_ADMIN_SECRET.");
@@ -464,7 +502,7 @@ function requireAppId(appId: string | undefined): string {
   }
 
   throw new Error(
-    "Missing app ID. Pass an <appId> positional argument for server-backed requests.",
+    "Missing app ID. Pass an <appId> positional argument or set JAZZ_APP_ID (or a framework-prefixed form such as VITE_JAZZ_APP_ID).",
   );
 }
 
@@ -493,7 +531,7 @@ async function resolveExportedSchemaByHash(options: SchemaExportOptions): Promis
   }
 
   const serverUrl = requireSchemaExportServerValue(
-    options.serverUrl ?? process.env.JAZZ_SERVER_URL,
+    options.serverUrl ?? resolveEnvVar(SERVER_URL_ENV_VARS),
     "serverUrl",
   );
   const adminSecret = requireSchemaExportServerValue(
@@ -1867,7 +1905,7 @@ if (isMainModule()) {
           : undefined,
         schemaHash: schemaHashFlag,
         appId,
-        serverUrl: getFlagValue(args, "--server-url") ?? process.env.JAZZ_SERVER_URL,
+        serverUrl: getFlagValue(args, "--server-url") ?? resolveEnvVar(SERVER_URL_ENV_VARS),
         adminSecret: getFlagValue(args, "--admin-secret") ?? process.env.JAZZ_ADMIN_SECRET,
       }).catch((err) => {
         console.error(err.message);
@@ -1963,21 +2001,33 @@ if (isMainModule()) {
     console.log("\nSchema hash options:");
     console.log("  --schema-dir <path>   Path to app root containing schema.ts (default: .)");
     console.log("\nSchema export options:");
-    console.log("  <appId>               Required for server-backed schema export by hash");
+    console.log(
+      "  <appId>               Required for server-backed schema export by hash (or set JAZZ_APP_ID / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_APP_ID)",
+    );
     console.log("  --schema-dir <path>   Path to app root containing schema.ts (default: .)");
     console.log("  --schema-hash <hash>  Export a stored structural schema by hash");
     console.log("  --migrations-dir <p>  Path to migrations directory (default: ./migrations)");
-    console.log("  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL)");
+    console.log(
+      "  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_SERVER_URL)",
+    );
     console.log("  --admin-secret <sec>  Admin secret (or set JAZZ_ADMIN_SECRET)");
     console.log("\nPermissions options:");
-    console.log("  <appId>               Required");
+    console.log(
+      "  <appId>               Required (or set JAZZ_APP_ID / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_APP_ID)",
+    );
     console.log("  --schema-dir <path>   Path to app root containing schema.ts (default: .)");
-    console.log("  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL)");
+    console.log(
+      "  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_SERVER_URL)",
+    );
     console.log("  --admin-secret <sec>  Admin secret (or set JAZZ_ADMIN_SECRET)");
     console.log("\nMigration options:");
-    console.log("  <appId>               Required for remote create/push commands");
+    console.log(
+      "  <appId>               Required for remote create/push commands (or set JAZZ_APP_ID / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_APP_ID)",
+    );
     console.log("  --schema-dir <path>   Path to app root containing schema.ts (default: .)");
-    console.log("  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL)");
+    console.log(
+      "  --server-url <url>    Jazz server URL (or set JAZZ_SERVER_URL / {VITE,PUBLIC,NEXT_PUBLIC,EXPO_PUBLIC}_JAZZ_SERVER_URL)",
+    );
     console.log("  --admin-secret <sec>  Admin secret (or set JAZZ_ADMIN_SECRET)");
     console.log("  --migrations-dir <p>  Path to migrations directory (default: ./migrations)");
     console.log(
