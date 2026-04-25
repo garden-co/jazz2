@@ -8,7 +8,10 @@ import { scaffold, validateAppName, type ScaffoldOptions } from "./scaffold.js";
 const repoRoot = path.resolve(import.meta.dirname, "../../../");
 const betterauthStarterPath = path.join(repoRoot, "starters/next-betterauth");
 const localfirstStarterPath = path.join(repoRoot, "starters/next-localfirst");
+const hybridStarterPath = path.join(repoRoot, "starters/next-hybrid");
 const sveltekitBetterauthStarterPath = path.join(repoRoot, "starters/sveltekit-betterauth");
+const sveltekitLocalfirstStarterPath = path.join(repoRoot, "starters/sveltekit-localfirst");
+const sveltekitHybridStarterPath = path.join(repoRoot, "starters/sveltekit-hybrid");
 
 // CI runners have no global git identity configured, so inject fallbacks
 // via the env vars git honours. Production code still fails loudly when a
@@ -224,6 +227,153 @@ describe("scaffold() — sveltekit-betterauth e2e via JAZZ_STARTER_PATH", () => 
     // SvelteKit starters have src/lib/ structure
     expect(fs.existsSync(path.join(tmpDir, "src/lib/schema.ts"))).toBe(true);
     expect(fs.existsSync(path.join(tmpDir, "svelte.config.js"))).toBe(true);
+
+    const allDepValues = [
+      ...Object.values(pkgJson.dependencies ?? {}),
+      ...Object.values(pkgJson.devDependencies ?? {}),
+    ];
+    for (const value of allDepValues) {
+      expect(value).not.toMatch(/^workspace:/);
+      expect(value).not.toMatch(/^catalog:/);
+    }
+  });
+});
+
+describe("scaffold() — next-hybrid e2e via JAZZ_STARTER_PATH", () => {
+  withLocalStarter(hybridStarterPath);
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scaffolds a complete next-hybrid project", { timeout: 30_000 }, async () => {
+    tmpDir = path.join(os.tmpdir(), `scaffold-next-hybrid-${Date.now()}`);
+
+    await scaffold({
+      appName: "alice-hybrid",
+      targetDir: tmpDir,
+      pm: null,
+      starter: "next-hybrid",
+    });
+
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(tmpDir, "package.json"), "utf-8")) as {
+      name?: string;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    expect(pkgJson.name).toBe("alice-hybrid");
+    expect(fs.existsSync(path.join(tmpDir, ".git"))).toBe(true);
+
+    // Hybrid starters include server-side auth wiring.
+    expect(fs.existsSync(path.join(tmpDir, "lib/auth.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "lib/auth-client.ts"))).toBe(true);
+
+    // Hybrid starters ship an env initialisation script.
+    expect(fs.existsSync(path.join(tmpDir, "scripts/ensure-env.js"))).toBe(true);
+
+    const allDepValues = [
+      ...Object.values(pkgJson.dependencies ?? {}),
+      ...Object.values(pkgJson.devDependencies ?? {}),
+    ];
+    for (const value of allDepValues) {
+      expect(value).not.toMatch(/^workspace:/);
+      expect(value).not.toMatch(/^catalog:/);
+    }
+  });
+});
+
+describe("scaffold() — sveltekit-localfirst e2e via JAZZ_STARTER_PATH", () => {
+  withLocalStarter(sveltekitLocalfirstStarterPath);
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scaffolds a complete sveltekit-localfirst project", { timeout: 30_000 }, async () => {
+    tmpDir = path.join(os.tmpdir(), `scaffold-sveltekit-lf-${Date.now()}`);
+
+    await scaffold({
+      appName: "alice-sveltekit-lf",
+      targetDir: tmpDir,
+      pm: null,
+      starter: "sveltekit-localfirst",
+    });
+
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(tmpDir, "package.json"), "utf-8")) as {
+      name?: string;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    expect(pkgJson.name).toBe("alice-sveltekit-lf");
+    expect(fs.existsSync(path.join(tmpDir, ".git"))).toBe(true);
+
+    // SvelteKit starters have src/lib/ structure.
+    expect(fs.existsSync(path.join(tmpDir, "src/lib/schema.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "svelte.config.js"))).toBe(true);
+
+    // Local-first starters have no server-side auth module.
+    expect(fs.existsSync(path.join(tmpDir, "src/lib/auth.ts"))).toBe(false);
+
+    const allDepValues = [
+      ...Object.values(pkgJson.dependencies ?? {}),
+      ...Object.values(pkgJson.devDependencies ?? {}),
+    ];
+    for (const value of allDepValues) {
+      expect(value).not.toMatch(/^workspace:/);
+      expect(value).not.toMatch(/^catalog:/);
+    }
+  });
+});
+
+describe("scaffold() — sveltekit-hybrid e2e via JAZZ_STARTER_PATH", () => {
+  withLocalStarter(sveltekitHybridStarterPath);
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scaffolds a complete sveltekit-hybrid project", { timeout: 30_000 }, async () => {
+    tmpDir = path.join(os.tmpdir(), `scaffold-sveltekit-hybrid-${Date.now()}`);
+
+    await scaffold({
+      appName: "alice-sveltekit-hybrid",
+      targetDir: tmpDir,
+      pm: null,
+      starter: "sveltekit-hybrid",
+    });
+
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(tmpDir, "package.json"), "utf-8")) as {
+      name?: string;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    expect(pkgJson.name).toBe("alice-sveltekit-hybrid");
+    expect(fs.existsSync(path.join(tmpDir, ".git"))).toBe(true);
+
+    // SvelteKit starters have src/lib/ structure.
+    expect(fs.existsSync(path.join(tmpDir, "src/lib/schema.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "svelte.config.js"))).toBe(true);
+
+    // Hybrid starters include server-side auth wiring and sign-up/sign-in routes.
+    expect(fs.existsSync(path.join(tmpDir, "src/lib/auth.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "src/lib/auth-client.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "src/routes/signup/+page.svelte"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "src/routes/signin/+page.svelte"))).toBe(true);
+
+    // Hybrid starters ship an env initialisation script.
+    expect(fs.existsSync(path.join(tmpDir, "scripts/ensure-env.js"))).toBe(true);
 
     const allDepValues = [
       ...Object.values(pkgJson.dependencies ?? {}),
