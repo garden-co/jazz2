@@ -1357,44 +1357,6 @@ impl SyncManager {
                     *state,
                     *confirmed_tier,
                 );
-                let key = RowBatchKey::new(*row_id, *branch_name, *batch_id);
-                let mut interested = HashSet::new();
-                if let Some(clients) = self.row_batch_interest.get(&key) {
-                    interested.extend(clients);
-                }
-                interested.remove(&client_id);
-                let settlement = self.settlement_for_row_batch_state_change(
-                    storage,
-                    *row_id,
-                    *branch_name,
-                    *batch_id,
-                    *confirmed_tier,
-                );
-                let persisted_settlement = settlement.clone().filter(|settlement| {
-                    self.persist_authoritative_batch_settlement(storage, settlement)
-                        .is_ok()
-                });
-                if let Some(settlement) = persisted_settlement.clone() {
-                    self.pending_batch_settlements.push(settlement);
-                }
-                for cid in interested {
-                    self.outbox.push(OutboxEntry {
-                        destination: Destination::Client(cid),
-                        payload: SyncPayload::RowBatchStateChanged {
-                            row_id: *row_id,
-                            branch_name: *branch_name,
-                            batch_id: *batch_id,
-                            state: *state,
-                            confirmed_tier: *confirmed_tier,
-                        },
-                    });
-                    if let Some(settlement) = persisted_settlement.clone() {
-                        self.outbox.push(OutboxEntry {
-                            destination: Destination::Client(cid),
-                            payload: SyncPayload::BatchSettlement { settlement },
-                        });
-                    }
-                }
             }
             SyncPayload::BatchSettlement { settlement } => {
                 self.pending_batch_settlements.push(settlement.clone());

@@ -950,6 +950,76 @@ fn row_batch_state_changed_relays_to_clients_that_received_row_batch_needed() {
 }
 
 #[test]
+fn client_row_batch_state_ack_does_not_leak_to_other_subscribers() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let alice = ClientId::new();
+    let bob = ClientId::new();
+    let row_id = ObjectId::new();
+    let mut row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice-todo");
+    row.confirmed_tier = Some(DurabilityTier::GlobalServer);
+    let batch_id = row.batch_id;
+
+    add_client(&mut sm, &io, alice);
+    add_client(&mut sm, &io, bob);
+    sm.take_outbox();
+    seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    persist_visible_row_settlement(&mut io, row_id, &row);
+
+    for (client_id, query_id) in [(alice, QueryId(1)), (bob, QueryId(2))] {
+        set_client_query_scope(
+            &mut sm,
+            &io,
+            client_id,
+            query_id,
+            HashSet::from([(row_id, BranchName::new("main"))]),
+            None,
+        );
+    }
+
+    let initial = sm.take_outbox();
+    assert!(initial.iter().any(|entry| matches!(
+        entry,
+        OutboxEntry {
+            destination: Destination::Client(id),
+            payload: SyncPayload::RowBatchNeeded { row: needed, .. },
+        } if *id == alice && needed.row_id == row_id
+    )));
+    assert!(initial.iter().any(|entry| matches!(
+        entry,
+        OutboxEntry {
+            destination: Destination::Client(id),
+            payload: SyncPayload::RowBatchNeeded { row: needed, .. },
+        } if *id == bob && needed.row_id == row_id
+    )));
+
+    sm.process_from_client(
+        &mut io,
+        bob,
+        SyncPayload::RowBatchStateChanged {
+            row_id,
+            branch_name: BranchName::new("main"),
+            batch_id,
+            state: None,
+            confirmed_tier: Some(DurabilityTier::Local),
+        },
+    );
+
+    let outbox = sm.take_outbox();
+    assert!(
+        outbox.iter().all(|entry| !matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload:
+                    SyncPayload::RowBatchStateChanged { .. } | SyncPayload::BatchSettlement { .. },
+            } if *id == alice
+        )),
+        "alice should not receive bob's per-client row-batch ack: {outbox:#?}"
+    );
+}
+
+#[test]
 fn initial_query_sync_replays_current_direct_batch_settlement() {
     let mut sm = SyncManager::new();
     let mut io = MemoryStorage::new();
