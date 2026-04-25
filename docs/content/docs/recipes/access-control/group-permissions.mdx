@@ -1,0 +1,74 @@
+---
+title: "Group permissions"
+description: Model a workspace with role-based access control using a members table and existence-based permissions.
+reviewedAt: "c92542388"
+---
+
+This recipe shows how to build a workspace where users have different levels of access depending on their role. The same pattern applies to any group-like concept&hairsp;—&hairsp;teams, projects, channels, organisations.
+
+## Roles at a glance
+
+| Role          | Read | Create | Edit own | Edit any | Manage members |
+| ------------- | ---- | ------ | -------- | -------- | -------------- |
+| `reader`      | ✓    |        |          |          |                |
+| `contributor` | ✓    | ✓      | ✓        |          |                |
+| `writer`      | ✓    | ✓      | ✓        | ✓        |                |
+| `admin`       | ✓    | ✓      | ✓        | ✓        | ✓              |
+
+## Schema
+
+Three tables: the workspace itself, a members join table that records each user's role, and the documents that belong to the workspace.
+
+<include cwd lang="ts" meta='title="schema.ts"'>
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-schema
+</include>
+
+## Permissions
+
+<include cwd lang="ts" meta='title="permissions.ts"'>
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-permissions
+</include>
+
+- **Contributor** edit access uses `allOf` to require both `$createdBy: session.user_id` (the row belongs to this user) and a matching contributor membership. Writers and admins bypass the creator check entirely.
+- **Bootstrap insert**: the second branch of `allowInsert` lets the workspace creator add themselves as the first admin&hairsp;—&hairsp;otherwise `isAdmin` would block everyone, since there are no members yet.
+- **Leave on your own**: members can delete their own membership row regardless of role. Admins can remove anyone.
+
+See [Permissions](/docs/auth/permissions) for more on `exists.where`, `anyOf`, `allOf`, and `$createdBy`.
+
+## Creating a workspace
+
+<include cwd lang="ts">
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-create
+</include>
+
+## Managing members
+
+### Adding a member
+
+<include cwd lang="ts">
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-add-member
+</include>
+
+### Listing members
+
+<include cwd lang="tsx" meta='title="WorkspaceMembers.tsx"'>
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-members-list
+</include>
+
+### Changing a member's role
+
+<include cwd lang="ts">
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-change-role
+</include>
+
+### Removing a member
+
+<include cwd lang="ts">
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-remove-member
+</include>
+
+## Querying documents
+
+<include cwd lang="tsx" meta='title="WorkspaceDocuments.tsx"'>
+  ../examples/docs/todo-client-localfirst-react/src/group-permissions-snippets.tsx#group-query-docs
+</include>
