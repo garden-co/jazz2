@@ -120,10 +120,15 @@ function isTypedAppLike(value: Record<string, unknown>): value is { wasmSchema: 
   return typeof schema === "object" && schema !== null && !Array.isArray(schema);
 }
 
-function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null {
+interface LoadedSchemaResult {
+  schema: Schema;
+  wasmSchema?: WasmSchema;
+}
+
+function schemaFromLoadedModule(loaded: Record<string, unknown>): LoadedSchemaResult | null {
   const collected = getCollectedSchema();
   if (collected.tables.length > 0) {
-    return collected;
+    return { schema: collected };
   }
 
   const candidates = [loaded.schema, loaded.schemaDef, loaded.default, loaded.app].filter(
@@ -133,11 +138,14 @@ function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null 
 
   for (const candidate of candidates) {
     if (isTypedAppLike(candidate)) {
-      return wasmSchemaToAst(candidate.wasmSchema);
+      return {
+        schema: wasmSchemaToAst(candidate.wasmSchema),
+        wasmSchema: candidate.wasmSchema,
+      };
     }
 
     try {
-      return schemaDefinitionToAst(candidate as any);
+      return { schema: schemaDefinitionToAst(candidate as any) };
     } catch {
       // Try the next supported export shape.
     }
@@ -146,7 +154,7 @@ function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null 
   return null;
 }
 
-async function loadSchemaAst(filePath: string): Promise<Schema> {
+async function loadSchemaAst(filePath: string): Promise<LoadedSchemaResult> {
   const loaded = await loadTsModule(filePath);
   const directSchema = schemaFromLoadedModule(loaded);
   if (directSchema) {
@@ -290,7 +298,8 @@ export async function loadCompiledSchema(schemaDir: string): Promise<LoadedSchem
     );
   }
 
-  let schema = await loadSchemaAst(resolved.schemaFile);
+  const loadedSchema = await loadSchemaAst(resolved.schemaFile);
+  const schema = loadedSchema.schema;
   const tablesWithInlinePolicies = findInlinePolicyTables(schema);
   if (tablesWithInlinePolicies.length > 0) {
     throw new Error(
@@ -328,6 +337,6 @@ export async function loadCompiledSchema(schemaDir: string): Promise<LoadedSchem
     permissionsFile: resolvedPermissionsFile,
     permissions,
     schema,
-    wasmSchema: schemaToWasm(schema),
+    wasmSchema: loadedSchema.wasmSchema ?? schemaToWasm(schema),
   };
 }
