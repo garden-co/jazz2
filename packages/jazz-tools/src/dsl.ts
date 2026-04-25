@@ -47,21 +47,12 @@ function isJsonObject(value: unknown): value is JsonSchema {
 }
 
 function normalizeJsonSchema<Output>(schema: JsonSchemaSource<Output>): JsonSchema {
-  const maybeStandard = (
-    schema as {
-      "~standard"?: {
-        jsonSchema?: {
-          input?: (options: { target: string }) => unknown;
-        };
-      };
-    }
-  )["~standard"];
-  const converter = maybeStandard?.jsonSchema?.input;
-  if (typeof converter === "function") {
-    const converted = converter({ target: "draft-07" });
+  const maybeStandard = "~standard" in schema ? schema["~standard"] : undefined;
+  if (maybeStandard) {
+    const converted = maybeStandard.jsonSchema.output({ target: "draft-07" });
     if (!isJsonObject(converted)) {
       throw new Error(
-        "JSON schema conversion failed: expected an object from ~standard.jsonSchema.input(...).",
+        "JSON schema conversion failed: expected an object from ~standard.jsonSchema.output(...).",
       );
     }
     return converted;
