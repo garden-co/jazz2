@@ -7,6 +7,7 @@ import { MessageComposer } from "@/components/composer/MessageComposer";
 import { Button } from "@/components/ui/button";
 import { useMyProfile } from "@/hooks/useMyProfile";
 import { app } from "../../../schema.js";
+import { type DurabilityTier } from "jazz-tools";
 
 const INITIAL_MESSAGES_TO_SHOW = 20;
 const LOAD_MORE_STEP = 20;
@@ -20,6 +21,9 @@ export const ChatView = ({ chatId }: ChatViewProps) => {
   const session = useSession();
   const userId = session?.user_id ?? null;
   const myProfile = useMyProfile();
+  const sharedWriteOptions: { tier: DurabilityTier } = {
+    tier: db.getConfig().serverUrl ? "edge" : "local",
+  };
 
   const [showNLastMessages, setShowNLastMessages] = useState(INITIAL_MESSAGES_TO_SHOW);
 
@@ -34,18 +38,51 @@ export const ChatView = ({ chatId }: ChatViewProps) => {
   const myMemberships =
     useAll(app.chatMembers.where({ chatId, userId: userId ?? "__none__" })) ?? [];
   const isMember = myMemberships.length > 0;
+  // autoJoinPending: true while we've started the insert but haven't yet
+  // received server acknowledgement.  Used to suppress the isMember shortcut
+  // so a local-only membership row can't unlock the composer prematurely.
+  const autoJoinPending = useRef(false);
   const autoJoined = useRef(false);
 
+  // membershipReady gates the composer: true when we know the server has
+  // acknowledged this user's membership.  Starts true if the user was already
+  // a member before this component mounted (e.g. returning to a chat they
+  // joined in a previous session); otherwise becomes true only after the
+  // auto-join insert is durably persisted at edge tier.
+  const [membershipReady, setMembershipReady] = useState(false);
+
   useEffect(() => {
+    // If the local store already shows membership AND we haven't just inserted
+    // it ourselves (i.e. this is a pre-existing membership), unlock the
+    // composer immediately — no insert needed.
+    if (isMember && !autoJoinPending.current) {
+      setMembershipReady(true);
+      return;
+    }
+
     if (!userId || !chatKnown || isMember || autoJoined.current) return;
     autoJoined.current = true;
-    db.insert(app.chatMembers, { chatId, userId });
-  }, [userId, chatKnown, isMember, chatId, db]);
+    autoJoinPending.current = true;
+
+    db.insert(app.chatMembers, { chatId, userId })
+      .wait(sharedWriteOptions)
+      .then(() => {
+        autoJoinPending.current = false;
+        setMembershipReady(true);
+      })
+      .catch((error) => {
+        console.error("auto-join failed", error);
+        autoJoined.current = false;
+        autoJoinPending.current = false;
+      });
+  }, [userId, chatKnown, isMember, chatId, db, sharedWriteOptions]);
 
   const [accessChecked, setAccessChecked] = useState(false);
   useEffect(() => {
     setAccessChecked(false);
     autoJoined.current = false;
+    autoJoinPending.current = false;
+    setMembershipReady(false);
     const timer = setTimeout(() => setAccessChecked(true), 1500);
     return () => clearTimeout(timer);
   }, [chatId]);
@@ -125,7 +162,7 @@ export const ChatView = ({ chatId }: ChatViewProps) => {
         )}
       </div>
 
-      <MessageComposer chatId={chatId} />
+      <MessageComposer chatId={chatId} disabled={!membershipReady} />
     </>
   );
 };

@@ -10,7 +10,8 @@
     "jsx": "react-jsx",
     "paths": {
       "@/*": ["./src/*"]
-    }
+    },
+    "types": ["node"]
   },
-  "include": ["src", "schema"]
+  "include": ["src", "schema", "e2e", "playwright.config.ts"]
 }
