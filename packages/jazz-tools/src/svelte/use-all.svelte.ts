@@ -4,12 +4,21 @@ import type { SubscriptionDelta } from "../runtime/subscription-manager.js";
 import { applyDelta } from "../reconcile-array.js";
 import { getJazzContext } from "./context.svelte.js";
 
+type MaybeGetter<T> = T | (() => T);
+
+function resolve<T>(value: MaybeGetter<T>): T {
+  return typeof value === "function" ? (value as () => T)() : value;
+}
+
 /**
  * Reactive query subscription. Instantiate in a component script block,
  * access results via `.current`.
  *
- * @param query - the database query (e.g. `app.todos.where({ done: false })`)
- * @param options - optional query execution options, including durability tier
+ * @param query - the database query, or a getter for a dynamic query
+ *   (e.g. `() => filter ? app.todos.where({ title: { contains: filter } }) : undefined`).
+ *   When a getter is passed, any reactive reads inside it are tracked, so the
+ *   subscription re-runs when its dependencies change.
+ * @param options - optional query execution options, or a getter for them
  *
  * ```svelte
  * <script lang="ts">
@@ -34,12 +43,16 @@ export class QuerySubscription<T extends { id: string }> {
 
   #unsubscribe: (() => void) | null = null;
 
-  constructor(query: QueryBuilder<T> | undefined, options?: QueryOptions) {
+  constructor(
+    query: MaybeGetter<QueryBuilder<T> | undefined>,
+    options?: MaybeGetter<QueryOptions | undefined>,
+  ) {
     const ctx = getJazzContext();
-    this.current = options?.tier ? undefined : [];
+    this.current = resolve(options)?.tier ? undefined : [];
 
     $effect(() => {
-      if (!query) {
+      const resolvedQuery = resolve(query);
+      if (!resolvedQuery) {
         this.current = undefined;
         this.loading = false;
         return;
@@ -48,11 +61,13 @@ export class QuerySubscription<T extends { id: string }> {
       const manager = ctx.manager;
       if (!manager) return;
 
+      const resolvedOptions = resolve(options);
+
       this.loading = true;
       this.error = null;
 
       try {
-        const key = manager.makeQueryKey(query, options);
+        const key = manager.makeQueryKey(resolvedQuery, resolvedOptions);
         const entry = manager.getCacheEntry<T>(key);
 
         // Apply initial state from cache

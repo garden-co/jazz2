@@ -13,5 +13,6 @@ vi.mock("svelte", async (importOriginal) => {
     ...actual,
     setContext: (key: unknown, value: unknown) => contextStore.set(key, value),
     getContext: (key: unknown) => contextStore.get(key),
+    onDestroy: vi.fn(),
   };
 });
