@@ -5,7 +5,7 @@ import {
   mockRow,
   runtimeBatchRecordStubs,
   type Runtime,
-} from "./support.js";
+} from "../client-tests/support.js";
 
 describe("JazzClient schema order", () => {
   it("passes create values through in the declared schema order", async () => {

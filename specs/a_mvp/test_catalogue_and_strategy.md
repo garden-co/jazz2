@@ -368,6 +368,50 @@ Completed:
 - Verified with `cargo test -p jazz-tools schema_manager::integration_tests --features test --lib`.
 - Verified the full Rust lib test suite for `jazz-tools` with `cargo test -p jazz-tools --features test --lib`.
 
+## Role Assignments After First Reorg
+
+These assignments are the first concrete interpretation of the tier model above. They are intentionally descriptive rather than restrictive: new tests can still move as behavior ownership becomes clearer.
+
+### Rust core contracts
+
+The split Rust modules are the primary owners for relational semantics and sync/runtime invariants:
+
+- `runtime_core/tests/basic.rs`: broad runtime smoke and user-subscription behavior that does not fit a narrower runtime contract yet.
+- `runtime_core/tests/query_subscription.rs`: query visibility, durability-tier reads, local overlays, settled/remote tier behavior, and subscription updates observed through `RuntimeCore`.
+- `runtime_core/tests/schema_catalogue.rs`: schema catalogue publishing, schema evolution, old/new schema compatibility, and schema sync behavior.
+- `runtime_core/tests/sync_replay.rs`: reconnect and query replay behavior.
+- `runtime_core/tests/fk_remove_error.rs`: focused regression contracts around FK-related removal/update edge cases.
+- `runtime_core/tests/write_batch/*`: direct, persisted, transactional, rejection/recovery, and storage-flush batch behavior. This is the primary contract owner for transaction and settlement semantics at the runtime boundary.
+- `query_manager/manager_tests/*`: query semantics, graph behavior, subscriptions, server sync, CRUD, branches, and query-manager lifecycle.
+- `query_manager/rebac_tests/*`: permission/ReBAC policy semantics. TS permissions tests should prove DSL shape and translation, not re-own these semantics.
+- `sync_manager/tests/*`: sync-manager state propagation, query scopes, subscriptions, row-batch state, settlements, transaction sealing, stale replay, server sync, client lifecycle, and permission handoff.
+- `schema_manager/integration_tests/tests/*`: schema lifecycle, catalogue integration, migrations, lenses, renames, query integration, sync, and write behavior.
+
+### TypeScript runtime boundary contracts
+
+The newly split TS runtime directories should stay focused on public TypeScript boundary behavior:
+
+- `packages/jazz-tools/src/runtime/query-adapter-tests/*`: primary owner for query-builder JSON to runtime query-shape translation. These tests should use app-shaped fixtures and should not grow into Rust query-engine semantic cases.
+- `packages/jazz-tools/src/runtime/client-tests/for-request.test.ts`: request-scoped client behavior, backend mode validation, JWT/session extraction, query/subscribe forwarding, subscription callback payload normalization, query options, and two-phase subscribe lifecycle.
+- `packages/jazz-tools/src/runtime/client-tests/support.ts`: local fixtures only for the two client-test suites. If another runtime suite needs these helpers, decide whether the helper belongs in `runtime/testing` before widening it.
+- `packages/jazz-tools/src/runtime/schema-order-tests/client-boundary.test.ts`: public `JazzClient` row/value alignment across create, query, included relation rows, magic projections, and subscription deltas.
+- `packages/jazz-tools/src/runtime/schema-order-tests/db-boundary.test.ts`: typed `Db` alignment, generated-schema fallback, caller-supplied mutation metadata, and client-backed DB forwarding.
+- `packages/jazz-tools/src/runtime/row-transformer.test.ts`: isolated value unwrapping and row transformation helper behavior. This should not own public runtime or `Db` boundary contracts.
+
+### First cleanup target
+
+Start the first non-move-only cleanup around runtime client duplication:
+
+1. Compare `runtime/schema-order-tests/client-boundary.test.ts`, `runtime/schema-order-tests/db-boundary.test.ts`, `runtime/row-transformer.test.ts`, and Rust client/query alignment tests.
+2. Keep one primary owner for schema-order semantics at each layer:
+   - Rust for core row alignment semantics.
+   - TS runtime for public client API boundary behavior.
+   - `row-transformer` only for isolated conversion helpers.
+3. Convert any duplicate TS runtime assertions into either adapter-specific boundary checks or deletion candidates.
+4. Do not delete anything until the PR names the stronger owner and explains what failure class would still be caught.
+
+Use the same pattern for `forRequest`/NAPI later: `client-tests/for-request.test.ts` should own public request-scoped client behavior, while `napi.for-request.test.ts` should only own NAPI-specific runtime wiring.
+
 ## Appendix: File Inventory
 
 This inventory includes test, spec, benchmark-test, config, and test-support files discovered by filename. The pruning pass should mark support/config files separately from executable test files.
@@ -395,7 +439,8 @@ This inventory includes test, spec, benchmark-test, config, and test-support fil
 - `packages/jazz-tools/src/runtime/client-session.test.ts`
 - `packages/jazz-tools/src/runtime/client.browser-assets.test.ts`
 - `packages/jazz-tools/src/runtime/client.build-output.test.ts`
-- `packages/jazz-tools/src/runtime/client.for-request.test.ts`
+- `packages/jazz-tools/src/runtime/client-tests/for-request.test.ts`
+- `packages/jazz-tools/src/runtime/client-tests/support.ts`
 - `packages/jazz-tools/src/runtime/client.mutations.test.ts`
 - `packages/jazz-tools/src/runtime/client.node-wasm-init.test.ts`
 - `packages/jazz-tools/src/runtime/client.test.ts`
@@ -406,7 +451,6 @@ This inventory includes test, spec, benchmark-test, config, and test-support fil
 - `packages/jazz-tools/src/runtime/db.driver-mode.test.ts`
 - `packages/jazz-tools/src/runtime/db.local-first-auth.test.ts`
 - `packages/jazz-tools/src/runtime/db.persisted.test.ts`
-- `packages/jazz-tools/src/runtime/db.schema-order.test.ts`
 - `packages/jazz-tools/src/runtime/db.transaction.test.ts`
 - `packages/jazz-tools/src/runtime/db.transport.test.ts`
 - `packages/jazz-tools/src/runtime/db.worker-bootstrap.test.ts`
@@ -417,12 +461,21 @@ This inventory includes test, spec, benchmark-test, config, and test-support fil
 - `packages/jazz-tools/src/runtime/napi.integration.test.ts`
 - `packages/jazz-tools/src/runtime/passkey-backup.test.ts`
 - `packages/jazz-tools/src/runtime/permissions.repro.test.ts`
-- `packages/jazz-tools/src/runtime/query-adapter.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/basic-query-structure.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/condition-translation.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/error-handling.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/full-query-translation.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/include-translation.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/orderby-translation.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/self-referential-relations.test.ts`
+- `packages/jazz-tools/src/runtime/query-adapter-tests/support.ts`
 - `packages/jazz-tools/src/runtime/recovery-phrase.integration.test.ts`
 - `packages/jazz-tools/src/runtime/recovery-phrase.test.ts`
 - `packages/jazz-tools/src/runtime/row-transformer.test.ts`
 - `packages/jazz-tools/src/runtime/schema-fetch.test.ts`
 - `packages/jazz-tools/src/runtime/schema-marshalling.abstract-bench.test.ts`
+- `packages/jazz-tools/src/runtime/schema-order-tests/client-boundary.test.ts`
+- `packages/jazz-tools/src/runtime/schema-order-tests/db-boundary.test.ts`
 - `packages/jazz-tools/src/runtime/subscription-manager.test.ts`
 - `packages/jazz-tools/src/runtime/tab-leader-election.test.ts`
 - `packages/jazz-tools/src/runtime/testing/napi-runtime-test-utils.ts`
