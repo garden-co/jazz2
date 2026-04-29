@@ -1,14 +1,12 @@
-import { fileURLToPath } from "node:url";
 import { createPolicyTestApp, type PolicyTestApp } from "jazz-tools/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { app } from "../../schema.js";
-
-const SCHEMA_DIR = fileURLToPath(new URL("../..", import.meta.url));
+import permissions from "../../permissions.js";
 
 let testApp: PolicyTestApp;
 
 beforeEach(async () => {
-  testApp = await createPolicyTestApp(SCHEMA_DIR, expect);
+  testApp = await createPolicyTestApp(app, permissions, expect);
 });
 
 afterEach(async () => {
