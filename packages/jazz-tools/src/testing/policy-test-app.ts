@@ -158,7 +158,8 @@ export async function createPolicyTestApp(
     userBranch: "main",
   });
 
-  const app = await import(pathToFileURL(resolvedPaths.appModulePath).href);
+  const appModule = await import(pathToFileURL(resolvedPaths.appModulePath).href);
+  const app = appModule.default ?? appModule.app ?? appModule;
   if (!app) {
     throw new Error(`No schema app module found near ${schemaDir}`);
   }
