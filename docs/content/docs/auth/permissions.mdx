@@ -202,3 +202,97 @@ When you want to reuse the same check inside a larger rule, compose `isCreator` 
 
 For more dynamic sharing or ownership models, prefer explicit tables and relations rather than
 encoding extra meaning into authorship alone.
+
+## Testing permissions
+
+Jazz provides utilities to test permissions in isolation without testing your whole app's logic.
+
+The `createPolicyTestApp` helper from `jazz-tools/testing` starts an isolated local Jazz server, publishes your app schema
+and compiled permissions, and gives you session-scoped database clients for assertions.
+
+```typescript title="permissions.test.ts"
+import { createPolicyTestApp, type PolicyTestApp } from "jazz-tools/testing";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { app } from "../schema.js";
+import permissions from "../permissions.js";
+
+let testApp: PolicyTestApp;
+
+beforeEach(async () => {
+  testApp = await createPolicyTestApp(app, permissions, expect);
+});
+
+afterEach(async () => {
+  await testApp.shutdown();
+});
+
+describe("todo permissions", () => {
+  it("allows owners to update their own todos", () => {
+    const todo = testApp.seed((db) => {
+      const { value } = db.insert(app.todos, {
+        title: "Buy milk",
+        ownerId: "alice",
+      });
+      return value;
+    });
+
+    const alice = testApp.as({
+      user_id: "alice",
+      claims: {},
+      authMode: "local-first",
+    });
+    const bob = testApp.as({
+      user_id: "bob",
+      claims: {},
+      authMode: "local-first",
+    });
+
+    testApp.expectAllowed(() =>
+      alice.update(app.todos, todo.id, {
+        title: "Buy oat milk",
+      }),
+    );
+
+    testApp.expectDenied(() =>
+      bob.update(app.todos, todo.id, {
+        title: "Buy orange juice",
+      }),
+    );
+  });
+});
+```
+
+`createPolicyTestApp` takes the app created with `defineApp(...)`, the
+permissions object created with `definePermissions(...)`, and your test runner's `expect` function.
+
+The returned `PolicyTestApp` provides:
+
+- `seed(fn)` — run setup writes as an admin, bypassing policy checks
+- `as(session)` — create a `Db` client scoped to a specific session
+- `expectAllowed(fn)` — assert that a write does not throw a policy error
+- `expectDenied(fn)` — assert that a write is rejected by a policy
+- `shutdown()` — stop the local client and server
+
+For read policies, assert on returned rows directly. Denied reads are filtered out rather than
+throwing.
+
+```typescript
+const bob = testApp.as({
+  user_id: "bob",
+  claims: {},
+  authMode: "local-first",
+});
+
+await expect(bob.all(app.todos.where({ id: privateTodo.id }))).resolves.toEqual([]);
+```
+
+If your policies depend on JWT claims, put those values in `session.claims` using the same claim
+names your policy reads.
+
+```typescript
+const invitedUser = testApp.as({
+  user_id: "bob",
+  claims: { join_code: "invite-123" },
+  authMode: "local-first",
+});
+```
