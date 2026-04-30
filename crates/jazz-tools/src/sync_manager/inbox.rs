@@ -451,6 +451,33 @@ impl SyncManager {
             })
     }
 
+    fn interested_clients_for_settlement(&self, settlement: &BatchSettlement) -> HashSet<ClientId> {
+        match settlement {
+            BatchSettlement::DurableDirect {
+                visible_members, ..
+            }
+            | BatchSettlement::AcceptedTransaction {
+                visible_members, ..
+            } => visible_members
+                .iter()
+                .flat_map(|member| {
+                    self.clients.iter().filter_map(move |(client_id, client)| {
+                        client
+                            .is_in_scope(member.object_id, &member.branch_name)
+                            .then_some(*client_id)
+                    })
+                })
+                .collect(),
+            BatchSettlement::Rejected { batch_id, .. } => self
+                .row_batch_interest
+                .iter()
+                .filter(|(key, _)| key.batch_id == *batch_id)
+                .flat_map(|(_, clients)| clients.iter().copied())
+                .collect(),
+            BatchSettlement::Missing { .. } => HashSet::new(),
+        }
+    }
+
     fn respond_to_batch_settlement_request<H: Storage>(
         &mut self,
         storage: &H,
@@ -1061,26 +1088,7 @@ impl SyncManager {
                     return;
                 }
                 self.pending_batch_settlements.push(settlement.clone());
-                let interested: HashSet<ClientId> = match &settlement {
-                    BatchSettlement::DurableDirect {
-                        visible_members, ..
-                    }
-                    | BatchSettlement::AcceptedTransaction {
-                        visible_members, ..
-                    } => visible_members
-                        .iter()
-                        .flat_map(|member| {
-                            self.clients.iter().filter_map(move |(client_id, client)| {
-                                client
-                                    .is_in_scope(member.object_id, &member.branch_name)
-                                    .then_some(*client_id)
-                            })
-                        })
-                        .collect(),
-                    BatchSettlement::Missing { .. } | BatchSettlement::Rejected { .. } => {
-                        HashSet::new()
-                    }
-                };
+                let interested = self.interested_clients_for_settlement(&settlement);
                 for cid in interested {
                     self.outbox.push(OutboxEntry {
                         destination: Destination::Client(cid),

@@ -1232,60 +1232,22 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsAtEdge.some((row) => row.id === insertedTodo.id)).toBe(true);
   }, 60000);
 
-  it("rejects insert immediately when published server permissions deny writes", async () => {
-    const { appId, serverUrl } = await getServerWithPermissions(app, rejectAllPermissions);
-
-    // Wait for client to fetch permissions from the server
-    const db = await getNonAdminClientDb(appId, serverUrl, ctx);
-    await waitForCondition(
-      async () => Boolean(db.getAuthState().session) && !db.getAuthState().error,
-      10_000,
-      "client db should authenticate before rejected insert",
-    );
-    await withTimeout(
-      db.all(allTodos, { tier: "edge" }),
-      10_000,
-      "client db should complete an initial edge read before rejected insert",
+  it("server permissions check rejects client optimistic insert", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
     );
 
-    expect(() => db.insert(todos, { title: "Rejected", done: false })).toThrow(
-      'WriteError("policy denied INSERT on table todos")',
-    );
-  });
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
 
-  it.skip("server permissions check rejects offline insert", async () => {
-    const { appId, serverUrl } = await getServerWithPermissions(app, rejectAllPermissions);
-
-    // Block network to prevent server permissions from being fetched by the client
-    await blockTestingServerNetwork(serverUrl);
-
-    const db = await getNonAdminClientDb(appId, serverUrl, ctx);
-
-    const inserted = db.insert(todos, { title: "Rejected later", done: false });
-    const waitPromise = inserted.wait({ tier: "edge" });
-
-    const todosAfterInsert = await db.all(allTodos, { tier: "local" });
-    expect(todosAfterInsert.length).toBe(1);
-
-    await unblockTestingServerNetwork(serverUrl);
-    // Insert is reverted in the client
-    await waitForTodos(
-      db,
-      (rows) => rows.length === 0,
-      "offline insert should be reverted once rejected by the server",
-      10_000,
-      "local",
-    );
-
-    // `WriteResult.wait` rejects
-    await expect(
-      withTimeout(waitPromise, 20_000, "offline rejected insert wait(edge) timed out"),
-    ).rejects.toMatchObject({
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await expect(insertResult.wait({ tier: "edge" })).rejects.toMatchObject({
       name: "PersistedWriteRejectedError",
-      batchId: inserted.batchId,
+      batchId: insertResult.batchId,
       code: "permission_denied",
     });
-  }, 60000);
+  });
 
   it("recovers sync after browser-side network loss with B in a separate context", async () => {
     const syncServer = await publishSyncServerSchemaAndPermissions("sync-recover");
@@ -1815,7 +1777,10 @@ async function waitForTodos(
   return waitForQuery(db, allTodos, predicate, label, timeoutMs, tier);
 }
 
-async function publishSyncServerSchemaAndPermissions(scope: string): Promise<TestingServerInfo> {
+async function publishSyncServerSchemaAndPermissions(
+  scope: string,
+  permissions?: CompiledPermissions,
+): Promise<TestingServerInfo> {
   const testingServer = await getTestingServerInfo(uniqueDbName(`worker-bridge-${scope}`));
   const { appId, serverUrl, adminSecret } = testingServer;
   const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
@@ -1824,30 +1789,31 @@ async function publishSyncServerSchemaAndPermissions(scope: string): Promise<Tes
     schema: app.wasmSchema,
   });
   const { head } = await fetchPermissionsHead(serverUrl, { appId, adminSecret });
+  const permissionsToPublish = permissions ?? {
+    todos: {
+      select: { using: { type: "True" } },
+      insert: { with_check: { type: "True" } },
+      update: {
+        using: { type: "True" },
+        with_check: { type: "True" },
+      },
+      delete: { using: { type: "True" } },
+    },
+    projects: {
+      select: { using: { type: "True" } },
+      insert: { with_check: { type: "True" } },
+      update: {
+        using: { type: "True" },
+        with_check: { type: "True" },
+      },
+      delete: { using: { type: "True" } },
+    },
+  };
   await publishStoredPermissions(serverUrl, {
     appId,
     adminSecret,
     schemaHash,
-    permissions: {
-      todos: {
-        select: { using: { type: "True" } },
-        insert: { with_check: { type: "True" } },
-        update: {
-          using: { type: "True" },
-          with_check: { type: "True" },
-        },
-        delete: { using: { type: "True" } },
-      },
-      projects: {
-        select: { using: { type: "True" } },
-        insert: { with_check: { type: "True" } },
-        update: {
-          using: { type: "True" },
-          with_check: { type: "True" },
-        },
-        delete: { using: { type: "True" } },
-      },
-    },
+    permissions: permissionsToPublish,
     expectedParentBundleObjectId: head?.bundleObjectId ?? null,
   });
 
