@@ -423,12 +423,19 @@ impl SyncManager {
     }
 
     pub fn seal_batch_to_servers(&mut self, submission: SealedBatchSubmission) {
+        let batch_id = submission.batch_id;
         let server_ids: Vec<_> = self.servers.keys().copied().collect();
         for server_id in server_ids {
             self.outbox.push(OutboxEntry {
                 destination: Destination::Server(server_id),
                 payload: SyncPayload::SealBatch {
                     submission: submission.clone(),
+                },
+            });
+            self.outbox.push(OutboxEntry {
+                destination: Destination::Server(server_id),
+                payload: SyncPayload::BatchSettlementNeeded {
+                    batch_ids: vec![batch_id],
                 },
             });
         }

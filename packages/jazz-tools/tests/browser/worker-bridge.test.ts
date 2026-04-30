@@ -282,11 +282,13 @@ async function getServerWithPermissions(
 ): Promise<{ appId: string; serverUrl: string; adminSecret: string }> {
   const { appId, serverUrl, adminSecret } = await getIsolatedTestingServerInfo();
   const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
+    appId,
     adminSecret,
     schema: app.wasmSchema,
   });
-  const { head } = await fetchPermissionsHead(serverUrl, { adminSecret });
+  const { head } = await fetchPermissionsHead(serverUrl, { appId, adminSecret });
   await publishStoredPermissions(serverUrl, {
+    appId,
     adminSecret,
     schemaHash,
     permissions,
@@ -303,9 +305,13 @@ async function getNonAdminClientDb(
   serverUrl: string,
   ctx: TestCleanup,
 ): Promise<Db> {
-  const jwtToken = await getTestingServerJwtForUser("browser-offline-rejected-wait", {
-    role: "user",
-  });
+  const jwtToken = await getTestingServerJwtForUser(
+    "browser-offline-rejected-wait",
+    {
+      role: "user",
+    },
+    appId,
+  );
   return ctx.track(
     await createDb({
       appId,
@@ -1202,9 +1208,10 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsOnA.some((row) => row.title === title)).toBe(true);
   }, 60000);
 
-  it.skip("resolves insert wait at edge tier through the worker bridge", async () => {
+  it("resolves insert wait at edge tier through the worker bridge", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions("sync-wait-edge");
     const sharedLocalAuthToken = generateAuthSecret();
-    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken);
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
 
     const title = `wait-edge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const inserted = db.insert(todos, { title, done: false });
@@ -1225,7 +1232,7 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsAtEdge.some((row) => row.id === insertedTodo.id)).toBe(true);
   }, 60000);
 
-  it.skip("rejects insert immediately when published server permissions deny writes", async () => {
+  it("rejects insert immediately when published server permissions deny writes", async () => {
     const { appId, serverUrl } = await getServerWithPermissions(app, rejectAllPermissions);
 
     // Wait for client to fetch permissions from the server
