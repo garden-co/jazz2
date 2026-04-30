@@ -119,8 +119,8 @@ export interface InitializeOptions extends JazzPluginOptions {
   envDir?: string;
   /** Called when a schema watch push fails after initialisation. Use this to forward errors to e.g. Vite's HMR overlay. */
   onSchemaError?: (error: Error) => void;
-  /** Called when the schema watcher successfully pushes an updated schema. Use this to e.g. trigger a Vite full-reload. */
-  onSchemaPush?: (hash: string) => void;
+  /** Called when the schema watcher successfully pushes an updated schema. Use this to e.g. trigger a Vite full-reload. The initial dev-server push awaits this callback so plugins can write generated artefacts before the host bundler starts compiling. */
+  onSchemaPush?: (hash: string) => void | Promise<void>;
 }
 
 export class ManagedDevRuntime {
@@ -299,8 +299,9 @@ export class ManagedDevRuntime {
         await persistAppIdToEnv(envPath, this.envKeys.appId, appId);
 
         const { pushSchemaCatalogue } = await import("./dev-server.js");
-        await pushSchemaCatalogue({ serverUrl, appId, adminSecret, schemaDir });
+        const initialPush = await pushSchemaCatalogue({ serverUrl, appId, adminSecret, schemaDir });
         console.log(`${LOG_PREFIX} schema published`);
+        await options.onSchemaPush?.(initialPush.hash);
 
         const { watchSchema } = await import("./schema-watcher.js");
         this.watcher = watchSchema({
@@ -308,9 +309,9 @@ export class ManagedDevRuntime {
           serverUrl,
           appId,
           adminSecret,
-          onPush: (hash) => {
+          onPush: async (hash) => {
             console.log(`${LOG_PREFIX} schema updated (${hash.slice(0, 12)})`);
-            options.onSchemaPush?.(hash);
+            await options.onSchemaPush?.(hash);
           },
           onError: (error) => {
             console.error(`${LOG_PREFIX} schema push failed:`, error.message);

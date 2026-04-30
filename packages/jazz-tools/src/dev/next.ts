@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { buildInspectorLink } from "./inspector-link.js";
 import { ManagedDevRuntime } from "./managed-runtime.js";
@@ -37,6 +37,14 @@ const PUBLIC_APP_ID_ENV = "NEXT_PUBLIC_JAZZ_APP_ID";
 const PUBLIC_SERVER_URL_ENV = "NEXT_PUBLIC_JAZZ_SERVER_URL";
 const PUBLIC_WASM_URL_ENV = "NEXT_PUBLIC_JAZZ_WASM_URL";
 const PUBLIC_WASM_SUBPATH = "_jazz/jazz_wasm_bg.wasm";
+const SCHEMA_HASH_STUB_SUBPATH = join("node_modules", ".cache", "jazz", "schema-hash.js");
+const SCHEMA_HASH_ALIAS = "jazz-tools/_dev/schema-hash";
+
+async function writeSchemaHashStub(appRoot: string, hash: string): Promise<void> {
+  const stubPath = join(appRoot, SCHEMA_HASH_STUB_SUBPATH);
+  await mkdir(dirname(stubPath), { recursive: true });
+  await writeFile(stubPath, `export const HASH = ${JSON.stringify(hash)};\n`);
+}
 
 function buildPublicWasmUrl(basePath: unknown): string {
   if (typeof basePath !== "string" || basePath.length === 0) {
@@ -122,7 +130,12 @@ export function withJazz(
         : undefined;
     const backendSecret = explicitBackendSecret ?? process.env.BACKEND_SECRET;
 
-    const managed = await runtime.initialize({ ...options, backendSecret });
+    const resolvedAppRoot = options.appRoot ?? process.cwd();
+    const managed = await runtime.initialize({
+      ...options,
+      backendSecret,
+      onSchemaPush: (hash) => writeSchemaHashStub(resolvedAppRoot, hash),
+    });
     if (!hasLoggedInspectorLink) {
       console.log(
         `[jazz] Open the inspector: ${buildInspectorLink(
@@ -134,6 +147,16 @@ export function withJazz(
       hasLoggedInspectorLink = true;
     }
 
+    const stubPath = join(resolvedAppRoot, SCHEMA_HASH_STUB_SUBPATH);
+    // Turbopack interprets absolute alias targets as server-relative paths and
+    // refuses to resolve them. Use the project-root-relative form there. Webpack
+    // is happy with either, so feed it the absolute path for clarity.
+    const turbopackStubPath = `./${SCHEMA_HASH_STUB_SUBPATH}`;
+    const previousWebpack = mergedWithWasmEnv.webpack as
+      | ((config: WebpackConfig, ctx: unknown) => WebpackConfig)
+      | undefined;
+    const previousTurbopack = (mergedWithWasmEnv.turbopack as TurbopackConfig | undefined) ?? {};
+
     return {
       ...mergedWithWasmEnv,
       env: {
@@ -142,8 +165,34 @@ export function withJazz(
         [PUBLIC_SERVER_URL_ENV]: managed.serverUrl,
         ...(managed.backendSecret ? { BACKEND_SECRET: managed.backendSecret } : {}),
       },
+      turbopack: {
+        ...previousTurbopack,
+        resolveAlias: {
+          ...previousTurbopack.resolveAlias,
+          [SCHEMA_HASH_ALIAS]: turbopackStubPath,
+        },
+      },
+      webpack: (config: WebpackConfig, ctx: unknown) => {
+        const next = previousWebpack ? previousWebpack(config, ctx) : config;
+        next.resolve = next.resolve ?? {};
+        next.resolve.alias = {
+          ...next.resolve.alias,
+          [SCHEMA_HASH_ALIAS]: stubPath,
+        };
+        return next;
+      },
     };
   };
+}
+
+interface WebpackConfig {
+  resolve?: { alias?: Record<string, string> };
+  [key: string]: unknown;
+}
+
+interface TurbopackConfig {
+  resolveAlias?: Record<string, string>;
+  [key: string]: unknown;
 }
 
 export async function __resetJazzNextPluginForTests(): Promise<void> {

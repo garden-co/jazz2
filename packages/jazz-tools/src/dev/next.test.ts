@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { access, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createTempRootTracker, getAvailablePort, todoSchema } from "./test-helpers.js";
 import * as devServer from "./dev-server.js";
+import * as schemaWatcher from "./schema-watcher.js";
 import { __resetJazzNextPluginForTests, withJazz, type NextConfigLike } from "./next.js";
 
 const dev = await import("./index.js");
@@ -281,6 +282,94 @@ describe("withJazz", () => {
       "conflicting Jazz dev runtime configuration",
     );
   }, 30_000);
+
+  it("writes a dev schema-hash stub on startup and rewrites it on each schema push", async () => {
+    vi.spyOn(devServer, "startLocalJazzServer").mockResolvedValue({
+      appId: "00000000-0000-0000-0000-000000000070",
+      port: 19870,
+      url: "http://127.0.0.1:19870",
+      dataDir: undefined as unknown as string,
+      stop: vi.fn().mockResolvedValue(undefined),
+    });
+    const pushSchemaCatalogue = vi
+      .spyOn(devServer, "pushSchemaCatalogue")
+      .mockResolvedValue({ hash: "1111111111111111aaaaaaaaaaaaaaaaaaaaaaaa" });
+    let capturedOnPush: ((hash: string) => void) | undefined;
+    vi.spyOn(schemaWatcher, "watchSchema").mockImplementation((opts) => {
+      capturedOnPush = opts.onPush;
+      return { close: vi.fn() };
+    });
+
+    const appRoot = await tempRoots.create("jazz-next-schema-hash-");
+    const schemaDir = appRoot;
+    await writeFile(join(schemaDir, "schema.ts"), todoSchema());
+
+    const wrapped = withJazz(
+      {},
+      {
+        appRoot,
+        schemaDir,
+        server: { port: 19870, adminSecret: "next-schema-hash-admin" },
+      },
+    );
+
+    await resolveWrappedConfig(wrapped, DEVELOPMENT_PHASE);
+
+    const stubPath = join(appRoot, "node_modules", ".cache", "jazz", "schema-hash.js");
+    const initial = await readFile(stubPath, "utf8");
+    expect(initial).toContain("1111111111111111aaaaaaaaaaaaaaaaaaaaaaaa");
+
+    expect(capturedOnPush).toBeDefined();
+    await capturedOnPush!("2222222222222222bbbbbbbbbbbbbbbbbbbbbbbb");
+
+    const updated = await readFile(stubPath, "utf8");
+    expect(updated).toContain("2222222222222222bbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(updated).not.toContain("1111111111111111aaaaaaaaaaaaaaaaaaaaaaaa");
+
+    expect(pushSchemaCatalogue).toHaveBeenCalled();
+  });
+
+  it("aliases jazz-tools/_dev/schema-hash to the generated stub for both webpack and turbopack", async () => {
+    vi.spyOn(devServer, "startLocalJazzServer").mockResolvedValue({
+      appId: "00000000-0000-0000-0000-000000000080",
+      port: 19880,
+      url: "http://127.0.0.1:19880",
+      dataDir: undefined as unknown as string,
+      stop: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.spyOn(devServer, "pushSchemaCatalogue").mockResolvedValue({ hash: "abc" });
+    vi.spyOn(schemaWatcher, "watchSchema").mockImplementation(() => ({ close: vi.fn() }));
+
+    const appRoot = await tempRoots.create("jazz-next-alias-");
+    const schemaDir = appRoot;
+    await writeFile(join(schemaDir, "schema.ts"), todoSchema());
+
+    const wrapped = withJazz(
+      {},
+      {
+        appRoot,
+        schemaDir,
+        server: { port: 19880, adminSecret: "next-alias-admin" },
+      },
+    );
+
+    const resolved = (await resolveWrappedConfig(wrapped, DEVELOPMENT_PHASE)) as NextConfigLike & {
+      turbopack?: { resolveAlias?: Record<string, string> };
+      webpack?: (config: { resolve?: { alias?: Record<string, string> } }) => unknown;
+    };
+
+    const expectedStub = join(appRoot, "node_modules", ".cache", "jazz", "schema-hash.js");
+
+    expect(resolved.turbopack?.resolveAlias?.["jazz-tools/_dev/schema-hash"]).toBe(
+      "./node_modules/.cache/jazz/schema-hash.js",
+    );
+
+    const baseConfig: { resolve?: { alias?: Record<string, string> } } = { resolve: { alias: {} } };
+    const finalConfig = resolved.webpack!(baseConfig) as {
+      resolve: { alias: Record<string, string> };
+    };
+    expect(finalConfig.resolve.alias["jazz-tools/_dev/schema-hash"]).toBe(expectedStub);
+  });
 
   it("throws when env-driven existing-server config changes in one process", async () => {
     const schemaDir = await tempRoots.create("jazz-next-env-conflict-");

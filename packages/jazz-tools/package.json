@@ -52,6 +52,10 @@
       "types": "./dist/dev/index.d.ts",
       "default": "./dist/dev/index.js"
     },
+    "./_dev/schema-hash": {
+      "types": "./dist/_dev/schema-hash.d.ts",
+      "default": "./dist/_dev/schema-hash.js"
+    },
     "./dev/next": {
       "types": "./dist/dev/next.d.ts",
       "default": "./dist/dev/next.js"
