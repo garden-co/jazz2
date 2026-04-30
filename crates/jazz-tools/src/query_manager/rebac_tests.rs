@@ -711,60 +711,60 @@ fn run_recursive_folder_update(max_depth: Option<usize>) -> (bool, bool) {
     (denied, applied)
 }
 
-/// Test that EXISTS clause in INSERT policy correctly denies writes.
-///
-/// Scenario: Insert policy requires EXISTS (SELECT FROM admins WHERE user_id = @session.user_id)
-/// A non-admin user tries to insert - should be denied.
+// Test that EXISTS clause in INSERT policy correctly denies writes.
+//
+// Scenario: Insert policy requires EXISTS (SELECT FROM admins WHERE user_id = @session.user_id)
+// A non-admin user tries to insert - should be denied.
 
-/// Test that UPDATE checks USING policy (can session see the old row?).
-///
-/// Scenario: Alice owns a document. Bob tries to update it.
-/// The USING policy (owner_id = @session.user_id) should deny Bob because
-/// he cannot "see" Alice's document.
-///
-/// CURRENT BUG: Only WITH CHECK is evaluated for UPDATE, not USING.
-/// See: manager.rs:1246-1247 - "TODO: Full USING check for UPDATE"
+// Test that UPDATE checks USING policy (can session see the old row?).
+//
+// Scenario: Alice owns a document. Bob tries to update it.
+// The USING policy (owner_id = @session.user_id) should deny Bob because
+// he cannot "see" Alice's document.
+//
+// CURRENT BUG: Only WITH CHECK is evaluated for UPDATE, not USING.
+// See: manager.rs:1246-1247 - "TODO: Full USING check for UPDATE"
 
-/// Test that INHERITS in SELECT policy correctly filters rows in query results.
-///
-/// Scenario: Documents inherit SELECT policy from their parent folder.
-/// Alice owns folder F. Bob owns document D in folder F.
-/// When Alice queries documents, she should NOT see Bob's document D
-/// because even though D is in her folder, INHERITS should check
-/// if Alice can see D directly (which requires owner_id = alice).
-///
-/// Actually, let's reverse this: Alice should be able to see documents
-/// in her folder via INHERITS, even if she doesn't own them directly.
-///
-/// Scenario revised:
-/// - Folder F owned by Alice
-/// - Document D in folder F, owned by Bob
-/// - SELECT policy: owner_id = @user_id OR INHERITS SELECT VIA folder_id
-/// - Alice should see D because she owns the folder (INHERITS passes)
-/// - Charlie (owns neither) should NOT see D
-///
-/// FIXED: PolicyFilterNode now properly evaluates INHERITS using PolicyGraph.
+// Test that INHERITS in SELECT policy correctly filters rows in query results.
+//
+// Scenario: Documents inherit SELECT policy from their parent folder.
+// Alice owns folder F. Bob owns document D in folder F.
+// When Alice queries documents, she should NOT see Bob's document D
+// because even though D is in her folder, INHERITS should check
+// if Alice can see D directly (which requires owner_id = alice).
+//
+// Actually, let's reverse this: Alice should be able to see documents
+// in her folder via INHERITS, even if she doesn't own them directly.
+//
+// Scenario revised:
+// - Folder F owned by Alice
+// - Document D in folder F, owned by Bob
+// - SELECT policy: owner_id = @user_id OR INHERITS SELECT VIA folder_id
+// - Alice should see D because she owns the folder (INHERITS passes)
+// - Charlie (owns neither) should NOT see D
+//
+// FIXED: PolicyFilterNode now properly evaluates INHERITS using PolicyGraph.
 
-/// Test that EXISTS clause in UPDATE USING policy correctly denies updates.
-///
-/// Scenario: UPDATE policy has USING = EXISTS (only admins can update protected rows)
-/// - Alice is an admin, Bob is not
-/// - Both try to update a protected row
-/// - Bob should be denied (USING EXISTS fails), Alice should be allowed
+// Test that EXISTS clause in UPDATE USING policy correctly denies updates.
+//
+// Scenario: UPDATE policy has USING = EXISTS (only admins can update protected rows)
+// - Alice is an admin, Bob is not
+// - Both try to update a protected row
+// - Bob should be denied (USING EXISTS fails), Alice should be allowed
 
 // ============================================================================
 // INHERITS Cycle Detection Tests
 // ============================================================================
 
-/// Test that INHERITS cycles are detected during schema validation.
-/// Cycle: A → B → A (direct cycle between two tables)
+// Test that INHERITS cycles are detected during schema validation.
+// Cycle: A → B → A (direct cycle between two tables)
 
-/// Test that self-referential INHERITS is detected as a cycle.
-/// Cycle: Folder → Folder (self-reference via parent_id)
+// Test that self-referential INHERITS is detected as a cycle.
+// Cycle: Folder → Folder (self-reference via parent_id)
 
-/// Test that valid INHERITS chains (no cycles) pass validation.
+// Test that valid INHERITS chains (no cycles) pass validation.
 
-/// Test that bounded self-referential INHERITS is accepted by cycle validation.
+// Test that bounded self-referential INHERITS is accepted by cycle validation.
 
 fn declared_file_inheritance_schema(array_edge: bool) -> Schema {
     let mut schema = Schema::new();

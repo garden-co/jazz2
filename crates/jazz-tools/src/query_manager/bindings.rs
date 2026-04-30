@@ -15,7 +15,9 @@ use crate::query_manager::manager::LocalUpdates;
 use crate::query_manager::parse_query_json;
 use crate::query_manager::query::Query;
 use crate::query_manager::session::{Session, WriteContext};
-use crate::query_manager::types::{RowDescriptor, Schema, TableName, Value};
+use crate::query_manager::types::{
+    PermissionPreflightDecision, RowDescriptor, Schema, TableName, Value,
+};
 use crate::row_format::decode_row;
 use crate::row_histories::BatchId;
 use crate::runtime_core::{ReadDurabilityOptions, SubscriptionDelta};
@@ -263,6 +265,14 @@ pub fn serialize_durability_tier(tier: DurabilityTier) -> &'static str {
         DurabilityTier::Local => "local",
         DurabilityTier::EdgeServer => "edge",
         DurabilityTier::GlobalServer => "global",
+    }
+}
+
+pub fn serialize_permission_preflight_decision(decision: PermissionPreflightDecision) -> JsonValue {
+    match decision {
+        PermissionPreflightDecision::Allow => JsonValue::Bool(true),
+        PermissionPreflightDecision::Deny => JsonValue::Bool(false),
+        PermissionPreflightDecision::Unknown => JsonValue::String("unknown".to_string()),
     }
 }
 

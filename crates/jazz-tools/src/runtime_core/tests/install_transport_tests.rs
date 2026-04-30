@@ -1,8 +1,7 @@
-use super::*;
-
 #[cfg(feature = "transport-websocket")]
+#[allow(clippy::module_inception)]
 mod install_transport_tests {
-    use super::*;
+    use super::super::*;
     use crate::transport_manager::{AuthConfig, StreamAdapter, TickNotifier};
 
     struct NopTick;

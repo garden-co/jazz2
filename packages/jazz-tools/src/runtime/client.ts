@@ -87,6 +87,18 @@ export interface Runtime {
     write_context_json: string | null | undefined,
     tier: string,
   ): Promise<void>;
+  canInsert?(table: string, values: InsertValues): MaybePromise<PermissionDecision>;
+  canInsertWithSession?(
+    table: string,
+    values: InsertValues,
+    write_context_json?: string | null,
+  ): MaybePromise<PermissionDecision>;
+  canUpdate?(object_id: string, values: Record<string, Value>): MaybePromise<PermissionDecision>;
+  canUpdateWithSession?(
+    object_id: string,
+    values: Record<string, Value>,
+    write_context_json?: string | null,
+  ): MaybePromise<PermissionDecision>;
   insertPersisted?(table: string, values: InsertValues, tier: string): PersistedInsertResult;
   insertPersistedWithSession?(
     table: string,
@@ -183,6 +195,8 @@ export interface AuthConfig {
  * - `global`: Persisted at global server
  */
 export type DurabilityTier = "local" | "edge" | "global";
+export type PermissionDecision = true | false | "unknown";
+type MaybePromise<T> = T | Promise<T>;
 /**
  * Controls when a write is visible to subscriptions.
  *
@@ -738,6 +752,13 @@ function normalizeUpdatedAt(updatedAt?: number): number | undefined {
     throw new Error("Invalid updatedAt override. Expected a non-negative integer.");
   }
   return updatedAt;
+}
+
+function normalizePermissionDecision(decision: unknown): PermissionDecision {
+  if (decision === true || decision === false || decision === "unknown") {
+    return decision;
+  }
+  throw new Error(`Invalid permission decision: ${String(decision)}`);
 }
 
 function durabilityTierRank(tier: DurabilityTier): number {
@@ -1653,8 +1674,25 @@ export class JazzClient {
   }
 
   private requireSessionWriteMethod<
-    T extends keyof Pick<Runtime, "insertWithSession" | "updateWithSession" | "deleteWithSession">,
+    T extends keyof Pick<
+      Runtime,
+      | "insertWithSession"
+      | "updateWithSession"
+      | "deleteWithSession"
+      | "canInsertWithSession"
+      | "canUpdateWithSession"
+    >,
   >(method: T): NonNullable<Runtime[T]> {
+    const runtimeMethod = this.runtime[method];
+    if (!runtimeMethod) {
+      throw new Error(`${String(method)} is not supported by this runtime`);
+    }
+    return runtimeMethod.bind(this.runtime) as NonNullable<Runtime[T]>;
+  }
+
+  private requireRuntimeMethod<T extends keyof Pick<Runtime, "canInsert" | "canUpdate">>(
+    method: T,
+  ): NonNullable<Runtime[T]> {
     const runtimeMethod = this.runtime[method];
     if (!runtimeMethod) {
       throw new Error(`${String(method)} is not supported by this runtime`);
@@ -2032,6 +2070,50 @@ export class JazzClient {
       optionsJson,
     );
     return this.alignQueryRowsToDeclaredSchema(queryJson, results as Row[], effectiveRuntimeSchema);
+  }
+
+  async canInsert(table: string, values: InsertValues): Promise<PermissionDecision> {
+    return this.canInsertInternal(table, values);
+  }
+
+  async canInsertInternal(
+    table: string,
+    values: InsertValues,
+    session?: Session,
+    attribution?: string,
+  ): Promise<PermissionDecision> {
+    const effectiveSession = this.resolveWriteSession(session, attribution);
+    const decision =
+      effectiveSession || attribution !== undefined
+        ? await this.requireSessionWriteMethod("canInsertWithSession")(
+            table,
+            values,
+            this.encodeWriteContext(effectiveSession, attribution),
+          )
+        : await this.requireRuntimeMethod("canInsert")(table, values);
+    return normalizePermissionDecision(decision);
+  }
+
+  async canUpdate(objectId: string, updates: Record<string, Value>): Promise<PermissionDecision> {
+    return this.canUpdateInternal(objectId, updates);
+  }
+
+  async canUpdateInternal(
+    objectId: string,
+    updates: Record<string, Value>,
+    session?: Session,
+    attribution?: string,
+  ): Promise<PermissionDecision> {
+    const effectiveSession = this.resolveWriteSession(session, attribution);
+    const decision =
+      effectiveSession || attribution !== undefined
+        ? await this.requireSessionWriteMethod("canUpdateWithSession")(
+            objectId,
+            updates,
+            this.encodeWriteContext(effectiveSession, attribution),
+          )
+        : await this.requireRuntimeMethod("canUpdate")(objectId, updates);
+    return normalizePermissionDecision(decision);
   }
 
   /**

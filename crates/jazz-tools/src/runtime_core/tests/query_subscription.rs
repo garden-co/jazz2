@@ -297,7 +297,7 @@ fn rc_query_local_transaction_overlay_keeps_same_row_updates_isolated_by_batch()
         crate::sync_manager::QueryPropagation::Full,
         QueryLocalOverlay {
             batch_id: alice_batch,
-            branch_name: branch_name.clone(),
+            branch_name,
             row_ids: vec![row_id],
         },
     );

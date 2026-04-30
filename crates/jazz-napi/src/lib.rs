@@ -28,7 +28,7 @@ use jazz_tools::binding_support::{
     parse_durability_tier as parse_binding_tier, parse_external_object_id, parse_query_input,
     parse_runtime_schema_input, parse_session_input, parse_write_context_input,
     query_rows_can_be_schema_aligned, serialize_local_batch_record, serialize_local_batch_records,
-    subscription_delta_to_json,
+    serialize_permission_preflight_decision, subscription_delta_to_json,
 };
 use jazz_tools::identity;
 use jazz_tools::middleware::AuthConfig;
@@ -731,6 +731,82 @@ impl NapiRuntime {
         Ok(serde_json::json!({
             "batchId": batch_id.to_string(),
         }))
+    }
+
+    #[napi(js_name = "canInsert")]
+    pub fn can_insert(
+        &self,
+        table: String,
+        #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
+    ) -> napi::Result<serde_json::Value> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| napi::Error::from_reason("lock"))?;
+        let decision = core
+            .can_insert(&table, values.0, None)
+            .map_err(|e| runtime_error_to_napi(e, "CanInsert failed"))?;
+        Ok(serialize_permission_preflight_decision(decision))
+    }
+
+    #[napi(js_name = "canInsertWithSession")]
+    pub fn can_insert_with_session(
+        &self,
+        table: String,
+        #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
+        write_context_json: Option<String>,
+    ) -> napi::Result<serde_json::Value> {
+        let write_context = parse_write_context_json(write_context_json)?;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| napi::Error::from_reason("lock"))?;
+        let decision = core
+            .can_insert(&table, values.0, write_context.as_ref())
+            .map_err(|e| runtime_error_to_napi(e, "CanInsert failed"))?;
+        Ok(serialize_permission_preflight_decision(decision))
+    }
+
+    #[napi(js_name = "canUpdate")]
+    pub fn can_update(
+        &self,
+        object_id: String,
+        #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
+    ) -> napi::Result<serde_json::Value> {
+        let uuid = uuid::Uuid::parse_str(&object_id)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid ObjectId: {}", e)))?;
+        let oid = ObjectId::from_uuid(uuid);
+        let updates = convert_updates(values.0);
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| napi::Error::from_reason("lock"))?;
+        let decision = core
+            .can_update(oid, updates, None)
+            .map_err(|e| runtime_error_to_napi(e, "CanUpdate failed"))?;
+        Ok(serialize_permission_preflight_decision(decision))
+    }
+
+    #[napi(js_name = "canUpdateWithSession")]
+    pub fn can_update_with_session(
+        &self,
+        object_id: String,
+        #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
+        write_context_json: Option<String>,
+    ) -> napi::Result<serde_json::Value> {
+        let uuid = uuid::Uuid::parse_str(&object_id)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid ObjectId: {}", e)))?;
+        let oid = ObjectId::from_uuid(uuid);
+        let write_context = parse_write_context_json(write_context_json)?;
+        let updates = convert_updates(values.0);
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| napi::Error::from_reason("lock"))?;
+        let decision = core
+            .can_update(oid, updates, write_context.as_ref())
+            .map_err(|e| runtime_error_to_napi(e, "CanUpdate failed"))?;
+        Ok(serialize_permission_preflight_decision(decision))
     }
 
     #[napi(js_name = "loadLocalBatchRecord", ts_return_type = "any | null")]

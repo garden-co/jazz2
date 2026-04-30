@@ -256,10 +256,10 @@ async fn update_todo(
             match state.client.query(query, None).await {
                 Ok(rows) => {
                     for (oid, values) in &rows {
-                        if *oid.uuid() == id {
-                            if let Some(todo) = row_to_todo(*oid, values) {
-                                return Json(todo).into_response();
-                            }
+                        if *oid.uuid() == id
+                            && let Some(todo) = row_to_todo(*oid, values)
+                        {
+                            return Json(todo).into_response();
                         }
                     }
                     (

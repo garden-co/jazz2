@@ -78,7 +78,6 @@ mod tests {
     use crate::object::ObjectId;
     use crate::query_manager::types::{SchemaHash, TableName};
     use crate::schema_manager::{AppId, LensOp};
-    use crate::server::ConnectionState;
 
     use std::collections::BTreeMap;
     use std::fmt;
@@ -2011,9 +2010,9 @@ mod tests {
             declared_schema_hash: None,
         };
         let payload = serde_json::to_vec(&handshake).expect("serialize handshake");
-        ws.send(WsMessage::Binary(
-            crate::transport_manager::frame_encode(&payload).into(),
-        ))
+        ws.send(WsMessage::Binary(crate::transport_manager::frame_encode(
+            &payload,
+        )))
         .await
         .expect("send handshake");
 

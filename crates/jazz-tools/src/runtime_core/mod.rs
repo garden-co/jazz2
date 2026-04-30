@@ -42,7 +42,8 @@ use crate::query_manager::manager::{QueryError, QueryUpdate};
 use crate::query_manager::query::Query;
 use crate::query_manager::session::{Session, WriteContext};
 use crate::query_manager::types::{
-    OrderedRowDelta, Schema, SchemaHash, TableName, TablePolicies, Value,
+    OrderedRowDelta, PermissionPreflightDecision, Schema, SchemaHash, TableName, TablePolicies,
+    Value,
 };
 use crate::row_format::decode_row;
 use crate::row_histories::BatchId;

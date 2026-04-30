@@ -8,7 +8,7 @@ What it demonstrates:
 - Passing a JWT token directly to `JazzProvider` to authenticate as a named user
 - Recreating `JazzProvider` on login and logout instead of mutating a live client across principal changes
 - Falling back to local-first auth when no token is present
-- Role-based UI gating (`admin` can post to Announcements; `member` can post to the general chat). Permissions are defined in [permissions.ts](./permissions.ts), with generic-chat message ownership enforced via `$createdBy`.
+- Permission-preflight UI gating with `db.canInsert(...)`. Write rules are defined in [permissions.ts](./permissions.ts): `admin` can post to Announcements, `admin`/`member` can post to the general chat, and generic-chat message ownership is enforced via `$createdBy`.
 
 Passwords are stored in plain text in memory for example simplicity only.
 One default account is seeded on startup: `admin@example.com / admin` with `role = "admin"`.
@@ -16,7 +16,7 @@ New sign-ups are auto-created as `role = "member"`.
 
 The Jazz sync server validates the JWT's signature against the JWKS on every connection.
 The `claims` object inside the payload is forwarded to the client as `session.claims`, which
-is how the UI reads `session.claims.role` for role-based gating.
+is what the Jazz permission preflight evaluates before enabling chat writes.
 
 ## Setup
 

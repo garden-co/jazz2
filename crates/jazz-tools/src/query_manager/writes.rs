@@ -10,7 +10,7 @@ use crate::row_histories::{
 };
 use crate::schema_manager::{SchemaContext, resolve_current_table_name};
 use crate::storage::{RowLocator, Storage, metadata_from_row_locator};
-use crate::sync_manager::RowBatchKey;
+use crate::sync_manager::{DurabilityTier, RowBatchKey};
 
 use super::encoding::{decode_column, decode_row, encode_row};
 use super::manager::{
@@ -21,7 +21,8 @@ use super::policy::{ComplexClause, Operation, evaluate_simple_parts_with_row_id}
 use super::server_queries::{AuthorizationPolicyRequest, RowTransformContext};
 use super::session::{AuthMode, Session, WriteContext};
 use super::types::{
-    ColumnType, ComposedBranchName, LoadedRow, RowDescriptor, Schema, SchemaHash, TableName, Value,
+    ColumnType, ComposedBranchName, LoadedRow, PermissionPreflightDecision, RowDescriptor, Schema,
+    SchemaHash, TableName, Value,
 };
 
 pub struct RowBranchWrite<'a> {
@@ -31,6 +32,12 @@ pub struct RowBranchWrite<'a> {
     pub values: &'a [Value],
     pub old_data_for_policy: &'a [u8],
     pub old_provenance_for_policy: &'a RowProvenance,
+}
+
+pub struct RowBranchInsert<'a> {
+    pub table: &'a str,
+    pub branch: &'a str,
+    pub values: &'a [Value],
 }
 
 struct PreparedUpdateWrite {
@@ -43,6 +50,32 @@ struct PreparedUpdateCommit<'a> {
     branch: &'a str,
     id: ObjectId,
     index_mutations: &'a [crate::storage::IndexMutation<'a>],
+}
+
+pub(crate) enum SchemaUpdateRowLoad {
+    Found {
+        table: String,
+        branch: String,
+        data: Vec<u8>,
+        batch_id: BatchId,
+        provenance: RowProvenance,
+    },
+    HardDeleted,
+}
+
+impl SchemaUpdateRowLoad {
+    fn into_found_parts(self) -> Option<(String, String, Vec<u8>, BatchId, RowProvenance)> {
+        match self {
+            Self::Found {
+                table,
+                branch,
+                data,
+                batch_id,
+                provenance,
+            } => Some((table, branch, data, batch_id, provenance)),
+            Self::HardDeleted => None,
+        }
+    }
 }
 
 struct RowBatchAuthoring<'a> {
@@ -791,12 +824,24 @@ impl QueryManager {
         branches: &[String],
         schema_context: &SchemaContext,
     ) -> Option<(String, String, Vec<u8>, BatchId, RowProvenance)> {
+        self.load_schema_update_row_in_context_for_tier(storage, id, branches, schema_context, None)
+            .and_then(SchemaUpdateRowLoad::into_found_parts)
+    }
+
+    pub(crate) fn load_schema_update_row_in_context_for_tier<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        id: ObjectId,
+        branches: &[String],
+        schema_context: &SchemaContext,
+        durability_tier: Option<DurabilityTier>,
+    ) -> Option<SchemaUpdateRowLoad> {
         let branch_schema_map = Self::branch_schema_map_for_context(schema_context);
         let (table, row) = self.load_best_visible_row_batch(
             storage,
             id,
             branches,
-            None,
+            durability_tier,
             schema_context,
             &branch_schema_map,
         )?;
@@ -807,6 +852,9 @@ impl QueryManager {
             schema_context,
             schema_warnings: &mut schema_warnings,
         };
+        if row.is_hard_deleted() {
+            return Some(SchemaUpdateRowLoad::HardDeleted);
+        }
         if row.data.is_empty() {
             return None;
         }
@@ -818,14 +866,12 @@ impl QueryManager {
             BranchName::new(&row.branch),
             &mut transform_context,
         )
-        .map(|resolved| {
-            (
-                table,
-                resolved.branch_name.as_str().to_string(),
-                resolved.content,
-                resolved.batch_id,
-                row.row_provenance(),
-            )
+        .map(|resolved| SchemaUpdateRowLoad::Found {
+            table,
+            branch: resolved.branch_name.as_str().to_string(),
+            data: resolved.content,
+            batch_id: resolved.batch_id,
+            provenance: row.row_provenance(),
         })
     }
 
@@ -1459,6 +1505,264 @@ impl QueryManager {
         self.local_subscription_uses_explicit_authorization(session)
             .then(|| self.authorization_schema_for_branch(&BranchName::new(branch)))
             .flatten()
+    }
+
+    fn preflight_authorization_context_unavailable(
+        &self,
+        branch: &str,
+        session: Option<&Session>,
+    ) -> bool {
+        session.is_some()
+            && self.authorization_schema_required
+            && self
+                .authorization_schema_for_branch(&BranchName::new(branch))
+                .is_none()
+    }
+
+    fn load_visible_row_on_branch_for_preflight(
+        &self,
+        storage: &dyn Storage,
+        row_id: ObjectId,
+        branch_name: &str,
+        durability_tier: Option<DurabilityTier>,
+    ) -> Option<(String, QueryRowBatch)> {
+        let branch_schema_map = Self::branch_schema_map_for_context(&self.schema_context);
+        self.load_best_visible_row_batch(
+            storage,
+            row_id,
+            &[branch_name.to_string()],
+            durability_tier,
+            &self.schema_context,
+            &branch_schema_map,
+        )
+    }
+
+    fn decision_from_policy_error(
+        error: QueryError,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        match error {
+            QueryError::PolicyDenied { .. }
+            | QueryError::AnonymousWriteDenied { .. }
+            | QueryError::RowAlreadyDeleted(_)
+            | QueryError::RowHardDeleted(_) => Ok(PermissionPreflightDecision::Deny),
+            other => Err(other),
+        }
+    }
+
+    pub fn can_insert_with_session<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        table: &str,
+        values: &[Value],
+        session: Option<&Session>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let owned = session.cloned().map(WriteContext::from_session);
+        self.can_insert_with_write_context(storage, table, values, owned.as_ref())
+    }
+
+    pub fn can_insert_with_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        table: &str,
+        values: &[Value],
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let current_branch = self.current_branch().as_str().to_string();
+        let write_schema = self.schema.clone();
+        self.can_insert_on_branch_with_schema_and_write_context(
+            storage,
+            RowBranchInsert {
+                table,
+                branch: &current_branch,
+                values,
+            },
+            write_schema.as_ref(),
+            write_context,
+        )
+    }
+
+    pub fn can_insert_on_branch_with_schema_and_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        insert: RowBranchInsert<'_>,
+        write_schema: &Schema,
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let RowBranchInsert {
+            table,
+            branch,
+            values,
+        } = insert;
+        let table_name = TableName::new(table);
+        let table_write =
+            self.write_table_cache_entry_for_schema(branch, table_name, write_schema)?;
+        let descriptor = table_write.descriptor.as_ref();
+        let insert_policy = table_write.insert_policy.as_deref();
+
+        if values.len() != descriptor.columns.len() {
+            return Err(QueryError::ColumnCountMismatch {
+                expected: descriptor.columns.len(),
+                actual: values.len(),
+            });
+        }
+
+        self.validate_json_for_values(descriptor, values)?;
+        Self::validate_write_index_values_on_branch(table, branch, values, descriptor)?;
+
+        let data =
+            encode_row(descriptor, values).map_err(|e| QueryError::EncodingError(e.to_string()))?;
+        let object_id = ObjectId::new();
+        let timestamp = self.reserve_write_timestamp();
+        let provenance = self.row_provenance_for_insert(write_context, timestamp);
+
+        let Some(session) = write_context.and_then(WriteContext::session) else {
+            return Ok(PermissionPreflightDecision::Allow);
+        };
+
+        if session.auth_mode == AuthMode::Anonymous {
+            return Ok(PermissionPreflightDecision::Deny);
+        }
+
+        if self.preflight_authorization_context_unavailable(branch, Some(session)) {
+            return Ok(PermissionPreflightDecision::Unknown);
+        }
+
+        if let Some((auth_schema, auth_context)) =
+            self.local_write_authorization_context(branch, Some(session))
+        {
+            let allowed = auth_schema
+                .get(&table_name)
+                .and_then(|table_schema| table_schema.policies.insert_policy())
+                .map(|policy| {
+                    self.evaluate_current_authorization_policy_for_content(
+                        storage,
+                        object_id,
+                        branch,
+                        table_name,
+                        policy,
+                        &data,
+                        &provenance,
+                        session,
+                        Operation::Insert,
+                        &auth_schema,
+                        &auth_context,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    !self.row_policy_mode.denies_missing_explicit_policy()
+                        && auth_schema.contains_key(&table_name)
+                });
+            return Ok(allowed.into());
+        }
+
+        if self.row_policy_mode.denies_missing_explicit_policy() && insert_policy.is_none() {
+            return Ok(PermissionPreflightDecision::Deny);
+        }
+        if let Some(policy) = insert_policy {
+            let mut visited = HashSet::new();
+            let allowed = self.evaluate_policy_for_content_with_context_for_row(
+                storage,
+                policy,
+                &data,
+                &provenance,
+                descriptor,
+                session,
+                table,
+                branch,
+                Operation::Insert,
+                object_id,
+                0,
+                &mut visited,
+            );
+            return Ok(allowed.into());
+        }
+
+        Ok(PermissionPreflightDecision::Allow)
+    }
+
+    pub fn can_update_with_session<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        id: ObjectId,
+        values: &[Value],
+        session: Option<&Session>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let owned = session.cloned().map(WriteContext::from_session);
+        self.can_update_with_write_context(storage, id, values, owned.as_ref())
+    }
+
+    pub fn can_update_with_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        id: ObjectId,
+        values: &[Value],
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let table = self
+            .load_row_table_name(storage, id)
+            .ok_or(QueryError::ObjectNotFound(id))?;
+        let branch = self.current_branch();
+        let current_row = self
+            .transactional_staged_row_for_write(storage, id, branch.as_str(), write_context)
+            .or_else(|| {
+                self.load_visible_row_on_branch_for_preflight(storage, id, branch.as_str(), None)
+                    .map(|(_, row)| row)
+            });
+        let Some(current_row) = current_row else {
+            return Ok(PermissionPreflightDecision::Unknown);
+        };
+        if current_row.is_hard_deleted() {
+            return Ok(PermissionPreflightDecision::Deny);
+        }
+        let old_data = current_row.data.clone();
+        let old_provenance = current_row.row_provenance();
+        let write_schema = self.schema.clone();
+        self.can_update_existing_row_on_branch_with_schema_and_write_context(
+            storage,
+            RowBranchWrite {
+                table: &table,
+                branch: branch.as_str(),
+                id,
+                values,
+                old_data_for_policy: &old_data,
+                old_provenance_for_policy: &old_provenance,
+            },
+            write_schema.as_ref(),
+            write_context,
+        )
+    }
+
+    pub fn can_update_existing_row_on_branch_with_schema_and_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        write: RowBranchWrite<'_>,
+        write_schema: &Schema,
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let branch = write.branch;
+        let old_provenance_for_policy = write.old_provenance_for_policy;
+        if let Some(session) = write_context.and_then(WriteContext::session) {
+            if session.auth_mode == AuthMode::Anonymous {
+                return Ok(PermissionPreflightDecision::Deny);
+            }
+            if self.preflight_authorization_context_unavailable(branch, Some(session)) {
+                return Ok(PermissionPreflightDecision::Unknown);
+            }
+        }
+
+        let timestamp = self.resolve_update_timestamp(write_context);
+        let new_provenance =
+            self.row_provenance_for_update(old_provenance_for_policy, write_context, timestamp);
+        match self.prepare_update_write_for_schema(
+            storage,
+            write,
+            write_schema,
+            write_context,
+            &new_provenance,
+        ) {
+            Ok(_) => Ok(PermissionPreflightDecision::Allow),
+            Err(error) => Self::decision_from_policy_error(error),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

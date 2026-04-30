@@ -1,11 +1,11 @@
 import * as React from "react";
-import { useAll, useDb, useSession } from "jazz-tools/react";
+import { useAll, useCanInsert, useDb, useSession } from "jazz-tools/react";
 import { app } from "../schema";
+import { chatMessageInput } from "./chat-permissions.js";
 
 export type ChatPanelProps = {
   chatId: string;
   title: string;
-  canSend: boolean;
   authorName: string | null;
   placeholder?: string;
   readOnlyNotice?: string;
@@ -21,7 +21,6 @@ function formatTimestamp(date: Date | number): string {
 export function ChatPanel({
   chatId,
   title,
-  canSend,
   authorName,
   placeholder,
   readOnlyNotice,
@@ -44,23 +43,25 @@ export function ChatPanel({
   const [deletingMessageId, setDeletingMessageId] = React.useState<string | null>(null);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
 
+  const messagePermissionInput = React.useMemo(
+    () => (sessionUserId && authorName ? chatMessageInput(chatId, authorName, "") : undefined),
+    [authorName, chatId, sessionUserId],
+  );
+  const canInsertMessage = useCanInsert(app.messages, messagePermissionInput);
+  const canSend = Boolean(sessionUserId && authorName && canInsertMessage === true);
+
   async function handleMessageSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!canSend || !sessionUserId || !authorName || !messageText.trim()) return;
+    const trimmedText = messageText.trim();
+    if (!sessionUserId || !authorName || !trimmedText) return;
 
     setMessagePending(true);
     setMessageError(null);
     setDeleteError(null);
 
     try {
-      await db
-        .insert(app.messages, {
-          author_name: authorName,
-          chat_id: chatId,
-          text: messageText.trim(),
-          sent_at: new Date(),
-        })
-        .wait({ tier: "edge" });
+      const message = chatMessageInput(chatId, authorName, trimmedText);
+      await db.insert(app.messages, message).wait({ tier: "edge" });
       setMessageText("");
     } catch (error) {
       setMessageError(error instanceof Error ? error.message : String(error));

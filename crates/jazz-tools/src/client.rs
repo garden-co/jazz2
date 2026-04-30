@@ -781,10 +781,14 @@ fn reorder_values_by_column_name(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rocksdb")]
     use crate::query_manager::policy::PolicyExpr;
+    #[cfg(feature = "rocksdb")]
     use crate::query_manager::types::{SchemaHash, TablePolicies};
+    #[cfg(feature = "rocksdb")]
     use crate::runtime_core::{NoopScheduler, RuntimeCore};
     use crate::schema_manager::AppId;
     #[cfg(feature = "rocksdb")]
@@ -813,6 +817,7 @@ mod tests {
             .build()
     }
 
+    #[cfg(feature = "rocksdb")]
     fn learned_runtime_todo_schema() -> Schema {
         SchemaBuilder::new()
             .table(
@@ -1090,7 +1095,7 @@ mod tests {
     #[test]
     fn query_alignment_preserves_row_identity() {
         let object_id = ObjectId::new();
-        let aligned = vec![(
+        let aligned = [(
             object_id,
             align_row_values_to_declared_schema(
                 &declared_todo_schema(),

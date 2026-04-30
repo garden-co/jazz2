@@ -9,7 +9,7 @@ What it demonstrates:
 - Calling `getAccessToken()` from the AuthKit hook and passing the WorkOS access token directly to `JazzProvider`
 - Recreating `JazzProvider` on login and logout, while reserving `db.updateAuthToken(...)` for same-user JWT refresh after auth expiry
 - Falling back to local-first auth when no WorkOS session exists
-- Role-based UI gating derived from JWT claims (`admin` posts to Announcements; `member` posts to the general chat), with generic-chat message ownership enforced via `$createdBy` in `permissions.ts`
+- Permission-preflight UI gating with `db.canInsert(...)`. Write rules are defined in `permissions.ts`: `admin` posts to Announcements, `admin`/`member` posts to the general chat, and generic-chat message ownership is enforced via `$createdBy`
 
 There is no local auth server in this example. WorkOS issues and signs all tokens;
 the JWKS is fetched from `https://api.workos.com/sso/jwks/<clientId>`.

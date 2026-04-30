@@ -3,6 +3,7 @@ export { createJazzClient, type JazzClient } from "./create-jazz-client.js";
 export { createJazzRnRuntime, type CreateJazzRnRuntimeOptions } from "./create-jazz-rn-runtime.js";
 export { JazzRnRuntimeAdapter, type JazzRnRuntimeBinding } from "./jazz-rn-runtime-adapter.js";
 export { useAll, useAllSuspense } from "./use-all.js";
+export { useCanInsert, useCanUpdate } from "../react-core/use-permissions.js";
 export {
   JazzProvider,
   type JazzProviderProps,

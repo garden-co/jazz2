@@ -17,7 +17,8 @@ const USER_ID: &str = "benchmark_user";
 fn update_write_path_with_and_without_observer(c: &mut Criterion) {
     let mut group = c.benchmark_group("observer_write_path/update_content");
 
-    for scale in [1_000usize] {
+    {
+        let scale = 1_000usize;
         group.throughput(Throughput::Elements(1));
 
         group.bench_with_input(

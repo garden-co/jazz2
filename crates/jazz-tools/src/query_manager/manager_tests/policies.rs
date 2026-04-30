@@ -219,6 +219,87 @@ fn no_session_returns_all_rows() {
 }
 
 #[test]
+fn permission_preflight_reports_allow_and_deny_without_writing() {
+    let sync_manager = SyncManager::new();
+    let schema = current_documents_permission_schema();
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema);
+    let alice = PolicySession::new("alice");
+    let bob = PolicySession::new("bob");
+
+    assert_eq!(
+        qm.can_insert_with_session(
+            &mut storage,
+            "documents",
+            &[
+                Value::Text("Alice's draft".into()),
+                Value::Text("alice".into()),
+            ],
+            Some(&alice),
+        )
+        .unwrap(),
+        crate::query_manager::types::PermissionPreflightDecision::Allow
+    );
+    assert_eq!(
+        qm.can_insert_with_session(
+            &mut storage,
+            "documents",
+            &[Value::Text("Bob's draft".into()), Value::Text("bob".into()),],
+            Some(&alice),
+        )
+        .unwrap(),
+        crate::query_manager::types::PermissionPreflightDecision::Deny
+    );
+
+    let inserted = qm
+        .insert(
+            &mut storage,
+            "documents",
+            &[
+                Value::Text("Existing doc".into()),
+                Value::Text("alice".into()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        qm.can_update_with_session(
+            &mut storage,
+            inserted.row_id,
+            &[
+                Value::Text("Updated doc".into()),
+                Value::Text("alice".into()),
+            ],
+            Some(&alice),
+        )
+        .unwrap(),
+        crate::query_manager::types::PermissionPreflightDecision::Allow
+    );
+    assert_eq!(
+        qm.can_update_with_session(
+            &mut storage,
+            inserted.row_id,
+            &[
+                Value::Text("Bob tries to update".into()),
+                Value::Text("alice".into()),
+            ],
+            Some(&bob),
+        )
+        .unwrap(),
+        crate::query_manager::types::PermissionPreflightDecision::Deny
+    );
+
+    let sub_id = qm.subscribe(qm.query("documents").build()).unwrap();
+    qm.process(&mut storage);
+    let rows = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        rows.len(),
+        1,
+        "preflight should not create, update, or delete rows"
+    );
+    assert_eq!(rows[0].1[0], Value::Text("Existing doc".into()));
+}
+
+#[test]
 fn loaded_empty_permissions_bundle_hides_rows_without_explicit_read_policy() {
     let sync_manager = SyncManager::new();
     let (mut qm, mut storage) = create_query_manager(sync_manager, test_schema());

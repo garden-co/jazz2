@@ -61,6 +61,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jazz_tools::binding_support::{
     parse_batch_id_input, serialize_local_batch_record, serialize_local_batch_records,
+    serialize_permission_preflight_decision,
 };
 use jazz_tools::identity;
 use jazz_tools::object::ObjectId;
@@ -1059,6 +1060,70 @@ impl WasmRuntime {
         }
         .serialize(&serializer)
         .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = canInsert)]
+    pub fn can_insert(&self, table: &str, values: JsValue) -> Result<JsValue, JsError> {
+        let named_values: HashMap<String, Value> = serde_wasm_bindgen::from_value(values)?;
+        let mut core = self.core.borrow_mut();
+        let decision = core
+            .can_insert(table, named_values, None)
+            .map_err(|e| JsError::new(&format!("CanInsert failed: {e}")))?;
+        serde_wasm_bindgen::to_value(&serialize_permission_preflight_decision(decision))
+            .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = canInsertWithSession)]
+    pub fn can_insert_with_session(
+        &self,
+        table: &str,
+        values: JsValue,
+        write_context_json: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let named_values: HashMap<String, Value> = serde_wasm_bindgen::from_value(values)?;
+        let write_context = parse_write_context_json(write_context_json)?;
+        let mut core = self.core.borrow_mut();
+        let decision = core
+            .can_insert(table, named_values, write_context.as_ref())
+            .map_err(|e| JsError::new(&format!("CanInsert failed: {e}")))?;
+        serde_wasm_bindgen::to_value(&serialize_permission_preflight_decision(decision))
+            .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = canUpdate)]
+    pub fn can_update(&self, object_id: &str, values: JsValue) -> Result<JsValue, JsError> {
+        let uuid = uuid::Uuid::parse_str(object_id)
+            .map_err(|e| JsError::new(&format!("Invalid ObjectId: {}", e)))?;
+        let oid = ObjectId::from_uuid(uuid);
+        let partial_values: HashMap<String, Value> = serde_wasm_bindgen::from_value(values)?;
+        let updates: Vec<(String, Value)> = partial_values.into_iter().collect();
+        let mut core = self.core.borrow_mut();
+        let decision = core
+            .can_update(oid, updates, None)
+            .map_err(|e| JsError::new(&format!("CanUpdate failed: {e}")))?;
+        serde_wasm_bindgen::to_value(&serialize_permission_preflight_decision(decision))
+            .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = canUpdateWithSession)]
+    pub fn can_update_with_session(
+        &self,
+        object_id: &str,
+        values: JsValue,
+        write_context_json: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let uuid = uuid::Uuid::parse_str(object_id)
+            .map_err(|e| JsError::new(&format!("Invalid ObjectId: {}", e)))?;
+        let oid = ObjectId::from_uuid(uuid);
+        let write_context = parse_write_context_json(write_context_json)?;
+        let partial_values: HashMap<String, Value> = serde_wasm_bindgen::from_value(values)?;
+        let updates: Vec<(String, Value)> = partial_values.into_iter().collect();
+        let mut core = self.core.borrow_mut();
+        let decision = core
+            .can_update(oid, updates, write_context.as_ref())
+            .map_err(|e| JsError::new(&format!("CanUpdate failed: {e}")))?;
+        serde_wasm_bindgen::to_value(&serialize_permission_preflight_decision(decision))
+            .map_err(|e| JsError::new(&format!("Serialization failed: {:?}", e)))
     }
 
     // =========================================================================

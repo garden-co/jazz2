@@ -3,6 +3,7 @@ import type {
   DirectInsertResult,
   DirectMutationResult,
   LocalBatchRecord,
+  PermissionDecision,
   Row,
   Runtime,
 } from "../runtime/client.js";
@@ -32,6 +33,18 @@ export interface JazzRnRuntimeBinding {
   onAuthFailure(callback: { onFailure(reason: string): void }): void;
   delete_(objectId: string): string;
   deleteWithSession?(objectId: string, writeContextJson: string | undefined): string;
+  canInsert(table: string, valuesJson: string): string;
+  canInsertWithSession?(
+    table: string,
+    valuesJson: string,
+    writeContextJson: string | undefined,
+  ): string;
+  canUpdate(objectId: string, valuesJson: string): string;
+  canUpdateWithSession?(
+    objectId: string,
+    valuesJson: string,
+    writeContextJson: string | undefined,
+  ): string;
   flush(): void;
   getSchemaHash(): string;
   insert(table: string, valuesJson: string, objectId: string | undefined): string;
@@ -145,6 +158,14 @@ function createErrorWithCause(message: string, cause: unknown): Error {
   }
 }
 
+function parsePermissionDecision(decisionJson: string): PermissionDecision {
+  const decision = JSON.parse(decisionJson) as unknown;
+  if (decision === true || decision === false || decision === "unknown") {
+    return decision;
+  }
+  throw new Error(`Invalid permission decision: ${String(decision)}`);
+}
+
 export class JazzRnRuntimeAdapter implements Runtime {
   private readonly handleMap = new Map<number, bigint>();
   private closed = false;
@@ -170,7 +191,12 @@ export class JazzRnRuntimeAdapter implements Runtime {
   }
 
   private requireWriteContextMethod<
-    T extends "insertWithSession" | "updateWithSession" | "deleteWithSession",
+    T extends
+      | "insertWithSession"
+      | "updateWithSession"
+      | "deleteWithSession"
+      | "canInsertWithSession"
+      | "canUpdateWithSession",
   >(method: T): NonNullable<JazzRnRuntimeBinding[T]> {
     const runtimeMethod = this.binding[method];
     if (!runtimeMethod) {
@@ -226,6 +252,32 @@ export class JazzRnRuntimeAdapter implements Runtime {
     }
   }
 
+  canInsert(table: string, values: InsertValues): PermissionDecision {
+    try {
+      const decisionJson = this.binding.canInsert(table, encodeFFIRecordToJson(values));
+      return parsePermissionDecision(decisionJson);
+    } catch (error) {
+      throw normalizeJazzRnError(error);
+    }
+  }
+
+  canInsertWithSession(
+    table: string,
+    values: InsertValues,
+    write_context_json?: string | null,
+  ): PermissionDecision {
+    try {
+      const decisionJson = this.requireWriteContextMethod("canInsertWithSession")(
+        table,
+        encodeFFIRecordToJson(values),
+        write_context_json ?? undefined,
+      );
+      return parsePermissionDecision(decisionJson);
+    } catch (error) {
+      throw normalizeJazzRnError(error);
+    }
+  }
+
   update(object_id: string, values: Record<string, Value>): DirectMutationResult {
     try {
       const resultJson = this.binding.update(object_id, encodeFFIRecordToJson(values));
@@ -247,6 +299,32 @@ export class JazzRnRuntimeAdapter implements Runtime {
         write_context_json ?? undefined,
       );
       return JSON.parse(resultJson) as DirectMutationResult;
+    } catch (error) {
+      throw normalizeJazzRnError(error);
+    }
+  }
+
+  canUpdate(object_id: string, values: Record<string, Value>): PermissionDecision {
+    try {
+      const decisionJson = this.binding.canUpdate(object_id, encodeFFIRecordToJson(values));
+      return parsePermissionDecision(decisionJson);
+    } catch (error) {
+      throw normalizeJazzRnError(error);
+    }
+  }
+
+  canUpdateWithSession(
+    object_id: string,
+    values: Record<string, Value>,
+    write_context_json?: string | null,
+  ): PermissionDecision {
+    try {
+      const decisionJson = this.requireWriteContextMethod("canUpdateWithSession")(
+        object_id,
+        encodeFFIRecordToJson(values),
+        write_context_json ?? undefined,
+      );
+      return parsePermissionDecision(decisionJson);
     } catch (error) {
       throw normalizeJazzRnError(error);
     }

@@ -1053,11 +1053,11 @@ fn configure_legacy_join_client_with_current_permissions(qm: &mut QueryManager) 
 // Part 5: Multi-Tier Forwarding Tests
 // ============================================================================
 
-/// Test that a mid-tier server forwards QuerySubscription to upstream servers.
+// Test that a mid-tier server forwards QuerySubscription to upstream servers.
 
-/// Test that a mid-tier server forwards QueryUnsubscription to upstream servers.
+// Test that a mid-tier server forwards QueryUnsubscription to upstream servers.
 
-/// Test that objects from upstream are relayed to downstream clients with matching scope.
+// Test that objects from upstream are relayed to downstream clients with matching scope.
 
 // ============================================================================
 // Part 6: End-to-End Integration Tests
@@ -1189,30 +1189,30 @@ fn pump_messages_three_tier(
     }
 }
 
-/// E2E: Client subscribes to query, receives matching data from server.
+// E2E: Client subscribes to query, receives matching data from server.
 
-/// E2E: Client can cold-load a paginated remote query with a non-zero offset.
+// E2E: Client can cold-load a paginated remote query with a non-zero offset.
 
-/// E2E: Client receives new matching rows as server inserts them.
+// E2E: Client receives new matching rows as server inserts them.
 
-/// E2E: Client does NOT receive rows that don't match the query filter.
+// E2E: Client does NOT receive rows that don't match the query filter.
 
-/// E2E: Permissions filter what gets synced - client only receives permitted rows.
+// E2E: Permissions filter what gets synced - client only receives permitted rows.
 
-/// E2E: New rows that don't match permissions are NOT synced.
+// E2E: New rows that don't match permissions are NOT synced.
 
-/// E2E: In a 3-tier topology, upstream must sync policy-evaluation dependencies.
-///
-/// Scenario:
-/// - documents SELECT policy: owner_id = @session.user_id OR INHERITS SELECT VIA folder_id
-/// - core has folder(owner=alice) and document(owner=bob, folder=alice_folder)
-/// - alice queries documents from downstream client via edge
-///
-/// Expected:
-/// - core deems the document visible (via INHERITS)
-/// - edge must receive enough rows to re-evaluate the same policy and relay to client
+// E2E: In a 3-tier topology, upstream must sync policy-evaluation dependencies.
+//
+// Scenario:
+// - documents SELECT policy: owner_id = @session.user_id OR INHERITS SELECT VIA folder_id
+// - core has folder(owner=alice) and document(owner=bob, folder=alice_folder)
+// - alice queries documents from downstream client via edge
+//
+// Expected:
+// - core deems the document visible (via INHERITS)
+// - edge must receive enough rows to re-evaluate the same policy and relay to client
 
-/// E2E: Untrusted downstream clients keep result-set-only scope (no policy context rows).
+// E2E: Untrusted downstream clients keep result-set-only scope (no policy context rows).
 
 /// Push a query subscription inbox entry for a client.
 fn push_query_subscription(

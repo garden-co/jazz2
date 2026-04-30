@@ -137,10 +137,7 @@ fn soft_delete_with_concurrent_tips_merges_preserved_content() {
     // Get the initial commit as the common parent
     let branch = get_branch(&qm);
     let branch_name = BranchName::new(&branch);
-    let initial_tips: Vec<_> = test_row_tip_ids(&storage, handle.row_id, &branch)
-        .iter()
-        .copied()
-        .collect();
+    let initial_tips: Vec<_> = test_row_tip_ids(&storage, handle.row_id, &branch).to_vec();
     assert_eq!(initial_tips.len(), 1);
     let parent = initial_tips[0];
 
@@ -188,10 +185,7 @@ fn soft_delete_with_concurrent_tips_merges_preserved_content() {
     qm.process(&mut storage);
 
     // Verify we now have concurrent tips
-    let tips: Vec<_> = test_row_tip_ids(&storage, handle.row_id, &branch)
-        .iter()
-        .copied()
-        .collect();
+    let tips: Vec<_> = test_row_tip_ids(&storage, handle.row_id, &branch).to_vec();
     assert_eq!(tips.len(), 2, "Should have 2 concurrent tips");
     assert!(tips.contains(&commit_a_id));
     assert!(tips.contains(&commit_b_id));

@@ -920,7 +920,7 @@ mod tests {
 
     thread_local! {
         static TEST_CONTROLLER: std::cell::RefCell<Option<Arc<TestStreamController>>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
 
     fn install_controller(c: Arc<TestStreamController>) {
@@ -959,11 +959,11 @@ mod tests {
         }
 
         async fn recv(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
-            if !self.handshake_delivered {
-                if let Some(frame) = self.controller.handshake_response.lock().unwrap().clone() {
-                    self.handshake_delivered = true;
-                    return Ok(Some(frame));
-                }
+            if !self.handshake_delivered
+                && let Some(frame) = self.controller.handshake_response.lock().unwrap().clone()
+            {
+                self.handshake_delivered = true;
+                return Ok(Some(frame));
             }
             if let Some(frame) = self.controller.recv_queue.lock().unwrap().pop_front() {
                 return Ok(Some(frame));
@@ -1155,8 +1155,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let calls_before = controller.connect_calls.load(Ordering::SeqCst);
 
-        let mut new_auth = AuthConfig::default();
-        new_auth.jwt_token = Some("refreshed".into());
+        let new_auth = AuthConfig {
+            jwt_token: Some("refreshed".into()),
+            ..Default::default()
+        };
         handle.update_auth(new_auth);
 
         // Manager should skip the remaining backoff and reconnect ~immediately.
@@ -1204,8 +1206,10 @@ mod tests {
         assert!(handle.has_ever_connected());
         let initial_close_calls = controller.close_calls.load(Ordering::SeqCst);
 
-        let mut new_auth = AuthConfig::default();
-        new_auth.jwt_token = Some("refreshed".into());
+        let new_auth = AuthConfig {
+            jwt_token: Some("refreshed".into()),
+            ..Default::default()
+        };
         handle.update_auth(new_auth);
 
         // Expect: Disconnected emitted; stream closed; reconnect reaches Connected again.

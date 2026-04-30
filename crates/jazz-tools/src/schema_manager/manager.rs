@@ -20,10 +20,10 @@ use crate::query_manager::manager::{DeleteHandle, InsertResult, QueryError, Quer
 use crate::query_manager::query::{Query, QueryBuilder};
 use crate::query_manager::session::{Session, WriteContext};
 use crate::query_manager::types::{
-    ComposedBranchName, RowDescriptor, RowPolicyMode, Schema, SchemaHash, TableName, TablePolicies,
-    Value,
+    ComposedBranchName, PermissionPreflightDecision, RowDescriptor, RowPolicyMode, Schema,
+    SchemaHash, TableName, TablePolicies, Value,
 };
-use crate::query_manager::writes::{RowBranchDelete, RowBranchWrite};
+use crate::query_manager::writes::{RowBranchDelete, RowBranchWrite, SchemaUpdateRowLoad};
 use crate::row_format::decode_row;
 use crate::schema_manager::rehydrate::latest_catalogue_content;
 use crate::storage::Storage;
@@ -1649,6 +1649,49 @@ impl SchemaManager {
         self.insert_with_write_context(storage, table, values, owned.as_ref())
     }
 
+    pub fn can_insert_with_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        table: &str,
+        values: HashMap<String, Value>,
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let (target_branch, target_hash) = match self.resolve_target_branch(write_context) {
+            Ok(target) => target,
+            Err(QueryError::UnknownSchema(_)) => {
+                return Ok(PermissionPreflightDecision::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(target_schema) = self.schema_for_hash(target_hash).cloned() else {
+            return Ok(PermissionPreflightDecision::Unknown);
+        };
+        let aligned_values =
+            Self::get_insert_values_with_defaults_for_schema(table, &target_schema, values)?;
+        self.query_manager
+            .can_insert_on_branch_with_schema_and_write_context(
+                storage,
+                crate::query_manager::writes::RowBranchInsert {
+                    table,
+                    branch: &target_branch,
+                    values: &aligned_values,
+                },
+                &target_schema,
+                write_context,
+            )
+    }
+
+    pub fn can_insert_with_session<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        table: &str,
+        values: HashMap<String, Value>,
+        session: Option<&Session>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let owned = session.cloned().map(WriteContext::from_session);
+        self.can_insert_with_write_context(storage, table, values, owned.as_ref())
+    }
+
     /// Create or update a row with a caller-supplied UUID.
     ///
     /// If a visible row already exists for `object_id`, only the supplied
@@ -1815,6 +1858,133 @@ impl SchemaManager {
     ) -> Result<crate::row_histories::BatchId, QueryError> {
         let owned = session.cloned().map(WriteContext::from_session);
         self.update_with_write_context(storage, object_id, values, owned.as_ref())
+    }
+
+    pub fn can_update_with_write_context<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        object_id: ObjectId,
+        values: &[(String, Value)],
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let (target_branch, target_hash) = match self.resolve_target_branch(write_context) {
+            Ok(target) => target,
+            Err(QueryError::UnknownSchema(_)) => {
+                return Ok(PermissionPreflightDecision::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(target_schema) = self.schema_for_hash(target_hash).cloned() else {
+            return Ok(PermissionPreflightDecision::Unknown);
+        };
+        let target_context = match self.schema_context_for_hash(target_hash) {
+            Ok(context) => context,
+            Err(QueryError::UnknownSchema(_)) => {
+                return Ok(PermissionPreflightDecision::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        let branches = target_context
+            .all_branch_names()
+            .into_iter()
+            .map(|branch_name| branch_name.as_str().to_string())
+            .collect::<Vec<_>>();
+        let loaded_row = write_context
+            .filter(|ctx| ctx.batch_mode() == crate::batch_fate::BatchMode::Transactional)
+            .and_then(WriteContext::batch_id)
+            .and_then(|batch_id| {
+                self.query_manager
+                    .load_latest_transactional_staged_row_on_branch(
+                        storage,
+                        object_id,
+                        &target_branch,
+                        batch_id,
+                    )
+                    .map(|(table, row)| {
+                        if row.is_hard_deleted() {
+                            SchemaUpdateRowLoad::HardDeleted
+                        } else {
+                            SchemaUpdateRowLoad::Found {
+                                table,
+                                branch: target_branch.clone(),
+                                data: row.data.to_vec(),
+                                batch_id: row.batch_id(),
+                                provenance: row.row_provenance(),
+                            }
+                        }
+                    })
+            })
+            .or_else(|| {
+                self.query_manager
+                    .load_schema_update_row_in_context_for_tier(
+                        storage,
+                        object_id,
+                        &branches,
+                        &target_context,
+                        None,
+                    )
+            });
+        let Some(loaded_row) = loaded_row else {
+            return Ok(PermissionPreflightDecision::Unknown);
+        };
+        let (table, _source_branch, old_current_data, _source_commit_id, old_current_provenance) =
+            match loaded_row {
+                SchemaUpdateRowLoad::Found {
+                    table,
+                    branch,
+                    data,
+                    batch_id,
+                    provenance,
+                } => (table, branch, data, batch_id, provenance),
+                SchemaUpdateRowLoad::HardDeleted => {
+                    return Ok(PermissionPreflightDecision::Deny);
+                }
+            };
+
+        let table_name = TableName::new(&table);
+        let descriptor = target_schema
+            .get(&table_name)
+            .ok_or(QueryError::TableNotFound(table_name))?
+            .columns
+            .clone();
+
+        let mut current_values = decode_row(&descriptor, &old_current_data)
+            .map_err(|err| QueryError::EncodingError(format!("{err:?}")))?;
+
+        for (column_name, new_value) in values {
+            let Some(index) = descriptor.column_index(column_name) else {
+                return Err(QueryError::EncodingError(format!(
+                    "column '{column_name}' not found"
+                )));
+            };
+            current_values[index] = new_value.clone();
+        }
+
+        self.query_manager
+            .can_update_existing_row_on_branch_with_schema_and_write_context(
+                storage,
+                RowBranchWrite {
+                    table: &table,
+                    branch: &target_branch,
+                    id: object_id,
+                    values: &current_values,
+                    old_data_for_policy: &old_current_data,
+                    old_provenance_for_policy: &old_current_provenance,
+                },
+                &target_schema,
+                write_context,
+            )
+    }
+
+    pub fn can_update_with_session<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        object_id: ObjectId,
+        values: &[(String, Value)],
+        session: Option<&Session>,
+    ) -> Result<PermissionPreflightDecision, QueryError> {
+        let owned = session.cloned().map(WriteContext::from_session);
+        self.can_update_with_write_context(storage, object_id, values, owned.as_ref())
     }
 
     /// Delete a row (soft delete), performing copy-on-write when the latest

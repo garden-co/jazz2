@@ -8,6 +8,7 @@ export {
   type LocalBatchRecord,
   type LocalUpdatesMode,
   type MutationErrorEvent,
+  type PermissionDecision,
   PersistedWriteRejectedError,
   SessionClient,
   Transaction,

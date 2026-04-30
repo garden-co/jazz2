@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn rc_row_writes_do_not_touch_legacy_commit_storage() {
-    let calls = Arc::new(Mutex::new(LegacyStorageCallCounts::default()));
+    let calls = Arc::new(Mutex::new(LegacyStorageCallCounts));
     let mut core = create_runtime_with_boxed_storage(
         test_schema(),
         "row-no-legacy-commit-storage",
@@ -23,7 +23,7 @@ fn rc_row_writes_do_not_touch_legacy_commit_storage() {
 
     assert_eq!(
         *calls.lock().unwrap(),
-        LegacyStorageCallCounts::default(),
+        LegacyStorageCallCounts,
         "row writes should persist only via row histories, not legacy branch commit storage"
     );
 }

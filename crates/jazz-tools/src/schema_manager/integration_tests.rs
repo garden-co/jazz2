@@ -200,15 +200,15 @@ mod tests {
         }
     }
 
-    /// Test full migration workflow: v1 -> v2 with added column.
+    // Test full migration workflow: v1 -> v2 with added column.
 
-    /// Test column rename through lens.
+    // Test column rename through lens.
 
-    /// Test multi-table schema evolution.
+    // Test multi-table schema evolution.
 
-    /// Test draft lens detection and rejection.
+    // Test draft lens detection and rejection.
 
-    /// Test validation of schema context.
+    // Test validation of schema context.
     // ========================================================================
     // QueryManager Integration Tests
     // ========================================================================
@@ -262,6 +262,7 @@ mod tests {
 
     /// Ingest a remote row batch entry on a specific branch through the storage-backed sync path.
     /// QueryManager picks this up during `process()` via the sync inbox.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_remote_row(
         qm: &mut QueryManager,
         storage: &mut MemoryStorage,
@@ -312,42 +313,42 @@ mod tests {
         });
     }
 
-    /// Test QueryManager with schema context initialization.
+    // Test QueryManager with schema context initialization.
 
-    /// Test QueryGraph compilation with schema context and column translation.
+    // Test QueryGraph compilation with schema context and column translation.
 
-    /// Test that SchemaManager's context can be used with QueryManager.
+    // Test that SchemaManager's context can be used with QueryManager.
 
     // ========================================================================
     // End-to-end test-cache integration tests
     // ========================================================================
 
-    /// End-to-end test: Insert rows in old schema format, query with new schema,
-    /// verify lens transforms are applied.
+    // End-to-end test: Insert rows in old schema format, query with new schema,
+    // verify lens transforms are applied.
 
     // ========================================================================
     // Multi-Hop Lens Path Integration Tests
     // ========================================================================
 
-    /// End-to-end test: v1 -> v2 -> v3 multi-hop transform.
-    /// Insert rows in v1 and v2 format, query with v3 schema,
-    /// verify lens transforms are applied across multiple hops.
+    // End-to-end test: v1 -> v2 -> v3 multi-hop transform.
+    // Insert rows in v1 and v2 format, query with v3 schema,
+    // verify lens transforms are applied across multiple hops.
 
-    /// Test multi-hop with chained column renames across versions.
+    // Test multi-hop with chained column renames across versions.
 
-    /// End-to-end test with column rename: query uses new column name,
-    /// lens translates for old schema index lookup.
+    // End-to-end test with column rename: query uses new column name,
+    // lens translates for old schema index lookup.
 
-    /// End-to-end test with table rename: query uses new table name,
-    /// lens translates old-branch scans and row decoding through the rename.
+    // End-to-end test with table rename: query uses new table name,
+    // lens translates old-branch scans and row decoding through the rename.
 
-    /// Table renames must also keep existing subscriptions reactive when old-schema
-    /// rows arrive after the query graph has already been compiled.
+    // Table renames must also keep existing subscriptions reactive when old-schema
+    // rows arrive after the query graph has already been compiled.
 
-    /// Existing old-schema subscriptions must recompile when a renamed future branch
-    /// becomes live, so new-table writes remain visible through the old table name.
+    // Existing old-schema subscriptions must recompile when a renamed future branch
+    // becomes live, so new-table writes remain visible through the old table name.
 
-    /// Rows from renamed tables are migrated on write (in both updates and deletes).
+    // Rows from renamed tables are migrated on write (in both updates and deletes).
     // ========================================================================
     // Catalogue Sync Tests
     // ========================================================================
@@ -356,105 +357,105 @@ mod tests {
         decode_lens_transform, decode_schema, encode_lens_transform, encode_schema,
     };
 
-    /// Test schema persistence and encoding roundtrip.
+    // Test schema persistence and encoding roundtrip.
 
-    /// Test lens persistence and encoding roundtrip.
+    // Test lens persistence and encoding roundtrip.
 
-    /// Test catalogue update processing: schema received via sync.
+    // Test catalogue update processing: schema received via sync.
 
-    /// Test catalogue update processing: lens makes pending schema live.
+    // Test catalogue update processing: lens makes pending schema live.
 
-    /// Test catalogue update processing: draft lenses are stored but must not
-    /// activate pending schemas.
+    // Test catalogue update processing: draft lenses are stored but must not
+    // activate pending schemas.
 
-    /// Test pending catalogue updates are queued in QueryManager.
+    // Test pending catalogue updates are queued in QueryManager.
 
-    /// Non-matching app_id catalogue objects must be ignored for all schema-shape variants.
+    // Non-matching app_id catalogue objects must be ignored for all schema-shape variants.
 
-    /// Unknown catalogue type must be ignored even for materially different schema payloads.
+    // Unknown catalogue type must be ignored even for materially different schema payloads.
 
-    /// Pushing the exact same schema (same hash/content) should be a no-op.
+    // Pushing the exact same schema (same hash/content) should be a no-op.
 
-    /// Malformed schema payload should fail decode path deterministically.
+    // Malformed schema payload should fail decode path deterministically.
 
-    /// Malformed lens payload should fail decode path deterministically.
+    // Malformed lens payload should fail decode path deterministically.
 
-    /// E2E test: Full catalogue sync flow with data query.
-    ///
-    /// This test simulates the complete flow where:
-    /// 1. Client A (v2) persists schema and lens to catalogue
-    /// 2. Client B (v1) receives via catalogue sync
-    /// 3. Client A writes a row on v2 branch
-    /// 4. Client B queries and receives transformed data
+    // E2E test: Full catalogue sync flow with data query.
+    //
+    // This test simulates the complete flow where:
+    // 1. Client A (v2) persists schema and lens to catalogue
+    // 2. Client B (v1) receives via catalogue sync
+    // 3. Client A writes a row on v2 branch
+    // 4. Client B queries and receives transformed data
 
-    /// Test multi-hop lens cascade activation via catalogue.
-    ///
-    /// Scenario: v1 client receives v2, then v3, then lens(v1->v2), then lens(v2->v3).
-    /// After each step, verify correct pending/live states.
+    // Test multi-hop lens cascade activation via catalogue.
+    //
+    // Scenario: v1 client receives v2, then v3, then lens(v1->v2), then lens(v2->v3).
+    // After each step, verify correct pending/live states.
     // ========================================================================
     // Multi-Client Server Schema Sync Tests
     // ========================================================================
     use crate::sync_manager::{ClientId, ClientRole, Destination, DurabilityTier};
 
-    /// E2E test: Two clients with same schema, server with empty schema.
-    ///
-    /// NOTE: This test is incomplete. The current architecture requires servers
-    /// to be initialized with the schema. Catalogue sync is designed for schema
-    /// EVOLUTION (adding new schema versions via lenses), not for schema
-    /// BOOTSTRAPPING (starting with no schema).
-    ///
-    /// The main test `e2e_two_clients_query_subscriptions_through_server`
-    /// validates the intended use case where all nodes share the same schema.
-    ///
-    /// Now implemented via lazy schema activation in QueryManager.
+    // E2E test: Two clients with same schema, server with empty schema.
+    //
+    // NOTE: This test is incomplete. The current architecture requires servers
+    // to be initialized with the schema. Catalogue sync is designed for schema
+    // EVOLUTION (adding new schema versions via lenses), not for schema
+    // BOOTSTRAPPING (starting with no schema).
+    //
+    // The main test `e2e_two_clients_query_subscriptions_through_server`
+    // validates the intended use case where all nodes share the same schema.
+    //
+    // Now implemented via lazy schema activation in QueryManager.
 
-    /// E2E test: Two clients, server all with same schema - query subscriptions sync.
-    ///
-    /// This is the more direct test of the user's question: both clients issue
-    /// query subscriptions that correctly sync through the server.
+    // E2E test: Two clients, server all with same schema - query subscriptions sync.
+    //
+    // This is the more direct test of the user's question: both clients issue
+    // query subscriptions that correctly sync through the server.
 
-    /// E2E test: Server with empty schema receives schema via sync, then handles queries.
-    ///
-    /// This tests the full scenario: server starts with no schema knowledge,
-    /// receives schema through catalogue sync, and can then process queries.
+    // E2E test: Server with empty schema receives schema via sync, then handles queries.
+    //
+    // This tests the full scenario: server starts with no schema knowledge,
+    // receives schema through catalogue sync, and can then process queries.
 
     // ========================================================================
     // Pending Row Updates Tests (rows arriving before schema)
     // ========================================================================
 
-    /// Test that rows arriving before their schema is known are buffered
-    /// and processed when the schema activates.
-    ///
-    /// Scenario:
-    /// 1. Client B (v1 schema) receives a row on the v2 branch (unknown schema)
-    /// 2. The row is buffered in pending_row_visibility_changes
-    /// 3. Client B receives schema v2 and lens v1->v2 via catalogue
-    /// 4. process() activates v2 and retries pending rows
-    /// 5. The row is now queryable with lens transform applied
+    // Test that rows arriving before their schema is known are buffered
+    // and processed when the schema activates.
+    //
+    // Scenario:
+    // 1. Client B (v1 schema) receives a row on the v2 branch (unknown schema)
+    // 2. The row is buffered in pending_row_visibility_changes
+    // 3. Client B receives schema v2 and lens v1->v2 via catalogue
+    // 4. process() activates v2 and retries pending rows
+    // 5. The row is now queryable with lens transform applied
 
     // ========================================================================
     // Query Settlement Tier Tests
     // ========================================================================
 
-    /// Test 1: Subscribe with settled_tier=None — immediate delivery (current behavior).
+    // Test 1: Subscribe with settled_tier=None — immediate delivery (current behavior).
 
-    /// Test 2: Client A subscribes on server B with settled_tier=Local.
-    /// B settles → emits QuerySettled(Local). After A receives it, A delivers.
+    // Test 2: Client A subscribes on server B with settled_tier=Local.
+    // B settles → emits QuerySettled(Local). After A receives it, A delivers.
 
-    /// Test 3: A subscribes with settled_tier=EdgeServer through B (Worker) to C (EdgeServer).
-    /// Worker settling is insufficient. EdgeServer settling satisfies the requirement.
+    // Test 3: A subscribes with settled_tier=EdgeServer through B (Worker) to C (EdgeServer).
+    // Worker settling is insufficient. EdgeServer settling satisfies the requirement.
 
-    /// Test 4: A subscribes with settled_tier=EdgeServer through B (Worker) to C (EdgeServer).
-    /// C's QuerySettled(EdgeServer) should relay through B back to A.
+    // Test 4: A subscribes with settled_tier=EdgeServer through B (Worker) to C (EdgeServer).
+    // C's QuerySettled(EdgeServer) should relay through B back to A.
 
-    /// Test 5: Data accumulates while waiting for tier. First delivery contains all rows.
+    // Test 5: Data accumulates while waiting for tier. First delivery contains all rows.
 
-    /// Test 5: One-shot query() with settled_tier via subscribe_with_sync.
-    /// With `local_updates = Immediate`, the subscription should deliver the
-    /// locally pending row once the initial frontier is complete, before the
-    /// requested tier confirms.
+    // Test 5: One-shot query() with settled_tier via subscribe_with_sync.
+    // With `local_updates = Immediate`, the subscription should deliver the
+    // locally pending row once the initial frontier is complete, before the
+    // requested tier confirms.
 
-    /// Test 6: One-shot query() with settled_tier resolves to empty snapshot after tier settle.
+    // Test 6: One-shot query() with settled_tier resolves to empty snapshot after tier settle.
     mod catalogue;
     mod lenses;
     mod locator_only_storage;

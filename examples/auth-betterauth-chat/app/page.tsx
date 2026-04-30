@@ -10,10 +10,6 @@ import { authClient, getJwtFromBetterAuth } from "../src/lib/auth-client";
 function ChatShell(): React.JSX.Element {
   const db = useDb();
   const { claims, authMode, userId } = useAuthState();
-  const isAuthenticated = authMode === "external";
-  const role = typeof claims.role === "string" ? claims.role : null;
-  const canPostAnnouncements = isAuthenticated && role === "admin";
-  const canPostGeneric = isAuthenticated && (role === "admin" || role === "member");
 
   const localFirstAuth = useLocalFirstAuth();
 
@@ -73,7 +69,6 @@ function ChatShell(): React.JSX.Element {
         <ChatPanel
           chatId={process.env.NEXT_PUBLIC_ANNOUNCEMENTS_CHAT_ID!}
           title="Announcements"
-          canSend={canPostAnnouncements}
           authorName={userId} // TODO: This should come from better auth (email, name/surname)
           readOnlyNotice="Only admins can post announcements."
         />
@@ -81,7 +76,6 @@ function ChatShell(): React.JSX.Element {
         <ChatPanel
           chatId={process.env.NEXT_PUBLIC_CHAT_ID!}
           title={process.env.NEXT_PUBLIC_CHAT_ID!}
-          canSend
           authorName={userId}
           readOnlyNotice="Sign in as admin or member to participate."
         />

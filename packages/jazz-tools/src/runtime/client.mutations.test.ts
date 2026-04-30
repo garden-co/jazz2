@@ -9,6 +9,12 @@ function makeClient(runtimeOverrides: Partial<Runtime> = {}) {
   const updateCalls: Array<[string, Record<string, unknown>]> = [];
   const deleteWithSessionCalls: Array<[string, string | undefined]> = [];
   const deleteCalls: string[] = [];
+  const canInsertCalls: Array<[string, Record<string, unknown>]> = [];
+  const canUpdateWithSessionCalls: Array<[string, Record<string, unknown>, string | undefined]> =
+    [];
+  const canInsertWithSessionCalls: Array<[string, Record<string, unknown>, string | undefined]> =
+    [];
+  const canUpdateCalls: Array<[string, Record<string, unknown>]> = [];
 
   const runtimeBase: Runtime = {
     loadLocalBatchRecord: () => null,
@@ -60,6 +66,30 @@ function makeClient(runtimeOverrides: Partial<Runtime> = {}) {
       deleteWithSessionCalls.push([objectId, writeContextJson ?? undefined]);
       return { batchId: "delete-with-session-batch-id" };
     },
+    canInsert: async (table: string, values: Record<string, unknown>) => {
+      canInsertCalls.push([table, values]);
+      return true;
+    },
+    canInsertWithSession: async (
+      table: string,
+      values: Record<string, unknown>,
+      writeContextJson?: string | null,
+    ) => {
+      canInsertWithSessionCalls.push([table, values, writeContextJson ?? undefined]);
+      return "unknown" as const;
+    },
+    canUpdate: async (objectId: string, updates: Record<string, unknown>) => {
+      canUpdateCalls.push([objectId, updates]);
+      return false;
+    },
+    canUpdateWithSession: async (
+      objectId: string,
+      updates: Record<string, unknown>,
+      writeContextJson?: string | null,
+    ) => {
+      canUpdateWithSessionCalls.push([objectId, updates, writeContextJson ?? undefined]);
+      return true;
+    },
     query: async () => [],
     subscribe: () => 0,
     createSubscription: () => 0,
@@ -100,6 +130,10 @@ function makeClient(runtimeOverrides: Partial<Runtime> = {}) {
     updateWithSessionCalls,
     deleteCalls,
     deleteWithSessionCalls,
+    canInsertCalls,
+    canInsertWithSessionCalls,
+    canUpdateCalls,
+    canUpdateWithSessionCalls,
   };
 }
 
@@ -174,6 +208,18 @@ describe("JazzClient mutation durability split", () => {
     expect(runtime.sealBatch).toHaveBeenCalledWith("delete-batch-id");
   });
 
+  it("routes permission preflight through local runtime methods", async () => {
+    const { client, canInsertCalls, canUpdateCalls } = makeClient();
+    const values = { title: { type: "Text" as const, value: "Draft" } };
+    const updates = { done: { type: "Boolean" as const, value: true } };
+
+    await expect(client.canInsert("todos", values)).resolves.toBe(true);
+    await expect(client.canUpdate("row-1", updates)).resolves.toBe(false);
+
+    expect(canInsertCalls).toEqual([["todos", values]]);
+    expect(canUpdateCalls).toEqual([["row-1", updates]]);
+  });
+
   it("routes attributed writes through session-aware runtime methods", async () => {
     const { client, insertWithSessionCalls, updateWithSessionCalls, deleteWithSessionCalls } =
       makeClient();
@@ -188,6 +234,23 @@ describe("JazzClient mutation durability split", () => {
     expect(insertWithSessionCalls).toEqual([["todos", insertValues, attributedContext]]);
     expect(updateWithSessionCalls).toEqual([["row-1", updates, attributedContext]]);
     expect(deleteWithSessionCalls).toEqual([["row-1", attributedContext]]);
+  });
+
+  it("routes attributed permission preflight through session-aware runtime methods", async () => {
+    const { client, canInsertWithSessionCalls, canUpdateWithSessionCalls } = makeClient();
+    const values = { title: { type: "Text" as const, value: "Draft" } };
+    const updates = { done: { type: "Boolean" as const, value: true } };
+    const attributedContext = JSON.stringify({ attribution: "alice" });
+
+    await expect(client.canInsertInternal("todos", values, undefined, "alice")).resolves.toBe(
+      "unknown",
+    );
+    await expect(client.canUpdateInternal("row-1", updates, undefined, "alice")).resolves.toBe(
+      true,
+    );
+
+    expect(canInsertWithSessionCalls).toEqual([["todos", values, attributedContext]]);
+    expect(canUpdateWithSessionCalls).toEqual([["row-1", updates, attributedContext]]);
   });
 
   it("forwards caller-supplied create ids to runtime insert methods", async () => {

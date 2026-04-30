@@ -27,6 +27,7 @@ import {
   type UpsertOptions,
   type WasmModule,
   type DurabilityTier,
+  type PermissionDecision,
   type QueryExecutionOptions,
   type QueryPropagation,
   type QueryVisibility,
@@ -2380,6 +2381,24 @@ export class Db {
     return client.delete(id);
   }
 
+  async canInsert<T, Init>(table: TableProxy<T, Init>, data: Init): Promise<PermissionDecision> {
+    const client = this.getClient(table._schema);
+    const transformedData = transformInsertInput(table, data);
+    const values = toInsertRecord(transformedData, table._schema, table._table);
+    return client.canInsert(table._table, values);
+  }
+
+  async canUpdate<T, Init>(
+    table: TableProxy<T, Init>,
+    id: string,
+    data: Partial<Init>,
+  ): Promise<PermissionDecision> {
+    const client = this.getClient(table._schema);
+    const transformedData = transformUpdateInput(table, data);
+    const updates = toUpdateRecord(transformedData, table._schema, table._table);
+    return client.canUpdate(id, updates);
+  }
+
   /**
    * Begin a new transaction.
    *
@@ -2940,6 +2959,38 @@ class ClientBackedDb extends Db {
 
   override delete<T, Init>(_table: TableProxy<T, Init>, id: string): WriteHandle {
     return this.runtimeClient.deleteHandleInternal(id, this.session, this.attribution);
+  }
+
+  override async canInsert<T, Init>(
+    table: TableProxy<T, Init>,
+    data: Init,
+  ): Promise<PermissionDecision> {
+    const runtimeSchema = createRuntimeSchemaResolver(() =>
+      normalizeRuntimeSchema(this.runtimeClient.getSchema()),
+    );
+    const inputSchema = resolveSchemaWithTable(table._schema, runtimeSchema.get, table._table);
+    const transformedData = transformInsertInput(table, data);
+    const values = toInsertRecord(transformedData, inputSchema, table._table);
+    return this.runtimeClient.canInsertInternal(
+      table._table,
+      values,
+      this.session,
+      this.attribution,
+    );
+  }
+
+  override async canUpdate<T, Init>(
+    table: TableProxy<T, Init>,
+    id: string,
+    data: Partial<Init>,
+  ): Promise<PermissionDecision> {
+    const runtimeSchema = createRuntimeSchemaResolver(() =>
+      normalizeRuntimeSchema(this.runtimeClient.getSchema()),
+    );
+    const inputSchema = resolveSchemaWithTable(table._schema, runtimeSchema.get, table._table);
+    const transformedData = transformUpdateInput(table, data);
+    const updates = toUpdateRecord(transformedData, inputSchema, table._table);
+    return this.runtimeClient.canUpdateInternal(id, updates, this.session, this.attribution);
   }
 
   override beginTransaction(): DbTransaction {

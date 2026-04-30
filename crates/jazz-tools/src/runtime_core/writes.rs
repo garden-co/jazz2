@@ -416,6 +416,28 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         Ok(batch_id)
     }
 
+    pub fn can_insert(
+        &mut self,
+        table: &str,
+        values: HashMap<String, Value>,
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, RuntimeError> {
+        self.schema_manager
+            .can_insert_with_write_context(&mut self.storage, table, values, write_context)
+            .map_err(RuntimeError::from)
+    }
+
+    pub fn can_update(
+        &mut self,
+        object_id: ObjectId,
+        values: Vec<(String, Value)>,
+        write_context: Option<&WriteContext>,
+    ) -> Result<PermissionPreflightDecision, RuntimeError> {
+        self.schema_manager
+            .can_update_with_write_context(&mut self.storage, object_id, &values, write_context)
+            .map_err(RuntimeError::from)
+    }
+
     // =========================================================================
     // Persisted CRUD Operations
     // =========================================================================

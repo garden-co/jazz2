@@ -21,6 +21,7 @@ use jazz_tools::binding_support::{
     serialize_local_batch_record, serialize_local_batch_records, subscription_delta_to_json,
 };
 use jazz_tools::object::ObjectId;
+use jazz_tools::query_manager::bindings::serialize_permission_preflight_decision;
 use jazz_tools::query_manager::query::Query;
 use jazz_tools::query_manager::session::{Session, WriteContext};
 use jazz_tools::query_manager::types::{Schema, SchemaHash, TableName, Value};
@@ -481,6 +482,46 @@ impl RnRuntime {
         })
     }
 
+    pub fn can_insert(&self, table: String, values_json: String) -> Result<String, JazzRnError> {
+        with_panic_boundary("can_insert", || {
+            let named_values = convert_insert_values(&values_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let decision = core
+                .can_insert(&table, named_values, None)
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serialize_permission_preflight_decision(decision)).map_err(|e| {
+                JazzRnError::Internal {
+                    message: format!("can_insert serialization failed: {e}"),
+                }
+            })
+        })
+    }
+
+    pub fn can_insert_with_session(
+        &self,
+        table: String,
+        values_json: String,
+        write_context_json: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("can_insert_with_session", || {
+            let named_values = convert_insert_values(&values_json)?;
+            let write_context = parse_write_context(write_context_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let decision = core
+                .can_insert(&table, named_values, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serialize_permission_preflight_decision(decision)).map_err(|e| {
+                JazzRnError::Internal {
+                    message: format!("can_insert serialization failed: {e}"),
+                }
+            })
+        })
+    }
+
     pub fn update(&self, object_id: String, values_json: String) -> Result<String, JazzRnError> {
         with_panic_boundary("update", || {
             let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
@@ -525,6 +566,56 @@ impl RnRuntime {
             }))
             .map_err(|e| JazzRnError::Internal {
                 message: format!("update serialization failed: {e}"),
+            })
+        })
+    }
+
+    pub fn can_update(
+        &self,
+        object_id: String,
+        values_json: String,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("can_update", || {
+            let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
+                message: e.to_string(),
+            })?;
+            let oid = ObjectId::from_uuid(uuid);
+            let updates = convert_updates(&values_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let decision = core.can_update(oid, updates, None).map_err(runtime_err)?;
+            serde_json::to_string(&serialize_permission_preflight_decision(decision)).map_err(|e| {
+                JazzRnError::Internal {
+                    message: format!("can_update serialization failed: {e}"),
+                }
+            })
+        })
+    }
+
+    pub fn can_update_with_session(
+        &self,
+        object_id: String,
+        values_json: String,
+        write_context_json: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("can_update_with_session", || {
+            let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
+                message: e.to_string(),
+            })?;
+            let oid = ObjectId::from_uuid(uuid);
+            let updates = convert_updates(&values_json)?;
+            let write_context = parse_write_context(write_context_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let decision = core
+                .can_update(oid, updates, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serialize_permission_preflight_decision(decision)).map_err(|e| {
+                JazzRnError::Internal {
+                    message: format!("can_update serialization failed: {e}"),
+                }
             })
         })
     }

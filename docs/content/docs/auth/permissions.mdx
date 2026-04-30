@@ -145,6 +145,152 @@ See [Server Setup](/docs/getting-started/server-setup#backend-context-setup) for
   reject violating writes, and server-scoped reads are filtered before data is sent to the client.
 </Callout>
 
+## Checking write permissions before showing UI
+
+`insert`, `update`, and `delete` remain the authority. You can call them directly and let Jazz reject
+writes that do not pass policy. For controls such as disabled buttons, hidden menu items, and
+read-only notices, Jazz also exposes preflight helpers that ask the local runtime whether an insert
+or update would currently be allowed.
+
+These helpers are consultative. They do not reserve the permission result, they do not wait for a
+remote authority, and they can return `"unknown"` when the local runtime does not yet have enough
+state to decide. Always keep the write path prepared for rejection.
+
+### Direct `Db` API
+
+Use `db.canInsert(table, data)` with the same table proxy and insert input shape you pass to
+`db.insert(...)`. Use `db.canUpdate(table, id, patch)` with the same table proxy, row id, and patch
+shape you pass to `db.update(...)`.
+
+Both methods return `Promise<true | false | "unknown">`.
+
+For example, this policy only lets admins create announcement rows:
+
+```ts title="permissions.ts"
+export default definePermissions(app, ({ policy, session }) => {
+  const isAdmin = session.where({ "claims.role": "admin" });
+
+  policy.announcements.allowRead.always();
+  policy.announcements.allowInsert.where(isAdmin);
+  policy.announcements.allowUpdate.where(isAdmin);
+  policy.announcements.allowDelete.where(isAdmin);
+});
+```
+
+To decide whether to show the "New announcement" button, pass a draft row with the same shape you
+would eventually insert:
+
+```ts
+const announcementDraft = {
+  title: "",
+  body: "",
+  published_at: new Date(),
+};
+
+const canCreateAnnouncement = await db.canInsert(app.announcements, announcementDraft);
+const showNewAnnouncementButton = canCreateAnnouncement === true;
+
+// The write still performs the authoritative permission check.
+await db.insert(app.announcements, realAnnouncement).wait({ tier: "edge" });
+```
+
+This draft-data pattern is a workaround for insert rules: insert policies evaluate the row being
+created, so Jazz needs candidate values even when you only want to decide whether a button should be
+visible. Use harmless placeholder values for fields that do not affect the policy, and use realistic
+values for fields that do.
+
+`false` means the current local permission state denies the write. `"unknown"` means Jazz cannot
+prove the write is allowed or denied from local state alone, for example because the target row,
+schema, or permission context is not loaded yet.
+
+<Callout type="warn">
+  Do not use `canInsert` or `canUpdate` as your only protection. They are useful for UI affordances,
+  but a policy can change, local state can be incomplete, and the write itself is still the
+  operation that must be accepted or rejected.
+</Callout>
+
+### Framework helpers
+
+Framework bindings wrap the direct `Db` calls and expose a reactive loading state. The helper returns
+`"unknown"` until the underlying promise resolves, then returns the same `true | false | "unknown"`
+decision as `db.canInsert` or `db.canUpdate`.
+
+<Tabs groupId="jazz-framework" items={["React", "Vue", "Svelte"]} persist updateAnchor>
+  <Tab value="React">
+
+```tsx
+import { useCanInsert } from "jazz-tools/react";
+
+function AnnouncementToolbar() {
+  const announcementDraft = {
+    title: "",
+    body: "",
+    published_at: new Date(),
+  };
+
+  const canCreateAnnouncement = useCanInsert(app.announcements, announcementDraft);
+
+  if (canCreateAnnouncement !== true) return null;
+
+  return <button>New announcement</button>;
+}
+```
+
+React Native uses the same hooks from `jazz-tools/react-native`.
+
+  </Tab>
+  <Tab value="Vue">
+
+```vue
+<script setup lang="ts">
+import { useCanInsert } from "jazz-tools/vue";
+
+const announcementDraft = {
+  title: "",
+  body: "",
+  published_at: new Date(),
+};
+
+const canCreateAnnouncement = useCanInsert(app.announcements, announcementDraft);
+</script>
+
+<template>
+  <button v-if="canCreateAnnouncement === true">New announcement</button>
+</template>
+```
+
+Vue helpers return `Ref<PermissionDecision>`, so templates unwrap them automatically. In script code,
+read `.value`.
+
+  </Tab>
+  <Tab value="Svelte">
+
+```svelte
+<script lang="ts">
+  import { CanInsertPermission } from "jazz-tools/svelte";
+
+  const announcementDraft = {
+    title: "",
+    body: "",
+    published_at: new Date(),
+  };
+
+  const canCreateAnnouncement = new CanInsertPermission(
+    app.announcements,
+    announcementDraft,
+  );
+</script>
+
+{#if canCreateAnnouncement.current === true}
+  <button>New announcement</button>
+{/if}
+```
+
+Svelte helpers expose their decision on `.current`.
+
+  </Tab>
+</Tabs>
+
 ## Magic columns
 
 Jazz exposes a small set of system-provided magic columns at query time. They do not exist in your

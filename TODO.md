@@ -46,9 +46,11 @@
 
 - [**async-persistence-layer**](todo/ideas/1_mvp/async-persistence-layer.md) — Non-blocking persistence for mobile. The Storage trait is synchronous, so RN currently blocks the UI on I/O. We need an async boundary between Jazz and the persisted storage.
 - [**auth-mode-gating-via-permissions**](todo/ideas/1_mvp/auth-mode-gating-via-permissions.md) — Replace `AuthConfig.allow_local_first_auth: bool` with declarative calls on the
+- [**authoritative-tier-permission-checks**](todo/ideas/1_mvp/authoritative-tier-permission-checks.md) — Explore a separate authoritative permission preflight that can ask a chosen durability tier, such as edge or global, to decide whether a write would be allowed when local-only `canInsert` or `canUpdate` is not enough.
 - [**complex-merge-strategies**](todo/ideas/1_mvp/complex-merge-strategies.md) — Per-column/per-table merge strategies beyond LWW (counters, sets, rich text, custom logic).
 - [**configurable-client-ttl**](todo/ideas/1_mvp/configurable-client-ttl.md) — Expose the client state TTL as a configurable option per app instead of leaving it hardcoded to 5 minutes and only adjustable through test-only plumbing.
 - [**count-aggregation**](todo/ideas/1_mvp/count-aggregation.md) — Add terminal `.count()` queries for filtered relations, with the MVP limited to reactive `COUNT(*)` returning `{ count: number }`.
+- [**deep-tri-state-policy-unknown**](todo/ideas/1_mvp/deep-tri-state-policy-unknown.md) — Make `"unknown"` precise inside relation-backed policy evaluation for consultative `db.canInsert` and `db.canUpdate` checks.
 - [**durability-guarantees-and-rate-limits**](todo/ideas/1_mvp/durability-guarantees-and-rate-limits.md) — Document and enforce a clear durability contract: `await db.insert(...).wait({tier})` resolving guarantees server persistence. Everything else (`db.insert`, etc.) is best-effort — the server may safely drop these requests for rate-limiting or resource reclamation without violating any contract.
 - [**e2e-test-remote-scaffold-path**](todo/ideas/1_mvp/e2e-test-remote-scaffold-path.md) — Add an integration test that drives `create-jazz` through its real production
 - [**explicit-indices**](todo/ideas/1_mvp/explicit-indices.md) — Developer-declared indices in the schema language, replacing auto-index-all-columns.

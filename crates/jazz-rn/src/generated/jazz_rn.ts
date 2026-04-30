@@ -690,6 +690,18 @@ export interface RnRuntimeInterface {
    * Run a batched tick. JS should call this when asked via `on_batched_tick_needed`.
    */
   batchedTick() /*throws*/ : void;
+  canInsert(table: string, valuesJson: string) /*throws*/ : string;
+  canInsertWithSession(
+    table: string,
+    valuesJson: string,
+    writeContextJson: string | undefined
+  ) /*throws*/ : string;
+  canUpdate(objectId: string, valuesJson: string) /*throws*/ : string;
+  canUpdateWithSession(
+    objectId: string,
+    valuesJson: string,
+    writeContextJson: string | undefined
+  ) /*throws*/ : string;
   /**
    * Flush and close the underlying storage, releasing filesystem locks.
    */
@@ -891,6 +903,92 @@ export class RnRuntime
         );
       },
       /*liftString:*/ FfiConverterString.lift
+    );
+  }
+
+  canInsert(table: string, valuesJson: string): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_insert(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(table),
+            FfiConverterString.lower(valuesJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
+  canInsertWithSession(
+    table: string,
+    valuesJson: string,
+    writeContextJson: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_insert_with_session(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(table),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterOptionalString.lower(writeContextJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
+  canUpdate(objectId: string, valuesJson: string): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_update(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(objectId),
+            FfiConverterString.lower(valuesJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
+  canUpdateWithSession(
+    objectId: string,
+    valuesJson: string,
+    writeContextJson: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_update_with_session(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(objectId),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterOptionalString.lower(writeContextJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
     );
   }
 
@@ -1604,6 +1702,38 @@ function uniffiEnsureInitialized() {
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       'uniffi_jazz_rn_checksum_method_rnruntime_batched_tick'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_insert() !==
+    283
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_can_insert'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_insert_with_session() !==
+    32412
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_can_insert_with_session'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_update() !==
+    34350
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_can_update'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_update_with_session() !==
+    42618
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_can_update_with_session'
     );
   }
   if (

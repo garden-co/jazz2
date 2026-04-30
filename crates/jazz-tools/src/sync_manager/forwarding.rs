@@ -111,7 +111,6 @@ impl SyncManager {
             for server_id in server_ids {
                 self.queue_row_to_server(server_id, object_id, metadata.clone(), row.clone());
             }
-            return;
         }
     }
 

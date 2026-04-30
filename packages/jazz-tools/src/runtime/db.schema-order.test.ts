@@ -496,6 +496,45 @@ describe("Db runtime schema order", () => {
     );
   });
 
+  it("encodes can* preflight inputs with the declared table schema", async () => {
+    const generatedSchema: WasmSchema = {
+      todos: {
+        columns: [
+          { name: "title", column_type: { type: "Text" }, nullable: false },
+          { name: "done", column_type: { type: "Boolean" }, nullable: false },
+        ],
+      },
+    };
+    const canInsert = vi.fn(async () => true as const);
+    const canUpdate = vi.fn(async () => false as const);
+    const client = {
+      getSchema: () => new Map(Object.entries(generatedSchema)),
+      canInsert,
+      canUpdate,
+    } as unknown as JazzClient;
+    const db = new TestDb(client);
+    const table = {
+      _table: "todos",
+      _schema: generatedSchema,
+      _rowType: {} as { id: string; title: string; done: boolean },
+      _initType: {} as { title: string; done: boolean },
+    } satisfies TableProxy<
+      { id: string; title: string; done: boolean },
+      { title: string; done: boolean }
+    >;
+
+    await expect(db.canInsert(table, { title: "Buy milk", done: false })).resolves.toBe(true);
+    await expect(db.canUpdate(table, "todo-1", { done: true })).resolves.toBe(false);
+
+    expect(canInsert).toHaveBeenCalledWith("todos", {
+      title: { type: "Text", value: "Buy milk" },
+      done: { type: "Boolean", value: false },
+    });
+    expect(canUpdate).toHaveBeenCalledWith("todo-1", {
+      done: { type: "Boolean", value: true },
+    });
+  });
+
   it("falls back to the generated schema for query results when the runtime schema is missing a table", async () => {
     const generatedSchema: WasmSchema = {
       todos: {

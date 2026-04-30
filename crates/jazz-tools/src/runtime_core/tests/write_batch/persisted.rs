@@ -166,7 +166,7 @@ fn rc_insert_persisted_resolves_on_worker_ack() {
 
 #[test]
 fn rc_insert_persisted_does_not_touch_legacy_ack_storage() {
-    let calls = Arc::new(Mutex::new(LegacyStorageCallCounts::default()));
+    let calls = Arc::new(Mutex::new(LegacyStorageCallCounts));
     let mut core = create_runtime_with_boxed_storage(
         test_schema(),
         "row-no-legacy-ack-storage",
@@ -209,7 +209,7 @@ fn rc_insert_persisted_does_not_touch_legacy_ack_storage() {
     );
     assert_eq!(
         *calls.lock().unwrap(),
-        LegacyStorageCallCounts::default(),
+        LegacyStorageCallCounts,
         "row durability updates should not touch legacy durability-ack storage"
     );
 }

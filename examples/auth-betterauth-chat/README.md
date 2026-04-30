@@ -12,7 +12,7 @@ What it demonstrates:
 - Fetching the JWT from the Better Auth session and passing it to `JazzProvider`
 - Recreating `JazzProvider` on login and logout, while keeping `db.updateAuthToken(...)` only for same-user JWT refresh after auth expiry
 - Falling back to local-first auth when no session exists
-- Role-based UI gating (`admin` can post to Announcements; `member` can post to the general chat). Permissions are defined in [permissions.ts](./permissions.ts), with generic-chat message ownership enforced via `$createdBy`.
+- Permission-preflight UI gating with `db.canInsert(...)`. Write rules are defined in [permissions.ts](./permissions.ts): `admin` can post to Announcements, local-first/authenticated users can post to the general chat, and generic-chat message ownership is enforced via `$createdBy`.
 
 One default account is seeded on startup: `admin@example.com / admin` with `role = "admin"`.
 New sign-ups receive `role = "member"` by default (configured via the `admin` plugin).

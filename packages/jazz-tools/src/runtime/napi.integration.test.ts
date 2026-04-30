@@ -502,6 +502,29 @@ describe("NAPI integration", () => {
         }),
       ).toThrow('Insert failed: WriteError("policy denied INSERT on table todos")');
 
+      await expect(
+        aliceDb.canInsert(policyTodosTable, {
+          title: "session-preflight-allowed",
+          done: false,
+          description: "",
+          owner_id: "alice",
+        }),
+      ).resolves.toBe(true);
+      await expect(
+        aliceDb.canInsert(policyTodosTable, {
+          title: "session-preflight-denied",
+          done: false,
+          description: "",
+          owner_id: "bob",
+        }),
+      ).resolves.toBe(false);
+      await expect(
+        aliceDb.canUpdate(policyTodosTable, createdTodo.id, { done: true }),
+      ).resolves.toBe(true);
+      await expect(aliceDb.canUpdate(policyTodosTable, randomUUID(), { done: true })).resolves.toBe(
+        "unknown",
+      );
+
       await withTimeout(
         aliceDb.update(policyTodosTable, createdTodo.id, { done: true }).wait({ tier: "edge" }),
         10_000,

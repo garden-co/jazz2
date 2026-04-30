@@ -61,6 +61,32 @@ interface NativeModuleInterface {
     ptr: bigint,
     uniffi_out_err: UniffiRustCallStatus
   ): void;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_insert(
+    ptr: bigint,
+    table: Uint8Array,
+    valuesJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_insert_with_session(
+    ptr: bigint,
+    table: Uint8Array,
+    valuesJson: Uint8Array,
+    writeContextJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_update(
+    ptr: bigint,
+    objectId: Uint8Array,
+    valuesJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_can_update_with_session(
+    ptr: bigint,
+    objectId: Uint8Array,
+    valuesJson: Uint8Array,
+    writeContextJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
   ubrn_uniffi_jazz_rn_fn_method_rnruntime_close(
     ptr: bigint,
     uniffi_out_err: UniffiRustCallStatus
@@ -237,6 +263,10 @@ interface NativeModuleInterface {
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_add_client(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_add_server(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_batched_tick(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_insert(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_insert_with_session(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_update(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_can_update_with_session(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_close(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_connect(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_create_subscription(): number;

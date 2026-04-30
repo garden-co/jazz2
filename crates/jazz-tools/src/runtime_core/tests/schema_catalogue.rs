@@ -328,7 +328,7 @@ fn runtime_bootstraps_current_schema_into_catalogue_for_flat_row_history() {
     )
     .expect("flat history row should decode with the catalogue-backed descriptor");
     assert_eq!(decoded.row_id, inserted_id);
-    assert_eq!(decoded.data.len() > 0, true);
+    assert!(!decoded.data.is_empty());
 }
 
 #[test]

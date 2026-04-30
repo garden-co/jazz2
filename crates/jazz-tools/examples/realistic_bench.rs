@@ -170,7 +170,7 @@ fn report_loop_progress(label: &str, index: usize, total: usize) {
         return;
     }
     let step = (total / 4).max(1);
-    if index > 0 && index % step == 0 {
+    if index > 0 && index.is_multiple_of(step) {
         progress(format!("{}: {}/{}", label, index, total));
     }
 }
@@ -832,7 +832,7 @@ async fn run_w3_offline_reconnect(
             .await?;
         observed_count = rows.len();
         polls += 1;
-        if polls % 10 == 0 {
+        if polls.is_multiple_of(10) {
             progress(format!(
                 "W3 polling observed={} target={} polls={}",
                 observed_count, target_count, polls

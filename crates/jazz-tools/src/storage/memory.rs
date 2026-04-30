@@ -1767,7 +1767,7 @@ mod tests {
         );
 
         storage
-            .append_history_region_rows("users", &[version.clone()])
+            .append_history_region_rows("users", std::slice::from_ref(&version))
             .unwrap();
         storage
             .upsert_visible_region_rows(

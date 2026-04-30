@@ -13,4 +13,5 @@ export {
   type JazzProviderProps,
 } from "./provider.js";
 export { useAll } from "./use-all.js";
+export { useCanInsert, useCanUpdate } from "./use-permissions.js";
 export type { DurabilityTier, QueryOptions, RuntimeSourcesConfig } from "../runtime/index.js";

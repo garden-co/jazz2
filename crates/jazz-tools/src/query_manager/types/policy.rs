@@ -14,6 +14,19 @@ impl RowPolicyMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionPreflightDecision {
+    Allow,
+    Deny,
+    Unknown,
+}
+
+impl From<bool> for PermissionPreflightDecision {
+    fn from(allowed: bool) -> Self {
+        if allowed { Self::Allow } else { Self::Deny }
+    }
+}
+
 /// Policy for a specific operation (SELECT, INSERT, UPDATE, DELETE).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

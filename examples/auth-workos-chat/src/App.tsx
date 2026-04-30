@@ -14,8 +14,6 @@ type ChatShellProps = {
 
 function ChatShell({ user, onSignIn, onSignOut }: ChatShellProps) {
   const { claims } = useAuthState();
-  const canPostAnnouncements = claims.role === "admin";
-  const canPostGeneric = claims.role === "member" || claims.role === "admin";
   const displayName = user ? `${user.firstName} ${user.lastName}`.trim() : "Anonymous";
   const statusDetail = user ? "Signed in with WorkOS" : "Sign in with WorkOS to unlock chat-01";
 
@@ -33,7 +31,6 @@ function ChatShell({ user, onSignIn, onSignOut }: ChatShellProps) {
         <ChatPanel
           chatId={ANNOUNCEMENTS_CHAT_ID}
           title="Announcements"
-          canSend={canPostAnnouncements}
           authorName={displayName}
           readOnlyNotice="Only admins can post announcements."
         />
@@ -41,7 +38,6 @@ function ChatShell({ user, onSignIn, onSignOut }: ChatShellProps) {
         <ChatPanel
           chatId={CHAT_ID}
           title={CHAT_ID}
-          canSend={canPostGeneric}
           authorName={displayName}
           readOnlyNotice="Sign in as admin or member to participate."
         />

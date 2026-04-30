@@ -46,8 +46,7 @@ fn row_history_test_schema(table: &str) -> crate::query_manager::types::Schema {
 
 fn seed_row_history_table(storage: &mut dyn Storage, table: &str) -> SchemaHash {
     let schema = row_history_test_schema(table);
-    let schema_hash = persist_test_schema(storage, &schema);
-    schema_hash
+    persist_test_schema(storage, &schema)
 }
 
 fn seed_row_history_locator(
@@ -109,12 +108,12 @@ pub fn test_row_raw_table_header_round_trip(factory: &dyn Fn() -> Box<dyn Storag
     );
 
     storage
-        .upsert_raw_table_header(&row_raw_table_id.raw_table_name(), &header)
+        .upsert_raw_table_header(row_raw_table_id.raw_table_name(), &header)
         .expect("row raw table header should persist");
 
     assert_eq!(
         storage
-            .load_raw_table_header(&row_raw_table_id.raw_table_name())
+            .load_raw_table_header(row_raw_table_id.raw_table_name())
             .unwrap(),
         Some(header.clone())
     );

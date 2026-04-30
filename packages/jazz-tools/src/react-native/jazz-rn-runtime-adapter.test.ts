@@ -15,6 +15,10 @@ function createBinding(overrides: Partial<JazzRnRuntimeBinding> = {}): JazzRnRun
     createSubscription: vi.fn(() => 9n),
     delete_: vi.fn(() => JSON.stringify({ batchId: "batch-delete-1" })),
     deleteWithSession: vi.fn(() => JSON.stringify({ batchId: "batch-delete-2" })),
+    canInsert: vi.fn(() => JSON.stringify(true)),
+    canInsertWithSession: vi.fn(() => JSON.stringify("unknown")),
+    canUpdate: vi.fn(() => JSON.stringify(false)),
+    canUpdateWithSession: vi.fn(() => JSON.stringify(true)),
     executeSubscription: vi.fn(),
     flush: vi.fn(),
     getSchemaHash: vi.fn(() => "schema-hash"),
@@ -184,6 +188,58 @@ describe("JazzRnRuntimeAdapter", () => {
 
     adapter.deleteWithSession("row-1", writeContextJson);
     expect(binding.deleteWithSession).toHaveBeenCalledWith("row-1", writeContextJson);
+  });
+
+  it("serializes permission preflight payloads and parses decisions", () => {
+    const binding = createBinding();
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    expect(adapter.canInsert("todos", { title: { type: "Text", value: "milk" } })).toBe(true);
+    expect(binding.canInsert).toHaveBeenCalledWith(
+      "todos",
+      JSON.stringify({ title: { type: "Text", value: "milk" } }),
+    );
+
+    expect(adapter.canUpdate("row-1", { done: { type: "Boolean", value: true } })).toBe(false);
+    expect(binding.canUpdate).toHaveBeenCalledWith(
+      "row-1",
+      JSON.stringify({ done: { type: "Boolean", value: true } }),
+    );
+  });
+
+  it("serializes write context payloads for session-aware permission preflights", () => {
+    const binding = createBinding();
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+    const writeContextJson = JSON.stringify({
+      session: { user_id: "alice", claims: {} },
+      attribution: "alice",
+    });
+
+    expect(
+      adapter.canInsertWithSession(
+        "todos",
+        { title: { type: "Text", value: "milk" } },
+        writeContextJson,
+      ),
+    ).toBe("unknown");
+    expect(binding.canInsertWithSession).toHaveBeenCalledWith(
+      "todos",
+      JSON.stringify({ title: { type: "Text", value: "milk" } }),
+      writeContextJson,
+    );
+
+    expect(
+      adapter.canUpdateWithSession(
+        "row-1",
+        { done: { type: "Boolean", value: true } },
+        writeContextJson,
+      ),
+    ).toBe(true);
+    expect(binding.canUpdateWithSession).toHaveBeenCalledWith(
+      "row-1",
+      JSON.stringify({ done: { type: "Boolean", value: true } }),
+      writeContextJson,
+    );
   });
 
   it("bridges subscription callbacks with handle conversion", () => {

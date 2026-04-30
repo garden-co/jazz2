@@ -61,7 +61,6 @@ function ChatShell({ onStoredAuthSessionChange }: ChatShellProps) {
         <ChatPanel
           chatId={ANNOUNCEMENTS_CHAT_ID}
           title="Announcements"
-          canSend={role === "admin"}
           authorName={userId ?? null}
           readOnlyNotice="Only admins can post announcements."
         />
@@ -69,7 +68,6 @@ function ChatShell({ onStoredAuthSessionChange }: ChatShellProps) {
         <ChatPanel
           chatId={CHAT_ID}
           title={CHAT_ID}
-          canSend={role === "admin" || role === "member"}
           authorName={userId ?? null}
           readOnlyNotice="Sign in as admin or member to participate."
         />
@@ -89,7 +87,7 @@ export function App() {
       env: "dev" as const,
       userBranch: "main" as const,
       serverUrl: SYNC_SERVER_URL,
-      driver: { type: "memory" as const },
+      // driver: { type: "memory" as const },
     };
 
     if (storedAuthSession) {

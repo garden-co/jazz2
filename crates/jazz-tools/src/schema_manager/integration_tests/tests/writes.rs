@@ -85,6 +85,50 @@ fn schema_manager_update_uses_visible_row_after_legacy_commit_history_is_removed
 }
 
 #[test]
+fn schema_manager_can_update_denies_known_hard_deleted_row() {
+    let schema = SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("name", ColumnType::Text)
+                .column("score", ColumnType::Integer),
+        )
+        .build();
+
+    let mut manager =
+        SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+    let mut storage = MemoryStorage::new();
+
+    let inserted = manager
+        .insert(
+            &mut storage,
+            "users",
+            HashMap::from([
+                ("name".to_string(), Value::Text("Alice".to_string())),
+                ("score".to_string(), Value::Integer(100)),
+            ]),
+        )
+        .unwrap();
+    manager
+        .query_manager_mut()
+        .hard_delete(&mut storage, inserted.row_id)
+        .unwrap();
+
+    let decision = manager
+        .can_update_with_write_context(
+            &mut storage,
+            inserted.row_id,
+            &[("score".to_string(), Value::Integer(101))],
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        decision,
+        crate::query_manager::types::PermissionPreflightDecision::Deny
+    );
+}
+
+#[test]
 fn removed_table_then_readded_does_not_resurface_old_rows() {
     // Branch story:
     //

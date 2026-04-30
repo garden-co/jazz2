@@ -45,6 +45,10 @@ test.describe("auth-simple-chat", () => {
     await expect(page.getByTestId("auth-status")).toContainText("member", { timeout: 20_000 });
     await expect(page.getByTestId("auth-status")).not.toContainText("Anonymous");
 
+    await expect(announcements.readOnlyNotice).toBeVisible();
+    await expect(announcements.input).toBeDisabled();
+    await expect(announcements.send).toBeDisabled();
+
     await page.reload();
     await expect(page.getByTestId("auth-status")).toContainText("member", { timeout: 20_000 });
     await expect(page.getByTestId("auth-status")).not.toContainText("Anonymous");

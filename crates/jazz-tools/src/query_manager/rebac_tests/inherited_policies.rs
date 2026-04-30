@@ -142,8 +142,7 @@ fn rebac_inherited_insert_uses_visible_row_region_after_legacy_branch_history_is
 
     let _folder_commit_id = *test_row_tip_ids(&storage, folder_id, &branch)
         .unwrap()
-        .iter()
-        .next()
+        .first()
         .expect("seed folder should have one tip");
     let mut qm = create_server_mode_query_manager(schema, schema_hash);
     let client_id = ClientId::new();

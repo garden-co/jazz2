@@ -22,6 +22,10 @@ export declare class NapiRuntime {
   updateWithSession(objectId: string, values: any, writeContextJson?: string | undefined | null): any
   delete(objectId: string): any
   deleteWithSession(objectId: string, writeContextJson?: string | undefined | null): any
+  canInsert(table: string, values: Record<string, unknown>): any
+  canInsertWithSession(table: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null): any
+  canUpdate(objectId: string, values: Record<string, unknown>): any
+  canUpdateWithSession(objectId: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null): any
   loadLocalBatchRecord(batchId: string): any | null
   loadLocalBatchRecords(): any[]
   drainRejectedBatchIds(): string[]
