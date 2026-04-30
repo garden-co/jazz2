@@ -519,7 +519,7 @@ async function createServerDb(
     config.jwtToken = await getTestingServerJwtForUser(sub, claims);
   }
   if (options.localFirstSecret) {
-    config.auth = { localFirstSecret: options.localFirstSecret };
+    config.secret = options.localFirstSecret;
   }
   return createDb(config);
 }

@@ -273,7 +273,7 @@ export async function createSyncedDb(
       appId,
       driver: { type: "persistent", dbName: uniqueDbName(label) },
       serverUrl,
-      auth: { localFirstSecret },
+      secret: localFirstSecret,
     }),
   );
 }
