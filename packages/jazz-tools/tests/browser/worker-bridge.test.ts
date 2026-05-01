@@ -23,7 +23,6 @@ import {
 } from "./support.js";
 import {
   blockTestingServerNetwork,
-  getIsolatedTestingServerInfo,
   getTestingServerInfo,
   getTestingServerJwtForUser,
   getTestingServerNetworkDebug,
@@ -272,55 +271,6 @@ const allCatalogueTodos: QueryBuilder<CatalogueTodo> = {
     });
   },
 };
-
-/**
- * Sets up a server with the given app schema and permissions.
- */
-async function getServerWithPermissions(
-  app: { wasmSchema: WasmSchema },
-  permissions: CompiledPermissions,
-): Promise<{ appId: string; serverUrl: string; adminSecret: string }> {
-  const { appId, serverUrl, adminSecret } = await getIsolatedTestingServerInfo();
-  const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
-    appId,
-    adminSecret,
-    schema: app.wasmSchema,
-  });
-  const { head } = await fetchPermissionsHead(serverUrl, { appId, adminSecret });
-  await publishStoredPermissions(serverUrl, {
-    appId,
-    adminSecret,
-    schemaHash,
-    permissions,
-    expectedParentBundleObjectId: head?.bundleObjectId ?? null,
-  });
-  return { appId, serverUrl, adminSecret };
-}
-
-/**
- * Creates a non-admin Db with the given appId and serverUrl.
- */
-async function getNonAdminClientDb(
-  appId: string,
-  serverUrl: string,
-  ctx: TestCleanup,
-): Promise<Db> {
-  const jwtToken = await getTestingServerJwtForUser(
-    "browser-offline-rejected-wait",
-    {
-      role: "user",
-    },
-    appId,
-  );
-  return ctx.track(
-    await createDb({
-      appId,
-      driver: { type: "persistent", dbName: uniqueDbName("sync-wait-edge-rejected-offline") },
-      serverUrl,
-      jwtToken,
-    }),
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Tests
