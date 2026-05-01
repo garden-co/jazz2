@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { Db, createDbFromClient, type QueryBuilder, type TableProxy } from "./db.js";
-import type { InsertValues, WasmRow, WasmSchema } from "../drivers/types.js";
-import { WriteResult, JazzClient, type DirectInsertResult, WriteHandle } from "./client.js";
+import { Db, createDbFromClient, type QueryBuilder, type TableProxy } from "../db.js";
+import type { InsertValues, WasmRow, WasmSchema } from "../../drivers/types.js";
+import { JazzClient, WriteHandle, WriteResult, type DirectInsertResult } from "../client.js";
 
 class TestDb extends Db {
   constructor(private readonly testClient: JazzClient) {
