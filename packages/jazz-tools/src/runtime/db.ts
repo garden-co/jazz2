@@ -1049,6 +1049,7 @@ export class Db {
    * added after the listeners are attached) are forwarded to all Db listeners.
    */
   private readonly mutationErrorListeners = new Set<(event: MutationErrorEvent) => void>();
+  private readonly pendingWorkerMutationErrorEvents: MutationErrorEvent[] = [];
   /**
    * Unsubscribers for {@link Db.clients}'s {@link JazzClient.onMutationError} listeners
    */
@@ -1301,15 +1302,19 @@ export class Db {
           onAuthFailure: (reason) => {
             this.markUnauthenticated(reason);
           },
+          onRejectedBatchAcknowledged: (batchId) => {
+            this.workerBridge?.acknowledgeRejectedBatch(batchId);
+          },
         },
       );
+
+      this.attachMutationErrorHandler(client);
 
       // In worker mode, set up the bridge for this client
       if (this.worker && !this.workerBridge) {
         this.attachWorkerBridge(key, client);
       }
 
-      this.attachMutationErrorHandler(client);
       // Direct (non-worker) clients with a serverUrl must open their own
       // Rust transport — the worker bridge is not doing it for them.
       if (!this.worker && this.config.serverUrl) {
@@ -1319,7 +1324,6 @@ export class Db {
         });
       }
 
-      this.attachMutationErrorHandler(client);
       this.clients.set(key, client);
     }
 
@@ -1343,6 +1347,7 @@ export class Db {
         for (const listener of this.mutationErrorListeners) {
           listener(event);
         }
+        this.workerBridge?.acknowledgeRejectedBatch(event.batch.batchId);
       }),
     );
   }
@@ -1381,6 +1386,34 @@ export class Db {
     this.applyBridgeRoutingForCurrentLeader(bridge, false);
     bridge.onAuthFailure((reason) => {
       this.markUnauthenticated(reason);
+    });
+    bridge.onLocalBatchRecordsSync((batches) => {
+      client.hydrateLocalBatchRecords(batches);
+    });
+    bridge.onMutationErrorReplay((batch) => {
+      client.replayRejectedBatchRecord(batch);
+      client.markReplayedRejectedBatchDelivered(batch.batchId);
+      const settlement = batch.latestSettlement;
+      if (!settlement || settlement.kind !== "rejected") {
+        return;
+      }
+
+      const event = {
+        code: settlement.code,
+        reason: settlement.reason,
+        batch,
+      };
+
+      if (this.mutationErrorListeners.size === 0) {
+        this.pendingWorkerMutationErrorEvents.push(event);
+        return;
+      }
+
+      for (const listener of this.mutationErrorListeners) {
+        listener(event);
+      }
+
+      this.workerBridge?.acknowledgeRejectedBatch(batch.batchId);
     });
     this.workerBridge = bridge;
     const bridgeReady = bridge
@@ -2315,6 +2348,14 @@ export class Db {
     this.mutationErrorListeners.add(listener);
     for (const client of this.clients.values()) {
       this.attachMutationErrorHandler(client);
+    }
+    while (this.pendingWorkerMutationErrorEvents.length > 0) {
+      const event = this.pendingWorkerMutationErrorEvents.shift()!;
+      listener(event);
+      for (const client of this.clients.values()) {
+        client.markReplayedRejectedBatchDelivered(event.batch.batchId);
+      }
+      this.workerBridge?.acknowledgeRejectedBatch(event.batch.batchId);
     }
     return () => {
       this.mutationErrorListeners.delete(listener);

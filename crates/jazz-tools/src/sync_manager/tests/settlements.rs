@@ -277,6 +277,55 @@ fn batch_settlement_needed_returns_persisted_rejected_without_visible_rows() {
 }
 
 #[test]
+fn server_rejected_batch_settlement_is_forwarded_to_interested_client() {
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    let settlement = BatchSettlement::Rejected {
+        batch_id: row.batch_id,
+        code: "permission_denied".to_string(),
+        reason: "writer lacks publish rights".to_string(),
+    };
+
+    seed_users_schema(&mut io);
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
+    sm.take_outbox();
+
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::RowBatchCreated {
+            metadata: Some(RowMetadata {
+                id: row_id,
+                metadata: row_metadata("users"),
+            }),
+            row,
+        },
+    );
+    sm.take_outbox();
+
+    sm.process_from_server(
+        &mut io,
+        server_id,
+        SyncPayload::BatchSettlement {
+            settlement: settlement.clone(),
+        },
+    );
+
+    assert!(sm.take_outbox().into_iter().any(|entry| matches!(
+        entry,
+        OutboxEntry {
+            destination: Destination::Client(id),
+            payload: SyncPayload::BatchSettlement { settlement: returned },
+        } if id == client_id && returned == settlement
+    )));
+}
+
+#[test]
 fn seal_batch_accepts_all_staged_transactional_rows_as_one_settlement() {
     let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
     let mut io = MemoryStorage::new();

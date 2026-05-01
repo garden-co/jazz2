@@ -46,6 +46,7 @@ pub struct SyncManager {
     pub(super) clock: MonotonicClock,
     pub(super) catalogue_entries: HashMap<ObjectId, CatalogueEntry>,
     pub(super) allow_unprivileged_schema_catalogue_writes: bool,
+    pub(super) retain_replayable_client_batch_records: bool,
 
     pub(super) servers: HashMap<ServerId, ServerState>,
     pub(super) pending_servers: HashMap<ServerId, Instant>,
@@ -96,6 +97,10 @@ impl std::fmt::Debug for SyncManager {
             .field(
                 "allow_unprivileged_schema_catalogue_writes",
                 &self.allow_unprivileged_schema_catalogue_writes,
+            )
+            .field(
+                "retain_replayable_client_batch_records",
+                &self.retain_replayable_client_batch_records,
             )
             .field("servers", &self.servers)
             .field("pending_servers", &self.pending_servers)
@@ -204,6 +209,7 @@ impl SyncManager {
             clock: MonotonicClock::new(),
             catalogue_entries: HashMap::new(),
             allow_unprivileged_schema_catalogue_writes: false,
+            retain_replayable_client_batch_records: false,
             servers: HashMap::new(),
             pending_servers: HashMap::new(),
             clients: HashMap::new(),
@@ -241,6 +247,16 @@ impl SyncManager {
     /// objects directly. Intended for development servers only.
     pub fn with_unprivileged_schema_catalogue_writes(mut self) -> Self {
         self.allow_unprivileged_schema_catalogue_writes = true;
+        self
+    }
+
+    /// Retain replayable local batch records for downstream client-authored
+    /// writes so bindings can replay unhandled mutation errors after restart.
+    ///
+    /// Intended for worker-like runtimes that persist another client's writes,
+    /// not authoritative multi-user servers.
+    pub fn with_replayable_client_batch_records(mut self) -> Self {
+        self.retain_replayable_client_batch_records = true;
         self
     }
 

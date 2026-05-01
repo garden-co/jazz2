@@ -69,6 +69,49 @@ let currentAuth: Record<string, string> = {};
 // Stored after init so reconnect-upstream can re-establish the WS.
 let currentWsUrl: string | null = null;
 
+function replayPendingRejectedBatchesToMain(): void {
+  if (!runtime || !mainClientId) {
+    return;
+  }
+
+  const rejectedBatchIds = runtime.drainRejectedBatchIds?.() ?? [];
+  for (const batchId of rejectedBatchIds) {
+    const batch = runtime.loadLocalBatchRecord?.(batchId);
+    if (batch?.latestSettlement?.kind !== "rejected") {
+      continue;
+    }
+    post({ type: "mutation-error-replay", batch });
+  }
+}
+
+function syncRetainedLocalBatchRecordsToMain(): void {
+  if (!runtime || !mainClientId) {
+    return;
+  }
+
+  const batches = runtime.loadLocalBatchRecords?.() ?? [];
+  if (batches.length === 0) {
+    return;
+  }
+
+  post({ type: "local-batch-records-sync", batches });
+}
+
+function replayNewlyRejectedBatchesToMain(): void {
+  if (!runtime || !mainClientId) {
+    return;
+  }
+
+  const rejectedBatchIds = runtime.drainRejectedBatchIds?.() ?? [];
+  for (const batchId of rejectedBatchIds) {
+    const batch = runtime.loadLocalBatchRecord?.(batchId);
+    if (batch?.latestSettlement?.kind !== "rejected") {
+      continue;
+    }
+    post({ type: "mutation-error-replay", batch });
+  }
+}
+
 function resolveAbsoluteWasmUrlFromInitError(error: unknown): string | null {
   const origin = self.location?.origin;
   if (!origin) return null;
@@ -347,6 +390,7 @@ async function handleInit(msg: InitMessage): Promise<void> {
           if (destinationClientId === mainClientId) {
             // Local main-thread client-bound payload.
             enqueueSyncMessageForMain(payload);
+            replayNewlyRejectedBatchesToMain();
             return;
           }
 
@@ -372,6 +416,9 @@ async function handleInit(msg: InitMessage): Promise<void> {
         }
       },
     );
+
+    syncRetainedLocalBatchRecordsToMain();
+    replayPendingRejectedBatchesToMain();
 
     // Runtime is now fully ready to ingest client sync traffic.
     const bufferedSyncMessages = pendingSyncMessages;
@@ -556,6 +603,15 @@ self.onmessage = async (event: MessageEvent<MainToWorkerMessage>) => {
       pendingPeerSyncMessages = [];
       post({ type: "shutdown-ok" });
       self.close();
+      break;
+
+    case "acknowledge-rejected-batch":
+      try {
+        runtime?.acknowledgeRejectedBatch?.(msg.batchId);
+        runtime?.flushWal?.();
+      } catch (error) {
+        console.warn("[worker] acknowledgeRejectedBatch failed:", error);
+      }
       break;
 
     case "simulate-crash":

@@ -7,7 +7,7 @@
  * Server sync tests use a real jazz-tools server spawned by global-setup.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { createDb, Db, type QueryBuilder } from "../../src/runtime/db.js";
 import type { WasmSchema } from "../../src/drivers/types.js";
 import { generateAuthSecret } from "../../src/runtime/auth-secret-store.js";
@@ -23,7 +23,6 @@ import {
 } from "./support.js";
 import {
   blockTestingServerNetwork,
-  getIsolatedTestingServerInfo,
   getTestingServerInfo,
   getTestingServerJwtForUser,
   getTestingServerNetworkDebug,
@@ -272,49 +271,6 @@ const allCatalogueTodos: QueryBuilder<CatalogueTodo> = {
     });
   },
 };
-
-/**
- * Sets up a server with the given app schema and permissions.
- */
-async function getServerWithPermissions(
-  app: { wasmSchema: WasmSchema },
-  permissions: CompiledPermissions,
-): Promise<{ appId: string; serverUrl: string; adminSecret: string }> {
-  const { appId, serverUrl, adminSecret } = await getIsolatedTestingServerInfo();
-  const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
-    adminSecret,
-    schema: app.wasmSchema,
-  });
-  const { head } = await fetchPermissionsHead(serverUrl, { adminSecret });
-  await publishStoredPermissions(serverUrl, {
-    adminSecret,
-    schemaHash,
-    permissions,
-    expectedParentBundleObjectId: head?.bundleObjectId ?? null,
-  });
-  return { appId, serverUrl, adminSecret };
-}
-
-/**
- * Creates a non-admin Db with the given appId and serverUrl.
- */
-async function getNonAdminClientDb(
-  appId: string,
-  serverUrl: string,
-  ctx: TestCleanup,
-): Promise<Db> {
-  const jwtToken = await getTestingServerJwtForUser("browser-offline-rejected-wait", {
-    role: "user",
-  });
-  return ctx.track(
-    await createDb({
-      appId,
-      driver: { type: "persistent", dbName: uniqueDbName("sync-wait-edge-rejected-offline") },
-      serverUrl,
-      jwtToken,
-    }),
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1202,9 +1158,10 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsOnA.some((row) => row.title === title)).toBe(true);
   }, 60000);
 
-  it.skip("resolves insert wait at edge tier through the worker bridge", async () => {
+  it("resolves insert wait at edge tier through the worker bridge", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions("sync-wait-edge");
     const sharedLocalAuthToken = generateAuthSecret();
-    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken);
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
 
     const title = `wait-edge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const inserted = db.insert(todos, { title, done: false });
@@ -1225,60 +1182,158 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsAtEdge.some((row) => row.id === insertedTodo.id)).toBe(true);
   }, 60000);
 
-  it.skip("rejects insert immediately when published server permissions deny writes", async () => {
-    const { appId, serverUrl } = await getServerWithPermissions(app, rejectAllPermissions);
-
-    // Wait for client to fetch permissions from the server
-    const db = await getNonAdminClientDb(appId, serverUrl, ctx);
-    await waitForCondition(
-      async () => Boolean(db.getAuthState().session) && !db.getAuthState().error,
-      10_000,
-      "client db should authenticate before rejected insert",
-    );
-    await withTimeout(
-      db.all(allTodos, { tier: "edge" }),
-      10_000,
-      "client db should complete an initial edge read before rejected insert",
+  it("server permissions check rejects client optimistic insert - wait notification", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
     );
 
-    expect(() => db.insert(todos, { title: "Rejected", done: false })).toThrow(
-      'WriteError("policy denied INSERT on table todos")',
-    );
-  });
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
 
-  it.skip("server permissions check rejects offline insert", async () => {
-    const { appId, serverUrl } = await getServerWithPermissions(app, rejectAllPermissions);
-
-    // Block network to prevent server permissions from being fetched by the client
-    await blockTestingServerNetwork(serverUrl);
-
-    const db = await getNonAdminClientDb(appId, serverUrl, ctx);
-
-    const inserted = db.insert(todos, { title: "Rejected later", done: false });
-    const waitPromise = inserted.wait({ tier: "edge" });
-
-    const todosAfterInsert = await db.all(allTodos, { tier: "local" });
-    expect(todosAfterInsert.length).toBe(1);
-
-    await unblockTestingServerNetwork(serverUrl);
-    // Insert is reverted in the client
-    await waitForTodos(
-      db,
-      (rows) => rows.length === 0,
-      "offline insert should be reverted once rejected by the server",
-      10_000,
-      "local",
-    );
-
-    // `WriteResult.wait` rejects
-    await expect(
-      withTimeout(waitPromise, 20_000, "offline rejected insert wait(edge) timed out"),
-    ).rejects.toMatchObject({
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await expect(insertResult.wait({ tier: "edge" })).rejects.toMatchObject({
       name: "PersistedWriteRejectedError",
-      batchId: inserted.batchId,
+      batchId: insertResult.batchId,
       code: "permission_denied",
     });
-  }, 60000);
+
+    const todosAfterRevert = await db.all(allTodos, { tier: "local" });
+    expect(todosAfterRevert.length).toBe(0);
+  });
+
+  it("server permissions check rejects client optimistic insert - onMutationError notification", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
+
+    const mutationErrorSpy = vi.fn();
+    db.onMutationError(mutationErrorSpy);
+
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await waitForCondition(
+      async () => mutationErrorSpy.mock.calls.length > 0,
+      1000,
+      "onMutationError handler should be called",
+    );
+    expect(mutationErrorSpy).toHaveBeenCalledWith({
+      code: "permission_denied",
+      reason: "Insert denied by policy on table todos",
+      batch: {
+        batchId: insertResult.batchId,
+        mode: "direct",
+        sealed: true,
+        latestSettlement: {
+          kind: "rejected",
+          batchId: insertResult.batchId,
+          code: "permission_denied",
+          reason: "Insert denied by policy on table todos",
+        },
+      },
+    });
+
+    const todosAfterRevert = await db.all(allTodos, { tier: "local" });
+    expect(todosAfterRevert.length).toBe(0);
+  });
+
+  it("wait() prevents onMutationError handler from firing", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
+
+    const mutationErrorSpy = vi.fn();
+    db.onMutationError(mutationErrorSpy);
+
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await expect(insertResult.wait({ tier: "edge" })).rejects.toMatchObject({
+      name: "PersistedWriteRejectedError",
+      batchId: insertResult.batchId,
+      code: "permission_denied",
+    });
+    expect(mutationErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it("replays onMutationError after restart when the rejection was not previously delivered", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-on-mutation-error-restart",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const dbName = uniqueDbName("sync-on-mutation-error-restart");
+    const dbBeforeRestart = track(
+      await createDb({
+        appId: syncServer.appId,
+        driver: { type: "persistent", dbName },
+        serverUrl: syncServer.serverUrl,
+        secret: sharedLocalAuthToken,
+      }),
+    );
+
+    const insertResult = dbBeforeRestart.insert(todos, {
+      title: "Rejected on restart",
+      done: false,
+    });
+    // Wait for the insert to be persisted locally before restarting
+    await insertResult.wait({ tier: "local" });
+
+    // Ensure the insert is not rejected before restarting
+    const clientBeforeRestart = (dbBeforeRestart as any).getClient(app.wasmSchema);
+    expect(
+      clientBeforeRestart.localBatchRecord(insertResult.batchId)?.latestSettlement,
+    ).not.toMatchObject({
+      kind: "rejected",
+    });
+
+    await dbBeforeRestart.shutdown();
+    untrack(dbBeforeRestart);
+
+    const dbAfterRestart = track(
+      await createDb({
+        appId: syncServer.appId,
+        driver: { type: "persistent", dbName },
+        serverUrl: syncServer.serverUrl,
+        secret: sharedLocalAuthToken,
+      }),
+    );
+
+    const mutationErrorSpy = vi.fn();
+    dbAfterRestart.onMutationError(mutationErrorSpy);
+
+    // Run a query to ensure both the in-memory and worker clients are initialized
+    // Also checks the insert was reverted
+    const todosAfterRestart = await dbAfterRestart.all(allTodos, { tier: "local" });
+    expect(todosAfterRestart.length).toBe(0);
+
+    await waitForCondition(
+      async () => mutationErrorSpy.mock.calls.length > 0,
+      5000,
+      "onMutationError handler should receive rejection after restart",
+    );
+    expect(mutationErrorSpy).toHaveBeenCalledWith({
+      code: "permission_denied",
+      reason: "Insert denied by policy on table todos",
+      batch: {
+        batchId: insertResult.batchId,
+        mode: "direct",
+        sealed: true,
+        latestSettlement: {
+          kind: "rejected",
+          batchId: insertResult.batchId,
+          code: "permission_denied",
+          reason: "Insert denied by policy on table todos",
+        },
+      },
+    });
+  });
 
   it("recovers sync after browser-side network loss with B in a separate context", async () => {
     const syncServer = await publishSyncServerSchemaAndPermissions("sync-recover");
@@ -1808,7 +1863,10 @@ async function waitForTodos(
   return waitForQuery(db, allTodos, predicate, label, timeoutMs, tier);
 }
 
-async function publishSyncServerSchemaAndPermissions(scope: string): Promise<TestingServerInfo> {
+async function publishSyncServerSchemaAndPermissions(
+  scope: string,
+  permissions?: CompiledPermissions,
+): Promise<TestingServerInfo> {
   const testingServer = await getTestingServerInfo(uniqueDbName(`worker-bridge-${scope}`));
   const { appId, serverUrl, adminSecret } = testingServer;
   const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
@@ -1817,30 +1875,31 @@ async function publishSyncServerSchemaAndPermissions(scope: string): Promise<Tes
     schema: app.wasmSchema,
   });
   const { head } = await fetchPermissionsHead(serverUrl, { appId, adminSecret });
+  const permissionsToPublish = permissions ?? {
+    todos: {
+      select: { using: { type: "True" } },
+      insert: { with_check: { type: "True" } },
+      update: {
+        using: { type: "True" },
+        with_check: { type: "True" },
+      },
+      delete: { using: { type: "True" } },
+    },
+    projects: {
+      select: { using: { type: "True" } },
+      insert: { with_check: { type: "True" } },
+      update: {
+        using: { type: "True" },
+        with_check: { type: "True" },
+      },
+      delete: { using: { type: "True" } },
+    },
+  };
   await publishStoredPermissions(serverUrl, {
     appId,
     adminSecret,
     schemaHash,
-    permissions: {
-      todos: {
-        select: { using: { type: "True" } },
-        insert: { with_check: { type: "True" } },
-        update: {
-          using: { type: "True" },
-          with_check: { type: "True" },
-        },
-        delete: { using: { type: "True" } },
-      },
-      projects: {
-        select: { using: { type: "True" } },
-        insert: { with_check: { type: "True" } },
-        update: {
-          using: { type: "True" },
-          with_check: { type: "True" },
-        },
-        delete: { using: { type: "True" } },
-      },
-    },
+    permissions: permissionsToPublish,
     expectedParentBundleObjectId: head?.bundleObjectId ?? null,
   });
 

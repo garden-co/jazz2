@@ -1,5 +1,8 @@
 use super::*;
-use crate::batch_fate::{BatchSettlement, SealedBatchSubmission, VisibleBatchMember};
+use crate::batch_fate::{
+    BatchMode, BatchSettlement, LocalBatchMember, LocalBatchRecord, SealedBatchSubmission,
+    VisibleBatchMember,
+};
 use crate::metadata::MetadataKey;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::policy::Operation;
@@ -217,6 +220,111 @@ impl SyncManager {
             .ok()
             .flatten()
             .map(|locator| metadata_from_row_locator(&locator))
+    }
+
+    fn local_batch_member_schema_hash<H: Storage>(
+        &self,
+        storage: &H,
+        branch_name: BranchName,
+        row_id: ObjectId,
+        batch_id: BatchId,
+    ) -> Option<crate::query_manager::types::SchemaHash> {
+        if let Ok(Some(locator)) =
+            storage.load_history_row_batch_table_locator(branch_name.as_str(), row_id, batch_id)
+        {
+            return Some(locator.schema_hash);
+        }
+
+        storage
+            .load_row_locator(row_id)
+            .ok()
+            .flatten()
+            .and_then(|locator| locator.origin_schema_hash)
+    }
+
+    fn retain_client_batch_record<H: Storage>(
+        &self,
+        storage: &mut H,
+        table: &str,
+        row: &StoredRowBatch,
+        mode: BatchMode,
+        seed_local_settlement: bool,
+    ) {
+        if !self.retain_replayable_client_batch_records {
+            return;
+        }
+
+        let branch_name = BranchName::new(&row.branch);
+        let Some(schema_hash) =
+            self.local_batch_member_schema_hash(storage, branch_name, row.row_id, row.batch_id)
+        else {
+            tracing::warn!(
+                row_id = %row.row_id,
+                %branch_name,
+                ?row.batch_id,
+                "skipping replayable client batch retention: missing schema hash"
+            );
+            return;
+        };
+
+        let mut record = match storage.load_local_batch_record(row.batch_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => LocalBatchRecord::new(row.batch_id, mode, false, None),
+            Err(error) => {
+                tracing::warn!(
+                    row_id = %row.row_id,
+                    %branch_name,
+                    ?row.batch_id,
+                    %error,
+                    "failed to load replayable client batch record"
+                );
+                return;
+            }
+        };
+
+        if record.mode != mode {
+            tracing::warn!(
+                row_id = %row.row_id,
+                %branch_name,
+                ?row.batch_id,
+                ?mode,
+                existing_mode = ?record.mode,
+                "skipping replayable client batch retention: conflicting batch modes"
+            );
+            return;
+        }
+
+        record.upsert_member(LocalBatchMember {
+            object_id: row.row_id,
+            table_name: table.to_string(),
+            branch_name,
+            schema_hash,
+            row_digest: row.content_digest(),
+        });
+
+        if seed_local_settlement {
+            record.apply_settlement(BatchSettlement::DurableDirect {
+                batch_id: row.batch_id,
+                confirmed_tier: self
+                    .max_local_durability_tier()
+                    .unwrap_or(DurabilityTier::Local),
+                visible_members: vec![VisibleBatchMember {
+                    object_id: row.row_id,
+                    branch_name,
+                    batch_id: row.batch_id,
+                }],
+            });
+        }
+
+        if let Err(error) = storage.upsert_local_batch_record(&record) {
+            tracing::warn!(
+                row_id = %row.row_id,
+                %branch_name,
+                ?row.batch_id,
+                %error,
+                "failed to persist replayable client batch record"
+            );
+        }
     }
 
     fn matches_replayed_row_batch(existing: &StoredRowBatch, incoming: &StoredRowBatch) -> bool {
@@ -449,6 +557,33 @@ impl SyncManager {
                     }
                 }
             })
+    }
+
+    fn interested_clients_for_settlement(&self, settlement: &BatchSettlement) -> HashSet<ClientId> {
+        match settlement {
+            BatchSettlement::DurableDirect {
+                visible_members, ..
+            }
+            | BatchSettlement::AcceptedTransaction {
+                visible_members, ..
+            } => visible_members
+                .iter()
+                .flat_map(|member| {
+                    self.clients.iter().filter_map(move |(client_id, client)| {
+                        client
+                            .is_in_scope(member.object_id, &member.branch_name)
+                            .then_some(*client_id)
+                    })
+                })
+                .collect(),
+            BatchSettlement::Rejected { batch_id, .. } => self
+                .row_batch_interest
+                .iter()
+                .filter(|(key, _)| key.batch_id == *batch_id)
+                .flat_map(|(_, clients)| clients.iter().copied())
+                .collect(),
+            BatchSettlement::Missing { .. } => HashSet::new(),
+        }
     }
 
     fn respond_to_batch_settlement_request<H: Storage>(
@@ -1061,26 +1196,7 @@ impl SyncManager {
                     return;
                 }
                 self.pending_batch_settlements.push(settlement.clone());
-                let interested: HashSet<ClientId> = match &settlement {
-                    BatchSettlement::DurableDirect {
-                        visible_members, ..
-                    }
-                    | BatchSettlement::AcceptedTransaction {
-                        visible_members, ..
-                    } => visible_members
-                        .iter()
-                        .flat_map(|member| {
-                            self.clients.iter().filter_map(move |(client_id, client)| {
-                                client
-                                    .is_in_scope(member.object_id, &member.branch_name)
-                                    .then_some(*client_id)
-                            })
-                        })
-                        .collect(),
-                    BatchSettlement::Missing { .. } | BatchSettlement::Rejected { .. } => {
-                        HashSet::new()
-                    }
-                };
+                let interested = self.interested_clients_for_settlement(&settlement);
                 for cid in interested {
                     self.outbox.push(OutboxEntry {
                         destination: Destination::Client(cid),
@@ -1547,6 +1663,13 @@ impl SyncManager {
                 if let Some(applied) = self.apply_row_updated(storage, metadata, row.clone()) {
                     if let Some(table) = applied.metadata.get(MetadataKey::Table.as_str()).cloned()
                     {
+                        self.retain_client_batch_record(
+                            storage,
+                            table.as_str(),
+                            &applied.row,
+                            BatchMode::Direct,
+                            true,
+                        );
                         self.forward_row_batch_to_servers_with_storage(
                             storage,
                             table.as_str(),
@@ -1611,6 +1734,15 @@ impl SyncManager {
                             );
                         }
                     } else {
+                        if let Some(table) = applied.metadata.get(MetadataKey::Table.as_str()) {
+                            self.retain_client_batch_record(
+                                storage,
+                                table.as_str(),
+                                &applied.row,
+                                BatchMode::Transactional,
+                                false,
+                            );
+                        }
                         self.try_accept_completed_sealed_batch_from_client(
                             storage,
                             client_id,
@@ -1620,6 +1752,19 @@ impl SyncManager {
                 }
             }
             SyncPayload::SealBatch { submission } => {
+                if self.retain_replayable_client_batch_records
+                    && let Ok(Some(mut record)) =
+                        storage.load_local_batch_record(submission.batch_id)
+                {
+                    record.mark_sealed(submission.clone());
+                    if let Err(error) = storage.upsert_local_batch_record(&record) {
+                        tracing::warn!(
+                            batch_id = ?submission.batch_id,
+                            %error,
+                            "failed to persist sealed replayable client batch record"
+                        );
+                    }
+                }
                 if submission.members.is_empty() {
                     tracing::warn!(batch_id = ?submission.batch_id, "ignoring SealBatch with no declared members");
                     return;
