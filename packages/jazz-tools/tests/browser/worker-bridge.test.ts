@@ -7,7 +7,7 @@
  * Server sync tests use a real jazz-tools server spawned by global-setup.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { createDb, Db, type QueryBuilder } from "../../src/runtime/db.js";
 import type { WasmSchema } from "../../src/drivers/types.js";
 import { generateAuthSecret } from "../../src/runtime/auth-secret-store.js";
@@ -1182,7 +1182,7 @@ describe("Worker Bridge with OPFS", () => {
     expect(rowsAtEdge.some((row) => row.id === insertedTodo.id)).toBe(true);
   }, 60000);
 
-  it("server permissions check rejects client optimistic insert", async () => {
+  it("server permissions check rejects client optimistic insert - wait notification", async () => {
     const syncServer = await publishSyncServerSchemaAndPermissions(
       "sync-wait-edge",
       rejectAllPermissions,
@@ -1197,6 +1197,68 @@ describe("Worker Bridge with OPFS", () => {
       batchId: insertResult.batchId,
       code: "permission_denied",
     });
+
+    const todosAfterRevert = await db.all(allTodos, { tier: "local" });
+    expect(todosAfterRevert.length).toBe(0);
+  });
+
+  it("server permissions check rejects client optimistic insert - onMutationError notification", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
+
+    const mutationErrorSpy = vi.fn();
+    db.onMutationError(mutationErrorSpy);
+
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await waitForCondition(
+      async () => mutationErrorSpy.mock.calls.length > 0,
+      1000,
+      "onMutationError handler should be called",
+    );
+    expect(mutationErrorSpy).toHaveBeenCalledWith({
+      code: "permission_denied",
+      reason: "Insert denied by policy on table todos",
+      batch: {
+        batchId: insertResult.batchId,
+        mode: "direct",
+        sealed: true,
+        latestSettlement: {
+          kind: "rejected",
+          batchId: insertResult.batchId,
+          code: "permission_denied",
+          reason: "Insert denied by policy on table todos",
+        },
+      },
+    });
+
+    const todosAfterRevert = await db.all(allTodos, { tier: "local" });
+    expect(todosAfterRevert.length).toBe(0);
+  });
+
+  it("wait() prevents onMutationError handler from firing", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-wait-edge",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const db = await createSyncedDb(ctx, "sync-wait-edge", sharedLocalAuthToken, syncServer);
+
+    const mutationErrorSpy = vi.fn();
+    db.onMutationError(mutationErrorSpy);
+
+    const insertResult = db.insert(todos, { title: "Rejected", done: false });
+    await expect(insertResult.wait({ tier: "edge" })).rejects.toMatchObject({
+      name: "PersistedWriteRejectedError",
+      batchId: insertResult.batchId,
+      code: "permission_denied",
+    });
+    expect(mutationErrorSpy).not.toHaveBeenCalled();
   });
 
   it("recovers sync after browser-side network loss with B in a separate context", async () => {

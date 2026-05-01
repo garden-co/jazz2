@@ -1266,7 +1266,7 @@ export class JazzClient {
    */
   private readonly mutationErrorListeners = new Set<(event: MutationErrorEvent) => void>();
   private readonly acknowledgedRejectedBatchErrors = new Map<string, PersistedWriteRejectedError>();
-  private pendingBatchWaitPollTimer: ReturnType<typeof setTimeout> | null = null;
+  private settlementPollTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private cachedRuntimeSchemaHash: string | null = null;
   private cachedRuntimeSchema: WasmSchema | null = null;
@@ -1537,8 +1537,12 @@ export class JazzClient {
   onMutationError(listener: (event: MutationErrorEvent) => void): () => void {
     this.mutationErrorListeners.add(listener);
     this.flushUnhandledMutationErrors();
+    this.ensureSettlementPolling();
     return () => {
       this.mutationErrorListeners.delete(listener);
+      if (!this.shouldPollSettlements()) {
+        this.cancelSettlementPolling();
+      }
     };
   }
 
@@ -2401,34 +2405,38 @@ export class JazzClient {
     }
   }
 
-  private ensurePendingBatchWaitPolling(): void {
-    if (this.pendingBatchWaitPollTimer !== null) {
+  private shouldPollSettlements(): boolean {
+    return this.pendingBatchWaiters.size > 0 || this.mutationErrorListeners.size > 0;
+  }
+
+  private ensureSettlementPolling(): void {
+    if (this.settlementPollTimer !== null) {
       return;
     }
-    if (this.pendingBatchWaiters.size === 0) {
+    if (!this.shouldPollSettlements()) {
       return;
     }
 
     // Rust-owned transports can settle batch records without routing through
     // JS `onSyncMessageReceived`, so poll retained batch metadata while waits
-    // are outstanding.
-    this.pendingBatchWaitPollTimer = setTimeout(() => {
-      this.pendingBatchWaitPollTimer = null;
+    // or mutation error listeners are outstanding.
+    this.settlementPollTimer = setTimeout(() => {
+      this.settlementPollTimer = null;
       const batchesWithPendingWaiters = new Set(this.pendingBatchWaiters.keys());
       this.flushPendingBatchWaiters();
       this.flushUnhandledMutationErrors(this.drainRejectedBatchIds(), batchesWithPendingWaiters);
 
-      this.ensurePendingBatchWaitPolling();
+      this.ensureSettlementPolling();
     }, 20);
   }
 
-  private cancelPendingBatchWaitPolling(): void {
-    if (this.pendingBatchWaitPollTimer === null) {
+  private cancelSettlementPolling(): void {
+    if (this.settlementPollTimer === null) {
       return;
     }
 
-    clearTimeout(this.pendingBatchWaitPollTimer);
-    this.pendingBatchWaitPollTimer = null;
+    clearTimeout(this.settlementPollTimer);
+    this.settlementPollTimer = null;
   }
 
   private flushUnhandledMutationErrors(
@@ -2489,7 +2497,7 @@ export class JazzClient {
       waiters.push({ tier, resolve, reject });
       this.pendingBatchWaiters.set(batchId, waiters);
       this.flushPendingBatchWaiters();
-      this.ensurePendingBatchWaitPolling();
+      this.ensureSettlementPolling();
     });
   }
 
@@ -2502,7 +2510,7 @@ export class JazzClient {
     }
 
     this.shutdownPromise = (async () => {
-      this.cancelPendingBatchWaitPolling();
+      this.cancelSettlementPolling();
 
       // Disconnect Rust-owned transport if present.
       this.runtime.disconnect?.();
