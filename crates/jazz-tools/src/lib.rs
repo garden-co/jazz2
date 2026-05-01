@@ -7,6 +7,8 @@ pub mod metadata;
 #[cfg(any(feature = "cli", feature = "server"))]
 pub mod middleware;
 pub mod object;
+#[cfg(feature = "otel-core")]
+pub mod otel;
 pub mod query_manager;
 pub mod row_format;
 pub mod row_histories;

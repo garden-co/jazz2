@@ -18,8 +18,33 @@ declare module "jazz-wasm" {
   type SyncOutboxCallback = (...args: SyncOutboxCallbackArgs) => void;
   type InsertValues = Record<string, unknown>;
 
+  export type WasmTraceEntry =
+    | {
+        kind: "span";
+        sequence: number;
+        name: string;
+        target: string;
+        level: string;
+        startUnixNano: string;
+        endUnixNano: string;
+        fields: Record<string, string>;
+      }
+    | {
+        kind: "log";
+        sequence: number;
+        target: string;
+        level: string;
+        timestampUnixNano: string;
+        message: string;
+        fields: Record<string, string>;
+      }
+    | { kind: "dropped"; count: number };
+
   export default function init(input?: unknown): Promise<void>;
   export function initSync(input?: unknown): void;
+  export function setTraceEntryCollectionEnabled(enabled: boolean): void;
+  export function drainTraceEntries(): WasmTraceEntry[];
+  export function subscribeTraceEntries(callback: () => void): () => void;
 
   export class WasmRuntime {
     constructor(

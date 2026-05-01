@@ -60,6 +60,7 @@ function Router() {
 
 const appId = import.meta.env.VITE_JAZZ_APP_ID;
 const serverUrl = import.meta.env.VITE_JAZZ_SERVER_URL;
+const telemetryCollectorUrl = import.meta.env.VITE_JAZZ_TELEMETRY_COLLECTOR_URL;
 
 if (!appId) {
   throw new Error("JAZZ_APP_ID is required");
@@ -76,8 +77,10 @@ function AppInner() {
     env: import.meta.env.DEV ? "dev" : "prod",
     userBranch: "main",
     devMode: import.meta.env.DEV,
-    auth: { localFirstSecret: secret },
+    secret,
     serverUrl,
+    telemetryCollectorUrl,
+    logLevel: telemetryCollectorUrl ? "debug" : undefined,
   };
 
   return (

@@ -44,14 +44,15 @@ server = [
 cli = ["server", "rocksdb", "dep:clap"]
 test-utils = ["server", "client", "sqlite"]
 test = ["test-utils", "cli"]
-otel = [
-  "cli",
+otel-core = [
+  "server",
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",
   "dep:opentelemetry-otlp",
   "dep:opentelemetry-stdout",
   "dep:tracing-opentelemetry",
 ]
+otel = ["cli", "otel-core"]
 
 [dependencies]
 opfs-btree = { path = "../opfs-btree", version = "0.1.0" }
@@ -110,7 +111,11 @@ thiserror = { version = "1", optional = true }
 
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = [
+  "grpc-tonic",
+  "http-json",
+  "reqwest-blocking-client",
+], optional = true }
 opentelemetry-stdout = { version = "0.31", features = ["trace"], optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 

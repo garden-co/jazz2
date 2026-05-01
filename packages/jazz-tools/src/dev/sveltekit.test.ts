@@ -12,6 +12,7 @@ const dev = await import("./index.js");
 const tempRoots = createTempRootTracker();
 const originalJazzAppId = process.env.PUBLIC_JAZZ_APP_ID;
 const originalJazzServerUrl = process.env.PUBLIC_JAZZ_SERVER_URL;
+const originalJazzTelemetryCollectorUrl = process.env.PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL;
 const originalBackendSecret = process.env.BACKEND_SECRET;
 
 function makeViteServer(
@@ -33,6 +34,7 @@ function makeViteServer(
 beforeEach(() => {
   delete process.env.PUBLIC_JAZZ_APP_ID;
   delete process.env.PUBLIC_JAZZ_SERVER_URL;
+  delete process.env.PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL;
   delete process.env.JAZZ_ADMIN_SECRET;
   delete process.env.BACKEND_SECRET;
 });
@@ -57,6 +59,12 @@ afterEach(async () => {
     delete process.env.PUBLIC_JAZZ_SERVER_URL;
   } else {
     process.env.PUBLIC_JAZZ_SERVER_URL = originalJazzServerUrl;
+  }
+
+  if (originalJazzTelemetryCollectorUrl === undefined) {
+    delete process.env.PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL;
+  } else {
+    process.env.PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL = originalJazzTelemetryCollectorUrl;
   }
 
   if (originalBackendSecret === undefined) {
@@ -98,6 +106,34 @@ describe("jazzSvelteKit", () => {
     expect(process.env.PUBLIC_JAZZ_APP_ID).toBe(viteServer.config.env!.PUBLIC_JAZZ_APP_ID);
     expect(process.env.PUBLIC_JAZZ_SERVER_URL).toBe(`http://127.0.0.1:${port}`);
   }, 30_000);
+
+  it("exposes top-level telemetry options and starts server-side telemetry", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const startSpy = vi.spyOn(devServer, "startLocalJazzServer").mockResolvedValue({
+      appId: "00000000-0000-0000-0000-000000000062",
+      port: 19882,
+      url: "http://127.0.0.1:19882",
+      dataDir: undefined as unknown as string,
+      stop: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.spyOn(devServer, "pushSchemaCatalogue").mockResolvedValue({ hash: "abc" });
+    vi.spyOn(schemaWatcher, "watchSchema").mockReturnValue({ close: vi.fn() });
+
+    const root = await tempRoots.create("jazz-sveltekit-top-level-telemetry-test-");
+    const plugin = jazzSvelteKit({
+      server: { port: 19882, adminSecret: "sveltekit-telemetry-admin" },
+      telemetry: "http://127.0.0.1:54418",
+    });
+    const viteServer = makeViteServer("serve", root);
+    await (plugin.configureServer as (s: ViteDevServer) => Promise<void>)(viteServer);
+
+    const startOptions = startSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(startOptions.telemetryCollectorUrl).toBe("http://127.0.0.1:54418");
+    expect(viteServer.config.env!.PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL).toBe(
+      "http://127.0.0.1:54418",
+    );
+    expect(logSpy).toHaveBeenCalledWith("[jazz] telemetry collector: http://127.0.0.1:54418");
+  });
 
   it("restarts the dev server on first-ever cold start so SvelteKit's $env capture sees the freshly allocated appId", async () => {
     const port = await getAvailablePort();

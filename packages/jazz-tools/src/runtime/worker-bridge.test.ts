@@ -1,8 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+
 import { WorkerBridge, type PeerSyncBatch } from "./worker-bridge.js";
 import type { Runtime } from "./client.js";
 import type { WorkerToMainMessage } from "../worker/worker-protocol.js";
 import { OutboxDestinationKind, type AuthFailureReason } from "./sync-transport.js";
+
+afterEach(() => {
+  delete (globalThis as Record<string, unknown>).__JAZZ_WASM_TRACE_SPAN__;
+});
 
 class MockWorker {
   onmessage: ((event: MessageEvent<WorkerToMainMessage>) => void) | null = null;
@@ -229,6 +234,55 @@ describe("WorkerBridge", () => {
     });
 
     await expect(initPromise).resolves.toBe("worker-client-123");
+  });
+
+  it("passes telemetry collector url through worker init", async () => {
+    const worker = new MockWorker();
+    const runtimeMock = createRuntimeMock();
+    const bridge = new WorkerBridge(worker as unknown as Worker, runtimeMock.runtime);
+
+    const initPromise = bridge.init({
+      schemaJson: '{"tables":[]}',
+      appId: "app-1",
+      env: "dev",
+      userBranch: "main",
+      dbName: "db-1",
+      telemetryCollectorUrl: "http://127.0.0.1:54418",
+    });
+
+    expect(worker.posted[0]).toMatchObject({
+      type: "init",
+      telemetryCollectorUrl: "http://127.0.0.1:54418",
+    });
+
+    worker.emitFromWorker({
+      type: "init-ok",
+      clientId: "worker-client-123",
+    });
+    await initPromise;
+  });
+
+  it("does not install a global WASM trace callback during init", async () => {
+    const worker = new MockWorker();
+    const runtimeMock = createRuntimeMock();
+    const bridge = new WorkerBridge(worker as unknown as Worker, runtimeMock.runtime);
+
+    const initPromise = bridge.init({
+      schemaJson: '{"tables":[]}',
+      appId: "app-1",
+      env: "dev",
+      userBranch: "main",
+      dbName: "db-1",
+      telemetryCollectorUrl: "http://127.0.0.1:54418",
+    });
+    worker.emitFromWorker({ type: "init-ok", clientId: "worker-client-123" });
+    await initPromise;
+
+    expect((globalThis as Record<string, unknown>).__JAZZ_WASM_TRACE_SPAN__).toBeUndefined();
+
+    const shutdownPromise = bridge.shutdown(worker as unknown as Worker);
+    worker.emitFromWorker({ type: "shutdown-ok" });
+    await shutdownPromise;
   });
 
   it("detaches runtime server on shutdown and stops forwarding after disposal", async () => {

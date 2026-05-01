@@ -243,6 +243,43 @@ describe("Db worker runtime bootstrap", () => {
     expect(options.fallbackWasmUrl).toMatch(/jazz_wasm_bg\.wasm$/);
   });
 
+  it("passes telemetryCollectorUrl into worker bridge options", async () => {
+    class FakeWorker extends EventTarget {
+      constructor(_url: string | URL, _options?: WorkerOptions) {
+        super();
+        queueMicrotask(() => {
+          const event = new Event("message");
+          Object.defineProperty(event, "data", {
+            value: { type: "ready" },
+            configurable: true,
+          });
+          this.dispatchEvent(event);
+        });
+      }
+
+      postMessage(): void {}
+
+      terminate(): void {}
+    }
+
+    (globalThis as Record<string, unknown>).window = {};
+    (globalThis as Record<string, unknown>).location = {
+      href: "http://localhost:3000/",
+    };
+    (globalThis as Record<string, unknown>).Worker = FakeWorker;
+
+    const db = await Db.createWithWorker({
+      appId: "worker-bootstrap-telemetry",
+      driver: { type: "persistent", dbName: "worker-bootstrap-telemetry" },
+      telemetryCollectorUrl: "http://127.0.0.1:54418",
+    });
+
+    const options = (db as any).buildWorkerBridgeOptions("{}");
+    await db.shutdown();
+
+    expect(options.telemetryCollectorUrl).toBe("http://127.0.0.1:54418");
+  });
+
   it("does not append a bootstrap wasm URL when runtimeSources provides in-memory wasmSource", async () => {
     const spawnedWorkerUrls: string[] = [];
 

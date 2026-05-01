@@ -12,6 +12,7 @@ export interface ExpoConfigLike {
 const runtime = new ManagedDevRuntime({
   appId: "EXPO_PUBLIC_JAZZ_APP_ID",
   serverUrl: "EXPO_PUBLIC_JAZZ_SERVER_URL",
+  telemetryCollectorUrl: "EXPO_PUBLIC_JAZZ_TELEMETRY_COLLECTOR_URL",
 });
 
 let hasLoggedInspectorLink = false;
@@ -43,6 +44,9 @@ export async function withJazz(
       ...expoConfig.extra,
       jazzAppId: managed.appId,
       jazzServerUrl: managed.serverUrl,
+      ...(managed.telemetryCollectorUrl
+        ? { jazzTelemetryCollectorUrl: managed.telemetryCollectorUrl }
+        : {}),
     },
   };
 }

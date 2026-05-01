@@ -31,6 +31,7 @@ export interface WorkerBridgeOptions {
   runtimeSources?: RuntimeSourcesConfig;
   fallbackWasmUrl?: string;
   logLevel?: "error" | "warn" | "info" | "debug" | "trace";
+  telemetryCollectorUrl?: string;
 }
 
 export interface PeerSyncBatch {
@@ -177,9 +178,9 @@ export class WorkerBridge {
       runtimeSources: options.runtimeSources,
       fallbackWasmUrl: options.fallbackWasmUrl,
       logLevel: options.logLevel,
+      telemetryCollectorUrl: options.telemetryCollectorUrl,
       clientId: "", // Worker generates its own client ID for main thread
     };
-
     this.state.expectsUpstreamServer = Boolean(options.serverUrl);
     if (!this.state.expectsUpstreamServer) {
       this.markUpstreamServerConnected();

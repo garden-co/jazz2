@@ -11,6 +11,7 @@ pub struct StringRecorder {
     pub is_following_args: bool,
     pub show_fields: bool,
     pub fields: HashMap<String, String>,
+    pub message: Option<String>,
 }
 impl StringRecorder {
     pub fn new(show_fields: bool) -> Self {
@@ -24,6 +25,8 @@ impl StringRecorder {
 impl Visit for StringRecorder {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if field.name() == "message" {
+            let message = format!("{value:?}");
+            self.message = Some(trim_debug_message(&message).to_string());
             if !self.display.is_empty() {
                 self.display = format!("{value:?}\n{}", self.display)
             } else {
@@ -62,6 +65,14 @@ impl core::default::Default for StringRecorder {
             is_following_args: false,
             show_fields: true,
             fields: HashMap::new(),
+            message: None,
         }
     }
+}
+
+fn trim_debug_message(message: &str) -> &str {
+    message
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(message)
 }

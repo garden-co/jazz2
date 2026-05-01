@@ -8,11 +8,11 @@
 //! ```
 
 mod commands;
-#[cfg(feature = "otel")]
-mod otel;
 
 use clap::{Parser, Subcommand};
 use jazz_tools::middleware::AuthConfig;
+#[cfg(feature = "otel")]
+use jazz_tools::otel;
 use jazz_tools::server::CatalogueAuthorityMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

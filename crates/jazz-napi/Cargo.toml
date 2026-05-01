@@ -10,14 +10,18 @@ crate-type = ["cdylib"]
 jazz_tools = { package = "jazz-tools", path = "../jazz-tools", version = "2.0.0-alpha.0", default-features = false, features = [
   "test-utils",
   "transport-websocket",
+  "otel-core",
 ] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 base64 = "0.22"
 napi = { version = "3", features = ["napi5", "serde-json", "async"] }
 napi-derive = "3"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_bytes = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]

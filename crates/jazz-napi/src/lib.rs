@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -355,11 +355,44 @@ struct DevServerStartOptions {
     catalogue_authority: Option<String>,
     catalogue_authority_url: Option<String>,
     catalogue_authority_admin_secret: Option<String>,
+    telemetry_collector_url: Option<String>,
 }
 
 fn parse_dev_server_start_options(options: JsonValue) -> napi::Result<DevServerStartOptions> {
     serde_json::from_value(options)
         .map_err(|error| napi::Error::from_reason(format!("Invalid DevServer options: {error}")))
+}
+
+static DEV_SERVER_OTEL_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
+    OnceLock::new();
+static DEV_SERVER_TELEMETRY_INIT: OnceLock<()> = OnceLock::new();
+
+fn init_dev_server_telemetry(collector_url: Option<&str>) {
+    let Some(collector_url) = collector_url else {
+        return;
+    };
+
+    DEV_SERVER_TELEMETRY_INIT.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let endpoint = jazz_tools::otel::normalize_otlp_traces_endpoint(collector_url);
+        let provider = jazz_tools::otel::init_tracer_provider_with_endpoint(
+            "jazz-dev-server",
+            Some(&endpoint),
+        );
+        let otel_layer = jazz_tools::otel::layer(&provider);
+        let filter = tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("jazz_tools=trace".parse().expect("valid tracing directive"))
+            .add_directive("tower_http=debug".parse().expect("valid tracing directive"));
+
+        if tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(filter).with(otel_layer),
+        )
+        .is_ok()
+        {
+            let _ = DEV_SERVER_OTEL_PROVIDER.set(provider);
+        }
+    });
 }
 
 /// Scheduler that schedules `batched_tick()` on the Node.js event loop via a
@@ -1494,11 +1527,12 @@ impl DevServer {
     #[napi(factory, ts_return_type = "Promise<DevServer>")]
     pub async fn start(
         #[napi(
-            ts_arg_type = "{ appId: string; port?: number; dataDir?: string; inMemory?: boolean; jwksUrl?: string; allowLocalFirstAuth?: boolean; backendSecret?: string; adminSecret?: string; catalogueAuthority?: 'local' | 'forward'; catalogueAuthorityUrl?: string; catalogueAuthorityAdminSecret?: string }"
+            ts_arg_type = "{ appId: string; port?: number; dataDir?: string; inMemory?: boolean; jwksUrl?: string; allowLocalFirstAuth?: boolean; backendSecret?: string; adminSecret?: string; catalogueAuthority?: 'local' | 'forward'; catalogueAuthorityUrl?: string; catalogueAuthorityAdminSecret?: string; telemetryCollectorUrl?: string }"
         )]
         options: JsonValue,
     ) -> napi::Result<Self> {
         let opts = parse_dev_server_start_options(options)?;
+        init_dev_server_telemetry(opts.telemetry_collector_url.as_deref());
 
         let app_id =
             AppId::from_string(&opts.app_id).unwrap_or_else(|_| AppId::from_name(&opts.app_id));

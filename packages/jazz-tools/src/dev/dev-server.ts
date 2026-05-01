@@ -30,6 +30,7 @@ export interface StartLocalJazzServerOptions {
   catalogueAuthority?: "local" | "forward";
   catalogueAuthorityUrl?: string;
   catalogueAuthorityAdminSecret?: string;
+  telemetryCollectorUrl?: string;
   enableLogs?: boolean;
 }
 
@@ -112,6 +113,7 @@ export async function startLocalJazzServer(
       catalogueAuthority: options.catalogueAuthority,
       catalogueAuthorityUrl: options.catalogueAuthorityUrl,
       catalogueAuthorityAdminSecret: options.catalogueAuthorityAdminSecret,
+      telemetryCollectorUrl: options.telemetryCollectorUrl,
     });
   } catch (error) {
     if (ownsPort) {
