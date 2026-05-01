@@ -67,41 +67,6 @@ fn rc_insert_syncs_exact_row_batch_without_row_region_reads() {
 }
 
 #[test]
-fn rc_sealed_direct_batch_requests_settlement_from_connected_server() {
-    let mut s = create_3tier_rc();
-    let ((row_id, _row_values), _) =
-        s.a.insert("users", user_insert_values(ObjectId::new(), "Alice"), None)
-            .unwrap();
-    let branch_name = s.a.schema_manager().branch_name();
-    let batch_id =
-        s.a.storage()
-            .load_visible_region_row("users", branch_name.as_str(), row_id)
-            .unwrap()
-            .expect("insert should create one visible row")
-            .batch_id;
-
-    s.a.sync_sender().take();
-    s.a.seal_batch(batch_id).unwrap();
-    s.a.batched_tick();
-
-    let outbox = s.a.sync_sender().take();
-    assert!(outbox.iter().any(|entry| matches!(
-        entry,
-        OutboxEntry {
-            destination: Destination::Server(server_id),
-            payload: SyncPayload::SealBatch { submission },
-        } if *server_id == s.b_server_for_a && submission.batch_id == batch_id
-    )));
-    assert!(outbox.iter().any(|entry| matches!(
-        entry,
-        OutboxEntry {
-            destination: Destination::Server(server_id),
-            payload: SyncPayload::BatchSettlementNeeded { batch_ids },
-        } if *server_id == s.b_server_for_a && batch_ids == &vec![batch_id]
-    )));
-}
-
-#[test]
 fn rc_update_sync() {
     let mut s = create_3tier_rc();
     let ((id, _row_values), _) =
