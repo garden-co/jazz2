@@ -1261,6 +1261,80 @@ describe("Worker Bridge with OPFS", () => {
     expect(mutationErrorSpy).not.toHaveBeenCalled();
   });
 
+  it("replays onMutationError after restart when the rejection was not previously delivered", async () => {
+    const syncServer = await publishSyncServerSchemaAndPermissions(
+      "sync-on-mutation-error-restart",
+      rejectAllPermissions,
+    );
+
+    const sharedLocalAuthToken = generateAuthSecret();
+    const dbName = uniqueDbName("sync-on-mutation-error-restart");
+    const dbBeforeRestart = track(
+      await createDb({
+        appId: syncServer.appId,
+        driver: { type: "persistent", dbName },
+        serverUrl: syncServer.serverUrl,
+        secret: sharedLocalAuthToken,
+      }),
+    );
+
+    const insertResult = dbBeforeRestart.insert(todos, {
+      title: "Rejected on restart",
+      done: false,
+    });
+    // Wait for the insert to be persisted locally before restarting
+    await insertResult.wait({ tier: "local" });
+
+    // Ensure the insert is not rejected before restarting
+    const clientBeforeRestart = (dbBeforeRestart as any).getClient(app.wasmSchema);
+    expect(
+      clientBeforeRestart.localBatchRecord(insertResult.batchId)?.latestSettlement,
+    ).not.toMatchObject({
+      kind: "rejected",
+    });
+
+    await dbBeforeRestart.shutdown();
+    untrack(dbBeforeRestart);
+
+    const dbAfterRestart = track(
+      await createDb({
+        appId: syncServer.appId,
+        driver: { type: "persistent", dbName },
+        serverUrl: syncServer.serverUrl,
+        secret: sharedLocalAuthToken,
+      }),
+    );
+
+    const mutationErrorSpy = vi.fn();
+    dbAfterRestart.onMutationError(mutationErrorSpy);
+
+    // Run a query to ensure both the in-memory and worker clients are initialized
+    // Also checks the insert was reverted
+    const todosAfterRestart = await dbAfterRestart.all(allTodos, { tier: "local" });
+    expect(todosAfterRestart.length).toBe(0);
+
+    await waitForCondition(
+      async () => mutationErrorSpy.mock.calls.length > 0,
+      5000,
+      "onMutationError handler should receive rejection after restart",
+    );
+    expect(mutationErrorSpy).toHaveBeenCalledWith({
+      code: "permission_denied",
+      reason: "Insert denied by policy on table todos",
+      batch: {
+        batchId: insertResult.batchId,
+        mode: "direct",
+        sealed: true,
+        latestSettlement: {
+          kind: "rejected",
+          batchId: insertResult.batchId,
+          code: "permission_denied",
+          reason: "Insert denied by policy on table todos",
+        },
+      },
+    });
+  });
+
   it("recovers sync after browser-side network loss with B in a separate context", async () => {
     const syncServer = await publishSyncServerSchemaAndPermissions("sync-recover");
     const sharedLocalAuthToken = generateAuthSecret();

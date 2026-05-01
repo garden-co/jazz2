@@ -314,6 +314,7 @@ export type SubscriptionCallback = (delta: RowDelta) => void;
 export interface ConnectSyncRuntimeOptions {
   useBinaryEncoding?: boolean;
   onAuthFailure?: (reason: AuthFailureReason) => void;
+  onRejectedBatchAcknowledged?: (batchId: string) => void;
 }
 
 /**
@@ -1266,6 +1267,9 @@ export class JazzClient {
    */
   private readonly mutationErrorListeners = new Set<(event: MutationErrorEvent) => void>();
   private readonly acknowledgedRejectedBatchErrors = new Map<string, PersistedWriteRejectedError>();
+  private readonly replayedRejectedBatchRecords = new Map<string, LocalBatchRecord>();
+  private readonly pendingReplayedRejectedBatchIds = new Set<string>();
+  private readonly onRejectedBatchAcknowledged?: (batchId: string) => void;
   private settlementPollTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private cachedRuntimeSchemaHash: string | null = null;
@@ -1313,6 +1317,7 @@ export class JazzClient {
     this.context = context;
     this.defaultDurabilityTier = defaultDurabilityTier;
     this.resolvedSession = this.resolveSessionFromContext();
+    this.onRejectedBatchAcknowledged = runtimeOptions?.onRejectedBatchAcknowledged;
 
     if (runtimeOptions?.onAuthFailure) {
       const handler = runtimeOptions.onAuthFailure;
@@ -1526,12 +1531,26 @@ export class JazzClient {
   }
 
   localBatchRecord(batchId: string): LocalBatchRecord | null {
-    return this.requireBatchRecordMethod("loadLocalBatchRecord")(batchId);
+    return (
+      this.requireBatchRecordMethod("loadLocalBatchRecord")(batchId) ??
+      this.replayedRejectedBatchRecords.get(batchId) ??
+      null
+    );
   }
 
   localBatchRecords(): LocalBatchRecord[] {
-    const records = this.requireBatchRecordMethod("loadLocalBatchRecords")();
-    return [...records].sort((left, right) => left.batchId.localeCompare(right.batchId));
+    const records = new Map(
+      this.requireBatchRecordMethod("loadLocalBatchRecords")().map((record) => [
+        record.batchId,
+        record,
+      ]),
+    );
+    for (const [batchId, record] of this.replayedRejectedBatchRecords) {
+      if (!records.has(batchId)) {
+        records.set(batchId, record);
+      }
+    }
+    return [...records.values()].sort((left, right) => left.batchId.localeCompare(right.batchId));
   }
 
   onMutationError(listener: (event: MutationErrorEvent) => void): () => void {
@@ -1548,11 +1567,46 @@ export class JazzClient {
 
   private acknowledgeRejectedBatchInternal(batchId: string): boolean {
     const rejection = rejectionFromSettlement(this.localBatchRecord(batchId)?.latestSettlement);
-    const acknowledged = this.requireBatchRecordMethod("acknowledgeRejectedBatch")(batchId);
+    const acknowledgedInRuntime = this.requireBatchRecordMethod("acknowledgeRejectedBatch")(
+      batchId,
+    );
+    const acknowledgedReplayed = this.replayedRejectedBatchRecords.delete(batchId);
+    this.pendingReplayedRejectedBatchIds.delete(batchId);
+    const acknowledged = acknowledgedInRuntime || acknowledgedReplayed;
     if (acknowledged && rejection) {
       this.acknowledgedRejectedBatchErrors.set(batchId, rejection);
     }
+    if (acknowledged) {
+      this.onRejectedBatchAcknowledged?.(batchId);
+    }
     return acknowledged;
+  }
+
+  hydrateLocalBatchRecords(records: readonly LocalBatchRecord[]): void {
+    const loadLocalBatchRecord = this.requireBatchRecordMethod("loadLocalBatchRecord");
+
+    for (const record of records) {
+      if (loadLocalBatchRecord(record.batchId)) {
+        continue;
+      }
+      this.replayedRejectedBatchRecords.set(record.batchId, record);
+    }
+  }
+
+  replayRejectedBatchRecord(record: LocalBatchRecord): void {
+    const runtimeRecord = this.requireBatchRecordMethod("loadLocalBatchRecord")(record.batchId);
+    if (runtimeRecord && !this.replayedRejectedBatchRecords.has(record.batchId)) {
+      return;
+    }
+    if (record.latestSettlement?.kind !== "rejected") {
+      return;
+    }
+
+    this.replayedRejectedBatchRecords.set(record.batchId, record);
+  }
+
+  markReplayedRejectedBatchDelivered(batchId: string): void {
+    this.pendingReplayedRejectedBatchIds.delete(batchId);
   }
 
   acknowledgeRejectedBatch(batchId: string): boolean {
@@ -2480,10 +2534,10 @@ export class JazzClient {
 
   private drainRejectedBatchIds(): string[] {
     const drainRejectedBatchIds = this.runtime.drainRejectedBatchIds;
-    if (!drainRejectedBatchIds) {
-      return [];
-    }
-    return [...new Set(drainRejectedBatchIds.call(this.runtime))].sort();
+    const runtimeBatchIds = drainRejectedBatchIds ? drainRejectedBatchIds.call(this.runtime) : [];
+    const replayedBatchIds = [...this.pendingReplayedRejectedBatchIds];
+    this.pendingReplayedRejectedBatchIds.clear();
+    return [...new Set([...runtimeBatchIds, ...replayedBatchIds])].sort();
   }
 
   waitForPersistedBatch(batchId: string, tier: DurabilityTier): Promise<void> {

@@ -359,9 +359,13 @@ fn build_schema_manager(
     let runtime_schema = jazz_tools::binding_support::parse_runtime_schema_input(schema_json)
         .map_err(|e| JsError::new(&format!("Invalid schema JSON: {}", e)))?;
     let node_tiers = parse_node_durability_tiers(tier)?;
+    let retain_replayable_client_batch_records = node_tiers.contains(&DurabilityTier::Local);
     let mut sync_manager = SyncManager::new();
     if !node_tiers.is_empty() {
         sync_manager = sync_manager.with_durability_tiers(node_tiers);
+    }
+    if retain_replayable_client_batch_records {
+        sync_manager = sync_manager.with_replayable_client_batch_records();
     }
     SchemaManager::new_with_policy_mode(
         sync_manager,
@@ -631,11 +635,15 @@ impl WasmRuntime {
         let schema = runtime_schema.schema;
         // Parse optional tier
         let node_tiers = parse_node_durability_tiers(tier.as_deref())?;
+        let retain_replayable_client_batch_records = node_tiers.contains(&DurabilityTier::Local);
 
         // Create sync manager
         let mut sync_manager = SyncManager::new();
         if !node_tiers.is_empty() {
             sync_manager = sync_manager.with_durability_tiers(node_tiers);
+        }
+        if retain_replayable_client_batch_records {
+            sync_manager = sync_manager.with_replayable_client_batch_records();
         }
 
         let app_id = AppId::from_string(app_id).unwrap_or_else(|_| AppId::from_name(app_id));

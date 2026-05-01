@@ -14,6 +14,7 @@ import type {
   WorkerLifecycleEvent,
   WorkerToMainMessage,
 } from "../worker/worker-protocol.js";
+import type { LocalBatchRecord } from "./client.js";
 import { createSyncOutboxRouter } from "./sync-transport.js";
 
 /**
@@ -59,6 +60,8 @@ interface WorkerBridgeState {
   syncBatchFlushQueued: boolean;
   peerSyncListener: ((batch: PeerSyncBatch) => void) | null;
   authFailureListener: ((reason: AuthFailureReason) => void) | null;
+  localBatchRecordsSyncListener: ((batches: LocalBatchRecord[]) => void) | null;
+  mutationErrorReplayListener: ((batch: LocalBatchRecord) => void) | null;
   serverPayloadForwarder: ((payload: Uint8Array) => void) | null;
 }
 
@@ -102,6 +105,8 @@ export class WorkerBridge {
       syncBatchFlushQueued: false,
       peerSyncListener: null,
       authFailureListener: null,
+      localBatchRecordsSyncListener: null,
+      mutationErrorReplayListener: null,
       serverPayloadForwarder: null,
     };
 
@@ -118,6 +123,10 @@ export class WorkerBridge {
         this.markUpstreamServerDisconnected();
       } else if (msg.type === "auth-failed") {
         this.state.authFailureListener?.(msg.reason);
+      } else if (msg.type === "local-batch-records-sync") {
+        this.state.localBatchRecordsSyncListener?.(msg.batches);
+      } else if (msg.type === "mutation-error-replay") {
+        this.state.mutationErrorReplayListener?.(msg.batch);
       } else if (msg.type === "peer-sync") {
         this.state.peerSyncListener?.({
           peerId: msg.peerId,
@@ -313,12 +322,25 @@ export class WorkerBridge {
     this.worker.postMessage({ type: "reconnect-upstream" });
   }
 
+  acknowledgeRejectedBatch(batchId: string): void {
+    if (this.isDisposedLike()) return;
+    this.worker.postMessage({ type: "acknowledge-rejected-batch", batchId });
+  }
+
   onPeerSync(listener: (batch: PeerSyncBatch) => void): void {
     this.state.peerSyncListener = listener;
   }
 
   onAuthFailure(listener: (reason: AuthFailureReason) => void): void {
     this.state.authFailureListener = listener;
+  }
+
+  onLocalBatchRecordsSync(listener: (batches: LocalBatchRecord[]) => void): void {
+    this.state.localBatchRecordsSyncListener = listener;
+  }
+
+  onMutationErrorReplay(listener: (batch: LocalBatchRecord) => void): void {
+    this.state.mutationErrorReplayListener = listener;
   }
 
   openPeer(peerId: string): void {
