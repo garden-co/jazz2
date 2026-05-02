@@ -1,0 +1,31 @@
+{
+  "name": "letter-canvas-react",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node ../../packages/jazz-tools/dist/cli.js validate && vite build",
+    "preview": "vite preview",
+    "test": "vitest run --config vitest.config.browser.ts"
+  },
+  "dependencies": {
+    "jazz-tools": "workspace:*",
+    "jazz-wasm": "workspace:*",
+    "qrcode.react": "^4.2.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "catalog:default",
+    "@vitest/browser": "catalog:default",
+    "@vitest/browser-playwright": "catalog:default",
+    "typescript": "catalog:default",
+    "vite": "catalog:default",
+    "vite-plugin-top-level-await": "catalog:default",
+    "vite-plugin-wasm": "catalog:default",
+    "vitest": "catalog:default"
+  }
+}
