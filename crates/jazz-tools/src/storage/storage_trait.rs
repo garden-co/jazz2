@@ -603,6 +603,10 @@ pub trait Storage {
         &mut self,
         settlement: &BatchSettlement,
     ) -> Result<(), StorageError> {
+        let settlement = match self.load_authoritative_batch_settlement(settlement.batch_id())? {
+            Some(existing) => existing.merged_with(settlement),
+            None => settlement.clone(),
+        };
         ensure_raw_table_header(
             self,
             AUTHORITATIVE_BATCH_SETTLEMENT_TABLE,
@@ -1027,20 +1031,15 @@ pub trait Storage {
             &row.bytes,
         )
         .map_err(|err| StorageError::IoError(format!("decode flat visible row: {err}")))?;
-        if entry
-            .current_row
-            .confirmed_tier
-            .is_some_and(|tier| tier >= required_tier)
-            || entry.batch_id_for_tier(required_tier).is_some()
-        {
-            return entry.materialize_preview_for_tier_with_storage(
-                self,
-                table,
-                row.user_descriptor.as_ref(),
-                required_tier,
-            );
+        let current_tier = row_confirmed_tier_with_batch_settlement(self, &entry.current_row)?;
+        if current_tier.is_some_and(|tier| tier >= required_tier) {
+            let mut current_row = entry.current_row.clone();
+            current_row.confirmed_tier = current_tier;
+            return Ok(Some(current_row));
         }
-        let history_rows = self.scan_history_region(table, branch, HistoryScan::Row { row_id })?;
+        let mut history_rows =
+            self.scan_history_region(table, branch, HistoryScan::Row { row_id })?;
+        apply_batch_settlement_tiers_to_rows(self, &mut history_rows)?;
         crate::row_histories::visible_row_preview_from_history_rows(
             row.user_descriptor.as_ref(),
             &history_rows,

@@ -1,10 +1,105 @@
 use super::*;
 use crate::batch_fate::LocalBatchMember;
 use crate::row_histories::RowState;
-use crate::row_histories::patch_row_batch_state;
 use crate::storage::metadata_from_row_locator;
 
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
+    fn sync_receive_stats_mut(
+        &mut self,
+        server_id: crate::sync_manager::ServerId,
+    ) -> &mut SyncReceiveStats {
+        self.sync_receive_stats
+            .entry(server_id)
+            .or_insert_with(SyncReceiveStats::new)
+    }
+
+    fn record_sequenced_sync_received(
+        &mut self,
+        server_id: crate::sync_manager::ServerId,
+        sequence: u64,
+        payload: &crate::sync_manager::SyncPayload,
+    ) {
+        let kind = payload.variant_name();
+        let stats = self.sync_receive_stats_mut(server_id);
+        stats.received_total += 1;
+        stats.highest_received_seq = stats.highest_received_seq.max(sequence);
+        *stats.received_by_type.entry(kind).or_default() += 1;
+        if let crate::sync_manager::SyncPayload::BatchSettlement { settlement } = payload {
+            *stats
+                .received_settlement_batches
+                .entry(settlement.batch_id())
+                .or_default() += 1;
+        }
+
+        if matches!(
+            payload,
+            crate::sync_manager::SyncPayload::QuerySettled { .. }
+        ) || stats.received_total >= stats.next_log_at
+        {
+            tracing::warn!(
+                target: "jazz_timing",
+                ?server_id,
+                sequence,
+                kind,
+                elapsed_ms = stats.elapsed_ms(),
+                received_total = stats.received_total,
+                applied_total = stats.applied_total,
+                highest_received_seq = stats.highest_received_seq,
+                highest_applied_seq = stats.highest_applied_seq,
+                received_by_type = ?stats.received_by_type,
+                settlement_unique_batches = stats.received_settlement_batches.len(),
+                settlement_duplicate_messages = stats.received_settlement_duplicates(),
+                top_settlement_duplicates = ?stats.top_received_settlement_duplicates(),
+                "[jazz timing] runtime sequenced sync received summary"
+            );
+            while stats.received_total >= stats.next_log_at {
+                stats.next_log_at += 500;
+            }
+        }
+    }
+
+    fn record_sequenced_sync_applied(
+        &mut self,
+        server_id: crate::sync_manager::ServerId,
+        sequence: u64,
+        payload: &crate::sync_manager::SyncPayload,
+    ) {
+        let kind = payload.variant_name();
+        let stats = self.sync_receive_stats_mut(server_id);
+        stats.applied_total += 1;
+        stats.highest_applied_seq = stats.highest_applied_seq.max(sequence);
+        *stats.applied_by_type.entry(kind).or_default() += 1;
+        if let crate::sync_manager::SyncPayload::BatchSettlement { settlement } = payload {
+            *stats
+                .applied_settlement_batches
+                .entry(settlement.batch_id())
+                .or_default() += 1;
+        }
+
+        if matches!(
+            payload,
+            crate::sync_manager::SyncPayload::QuerySettled { .. }
+        ) || stats.applied_total.is_multiple_of(500)
+        {
+            tracing::warn!(
+                target: "jazz_timing",
+                ?server_id,
+                sequence,
+                kind,
+                elapsed_ms = stats.elapsed_ms(),
+                received_total = stats.received_total,
+                applied_total = stats.applied_total,
+                highest_received_seq = stats.highest_received_seq,
+                highest_applied_seq = stats.highest_applied_seq,
+                applied_by_type = ?stats.applied_by_type,
+                settlement_unique_batches = stats.applied_settlement_batches.len(),
+                settlement_duplicate_messages = stats.applied_settlement_duplicates(),
+                top_settlement_duplicates = ?stats.top_applied_settlement_duplicates(),
+                "[jazz timing] runtime sequenced sync applied summary"
+            );
+        }
+    }
+
     fn local_batch_rows(
         &self,
         batch_id: crate::row_histories::BatchId,
@@ -97,6 +192,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }
 
         if let Some(acked_tier) = settlement.confirmed_tier() {
+            self.schema_manager
+                .query_manager_mut()
+                .mark_subscriptions_visibility_recompute_for_tier(acked_tier);
             match &settlement {
                 crate::batch_fate::BatchSettlement::DurableDirect {
                     visible_members, ..
@@ -105,30 +203,13 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     visible_members, ..
                 } => {
                     for member in visible_members {
-                        match patch_row_batch_state(
-                            &mut self.storage,
-                            member.object_id,
-                            &member.branch_name,
-                            member.batch_id,
-                            None,
-                            Some(acked_tier),
-                        ) {
-                            Ok(Some(update)) => self
-                                .schema_manager
+                        if let Ok(Some(locator)) = self.storage.load_row_locator(member.object_id) {
+                            self.schema_manager
                                 .query_manager_mut()
-                                .enqueue_row_visibility_change(update),
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::debug!(
-                                    object_id = %member.object_id,
-                                    branch_name = %member.branch_name,
-                                    batch_id = ?member.batch_id,
-                                    ?acked_tier,
-                                    ?error,
-                                    "ignoring batch settlement tier for local row batch that is not present"
+                                .mark_local_row_updated_in_subscriptions(
+                                    locator.table.as_str(),
+                                    member.object_id,
                                 );
-                                continue;
-                            }
                         }
                         self.durability.record_ack(
                             crate::sync_manager::RowBatchKey::new(
@@ -315,13 +396,54 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                         >= pending_settled.through_seq
                 });
                 if is_ready {
+                    let stats = pending_settled
+                        .server_id
+                        .and_then(|server_id| self.sync_receive_stats.get(&server_id));
+                    tracing::warn!(
+                        target: "jazz_timing",
+                        query_id = pending_settled.query_id.0,
+                        ?pending_settled.tier,
+                        ?pending_settled.server_id,
+                        through_seq = pending_settled.through_seq,
+                        received_total = stats.map(|stats| stats.received_total).unwrap_or(0),
+                        applied_total = stats.map(|stats| stats.applied_total).unwrap_or(0),
+                        highest_received_seq = stats.map(|stats| stats.highest_received_seq).unwrap_or(0),
+                        highest_applied_seq = stats.map(|stats| stats.highest_applied_seq).unwrap_or(0),
+                        received_by_type = ?stats.map(|stats| &stats.received_by_type),
+                        applied_by_type = ?stats.map(|stats| &stats.applied_by_type),
+                        "[jazz timing] runtime QuerySettled watermark ready"
+                    );
                     ready.push(pending_settled);
                 } else {
+                    let applied_seq = pending_settled
+                        .server_id
+                        .and_then(|server_id| self.last_applied_server_seq.get(&server_id).copied())
+                        .unwrap_or(0);
+                    let stats = pending_settled
+                        .server_id
+                        .and_then(|server_id| self.sync_receive_stats.get(&server_id));
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        query_id = pending_settled.query_id.0,
+                        ?pending_settled.tier,
+                        ?pending_settled.server_id,
+                        through_seq = pending_settled.through_seq,
+                        applied_seq,
+                        seq_lag = pending_settled.through_seq.saturating_sub(applied_seq),
+                        highest_received_seq = stats.map(|stats| stats.highest_received_seq).unwrap_or(0),
+                        highest_applied_seq = stats.map(|stats| stats.highest_applied_seq).unwrap_or(0),
+                        "[jazz timing] runtime QuerySettled watermark blocked"
+                    );
                     blocked.push(pending_settled);
                 }
             }
 
             if !blocked.is_empty() {
+                tracing::debug!(
+                    target: "jazz_timing",
+                    count = blocked.len(),
+                    "[jazz timing] runtime requeueing blocked QuerySettled messages"
+                );
                 self.schema_manager
                     .query_manager_mut()
                     .sync_manager_mut()
@@ -335,6 +457,12 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             {
                 let query_manager = self.schema_manager.query_manager_mut();
                 for pending_settled in ready_query_settled {
+                    tracing::warn!(
+                        target: "jazz_timing",
+                        query_id = pending_settled.query_id.0,
+                        ?pending_settled.tier,
+                        "[jazz timing] runtime applying ready QuerySettled"
+                    );
                     query_manager
                         .apply_query_settled(pending_settled.query_id, pending_settled.tier);
                 }
@@ -511,6 +639,60 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .take_outbox();
         if !outbox.is_empty() {
             debug!(count = outbox.len(), "{log_message}");
+            let mut row_batches = 0usize;
+            let mut query_subscriptions = 0usize;
+            let mut query_settled = 0usize;
+            let mut batch_settlements = 0usize;
+            let mut settlement_batches =
+                std::collections::HashMap::<crate::row_histories::BatchId, usize>::new();
+            let mut other = 0usize;
+            for msg in &outbox {
+                match &msg.payload {
+                    crate::sync_manager::SyncPayload::RowBatchCreated { .. }
+                    | crate::sync_manager::SyncPayload::RowBatchNeeded { .. } => {
+                        row_batches += 1;
+                    }
+                    crate::sync_manager::SyncPayload::QuerySubscription { .. } => {
+                        query_subscriptions += 1;
+                    }
+                    crate::sync_manager::SyncPayload::QuerySettled { .. } => {
+                        query_settled += 1;
+                    }
+                    crate::sync_manager::SyncPayload::BatchSettlement { settlement } => {
+                        batch_settlements += 1;
+                        *settlement_batches.entry(settlement.batch_id()).or_default() += 1;
+                    }
+                    _ => {
+                        other += 1;
+                    }
+                }
+            }
+            let settlement_duplicate_messages: usize = settlement_batches
+                .values()
+                .map(|count| count.saturating_sub(1))
+                .sum();
+            let mut top_settlement_duplicates: Vec<_> = settlement_batches
+                .iter()
+                .filter_map(|(batch_id, count)| {
+                    let duplicates = count.saturating_sub(1);
+                    (duplicates > 0).then_some((*batch_id, duplicates))
+                })
+                .collect();
+            top_settlement_duplicates.sort_by(|(_, left), (_, right)| right.cmp(left));
+            top_settlement_duplicates.truncate(8);
+            tracing::warn!(
+                target: "jazz_timing",
+                count = outbox.len(),
+                row_batches,
+                query_subscriptions,
+                query_settled,
+                batch_settlements,
+                settlement_unique_batches = settlement_batches.len(),
+                settlement_duplicate_messages,
+                top_settlement_duplicates = ?top_settlement_duplicates,
+                other,
+                "[jazz timing] runtime flushing outbox"
+            );
         }
 
         let mut unsent = Vec::new();
@@ -551,6 +733,80 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             while let Some(message) = handle.try_recv_inbound() {
                 inbound.push(message);
             }
+        }
+
+        if !inbound.is_empty() {
+            let mut first_seq = None;
+            let mut last_seq = None;
+            let mut row_batches = 0usize;
+            let mut query_settled = 0usize;
+            let mut batch_settlements = 0usize;
+            let mut settlement_batches =
+                std::collections::HashMap::<crate::row_histories::BatchId, usize>::new();
+            let mut other = 0usize;
+
+            for message in &inbound {
+                match message {
+                    crate::transport_manager::TransportInbound::Sync { entry, sequence } => {
+                        if let Some(sequence) = *sequence {
+                            first_seq = Some(
+                                first_seq.map_or(sequence, |current: u64| current.min(sequence)),
+                            );
+                            last_seq = Some(
+                                last_seq.map_or(sequence, |current: u64| current.max(sequence)),
+                            );
+                        }
+                        match &entry.payload {
+                            crate::sync_manager::SyncPayload::RowBatchCreated { .. }
+                            | crate::sync_manager::SyncPayload::RowBatchNeeded { .. } => {
+                                row_batches += 1;
+                            }
+                            crate::sync_manager::SyncPayload::QuerySettled { .. } => {
+                                query_settled += 1;
+                            }
+                            crate::sync_manager::SyncPayload::BatchSettlement { settlement } => {
+                                batch_settlements += 1;
+                                *settlement_batches.entry(settlement.batch_id()).or_default() += 1;
+                            }
+                            _ => {
+                                other += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        other += 1;
+                    }
+                }
+            }
+            let settlement_duplicate_messages: usize = settlement_batches
+                .values()
+                .map(|count| count.saturating_sub(1))
+                .sum();
+            let mut top_settlement_duplicates: Vec<_> = settlement_batches
+                .iter()
+                .filter_map(|(batch_id, count)| {
+                    let duplicates = count.saturating_sub(1);
+                    (duplicates > 0).then_some((*batch_id, duplicates))
+                })
+                .collect();
+            top_settlement_duplicates.sort_by(|(_, left), (_, right)| right.cmp(left));
+            top_settlement_duplicates.truncate(8);
+
+            tracing::warn!(
+                target: "jazz_timing",
+                %server_id,
+                count = inbound.len(),
+                ?first_seq,
+                ?last_seq,
+                row_batches,
+                query_settled,
+                batch_settlements,
+                settlement_unique_batches = settlement_batches.len(),
+                settlement_duplicate_messages,
+                top_settlement_duplicates = ?top_settlement_duplicates,
+                other,
+                "[jazz timing] runtime drained transport inbound"
+            );
         }
 
         for message in inbound {
@@ -642,6 +898,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 if msg.payload.writes_storage() {
                     self.mark_storage_write_pending_flush();
                 }
+                self.record_sequenced_sync_applied(server_id, sequence, &msg.payload);
                 self.push_sync_inbox(msg);
                 applied_messages += 1;
                 last_applied = sequence;
@@ -702,6 +959,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     tracer.record_incoming(&message.source, name, &message.payload);
                 }
 
+                self.record_sequenced_sync_received(server_id, sequence, &message.payload);
                 self.parked_sync_messages_by_server_seq
                     .entry(server_id)
                     .or_default()
@@ -719,6 +977,17 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .insert(server_id, next_sequence);
         self.last_applied_server_seq
             .insert(server_id, next_sequence.saturating_sub(1));
+        {
+            let stats = self.sync_receive_stats_mut(server_id);
+            stats.highest_applied_seq = next_sequence.saturating_sub(1);
+            tracing::warn!(
+                target: "jazz_timing",
+                ?server_id,
+                next_sequence,
+                highest_applied_seq = stats.highest_applied_seq,
+                "[jazz timing] runtime server stream sequence initialized"
+            );
+        }
         if let Some(buffered) = self.parked_sync_messages_by_server_seq.get_mut(&server_id) {
             buffered.retain(|seq, _| *seq >= next_sequence);
         }

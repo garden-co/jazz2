@@ -40,6 +40,22 @@ pub(super) struct ResolvedSchemaRow {
 
 const SCHEMA_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(not(target_arch = "wasm32"))]
+fn timing_now() -> Option<Instant> {
+    Some(Instant::now())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timing_now() -> Option<Instant> {
+    None
+}
+
+fn timing_elapsed_ms(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| started.elapsed().as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub(super) struct RowTransformContext<'a> {
     pub(super) table: &'a str,
     pub(super) branch_schema_map:
@@ -759,14 +775,33 @@ impl QueryManager {
     /// 3. Set the scope in SyncManager (which triggers initial sync)
     pub(super) fn process_pending_query_subscriptions<H: Storage>(&mut self, storage: &mut H) {
         let pending = self.sync_manager.take_pending_query_subscriptions();
+        if !pending.is_empty() {
+            tracing::warn!(
+                target: "jazz_timing",
+                count = pending.len(),
+                "[jazz timing] server pending query subscriptions"
+            );
+        }
         let mut deferred = Vec::new();
         let mut schema_warning_notifications = Vec::new();
         let mut settled_notifications = Vec::new();
 
         for sub in pending {
+            let timing_started = timing_now();
+            let query_id_for_timing = sub.query_id;
+            let client_id_for_timing = sub.client_id;
+            let table_for_timing = sub.query.table.as_str().to_string();
             let Some((schema_for_compile, subscription_context)) =
                 self.build_server_subscription_context(&sub.query)
             else {
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    elapsed_ms = timing_elapsed_ms(timing_started),
+                    "[jazz timing] server subscription deferred: missing schema context"
+                );
                 deferred.push(sub);
                 continue;
             };
@@ -822,6 +857,14 @@ impl QueryManager {
                     "query_compilation_failed",
                     reason,
                 );
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    elapsed_ms = timing_elapsed_ms(timing_started),
+                    "[jazz timing] server subscription rejected: compile failed"
+                );
                 continue;
             };
 
@@ -838,6 +881,7 @@ impl QueryManager {
             let mut schema_warnings = SchemaWarningAccumulator::default();
             let include_deleted = sub.query.include_deleted;
             {
+                let settle_started = timing_now();
                 let row_loader =
                     |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
                         Self::load_visible_row_for_query(
@@ -859,6 +903,14 @@ impl QueryManager {
                     };
 
                 let _delta = graph.settle(storage_ref, row_loader);
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    elapsed_ms = timing_elapsed_ms(settle_started),
+                    "[jazz timing] server subscription initial graph settled"
+                );
             }
             let mut reported_schema_warnings = HashSet::new();
             let new_schema_warnings = Self::finalize_schema_warnings(
@@ -878,8 +930,9 @@ impl QueryManager {
             let scope = if self
                 .client_bypasses_authorization_filtering(sub.client_id, session_for_policy.as_ref())
             {
+                let scope_started = timing_now();
                 let result_scope = graph.sync_scope_object_ids();
-                Some(
+                let scope = Some(
                     if sync_policy_context_rows || !policy_context_tables.is_empty() {
                         Self::scope_with_policy_context_rows_for_tables(
                             &result_scope,
@@ -890,15 +943,37 @@ impl QueryManager {
                     } else {
                         result_scope
                     },
-                )
+                );
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    elapsed_ms = timing_elapsed_ms(scope_started),
+                    scope_size = scope.as_ref().map(|scope| scope.len()).unwrap_or(0),
+                    "[jazz timing] server subscription scope computed: bypass auth"
+                );
+                scope
             } else {
-                self.authorized_scope_from_graph_if_available(
+                let scope_started = timing_now();
+                let scope = self.authorized_scope_from_graph_if_available(
                     storage_ref,
                     &graph,
                     &subscription_context,
                     &branch_schema_map,
                     session_for_policy.as_ref(),
-                )
+                );
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    elapsed_ms = timing_elapsed_ms(scope_started),
+                    scope_ready = scope.is_some(),
+                    scope_size = scope.as_ref().map(|scope| scope.len()).unwrap_or(0),
+                    "[jazz timing] server subscription authorized scope computed"
+                );
+                scope
             };
             if let Some(scope) = scope.as_ref() {
                 // Set scope in SyncManager (triggers initial sync)
@@ -917,6 +992,16 @@ impl QueryManager {
                     .sync_manager
                     .max_local_durability_tier()
                     .unwrap_or(DurabilityTier::Local);
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %client_id_for_timing,
+                    query_id = query_id_for_timing.0,
+                    table = %table_for_timing,
+                    ?settled_tier,
+                    scope_size = scope.len(),
+                    elapsed_ms = timing_elapsed_ms(timing_started),
+                    "[jazz timing] server subscription initial QuerySettled queued"
+                );
                 settled_notifications.push((
                     sub.client_id,
                     sub.query_id,
@@ -954,6 +1039,16 @@ impl QueryManager {
                     reported_schema_warnings,
                 },
             );
+
+            tracing::warn!(
+                target: "jazz_timing",
+                %client_id_for_timing,
+                query_id = query_id_for_timing.0,
+                table = %table_for_timing,
+                settled_once,
+                elapsed_ms = timing_elapsed_ms(timing_started),
+                "[jazz timing] server subscription processed"
+            );
         }
 
         for (client_id, warning) in schema_warning_notifications {
@@ -961,6 +1056,14 @@ impl QueryManager {
         }
 
         for (client_id, query_id, tier, scope) in settled_notifications {
+            tracing::warn!(
+                target: "jazz_timing",
+                %client_id,
+                query_id = query_id.0,
+                ?tier,
+                scope_size = scope.len(),
+                "[jazz timing] server emitting QuerySettled"
+            );
             self.sync_manager
                 .emit_query_settled(client_id, query_id, tier, &scope);
         }
@@ -1018,8 +1121,16 @@ impl QueryManager {
             Vec::new();
 
         let subscription_keys: Vec<_> = self.server_subscriptions.keys().copied().collect();
+        if !subscription_keys.is_empty() {
+            tracing::debug!(
+                target: "jazz_timing",
+                count = subscription_keys.len(),
+                "[jazz timing] server settling active subscriptions"
+            );
+        }
 
         for (client_id, query_id) in subscription_keys {
+            let timing_started = timing_now();
             let Some(mut sub) = self.server_subscriptions.remove(&(client_id, query_id)) else {
                 continue;
             };
@@ -1032,6 +1143,7 @@ impl QueryManager {
             // Row loader for this subscription
             let new_scope = {
                 {
+                    let settle_started = timing_now();
                     let row_loader =
                         |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
                             Self::load_visible_row_for_query(
@@ -1053,6 +1165,14 @@ impl QueryManager {
                         };
 
                     let _delta = sub.graph.settle(storage, row_loader);
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        %client_id,
+                        query_id = query_id.0,
+                        table = %table,
+                        elapsed_ms = timing_elapsed_ms(settle_started),
+                        "[jazz timing] server active subscription graph settled"
+                    );
                 }
                 let new_schema_warnings = Self::finalize_schema_warnings(
                     &mut sub.reported_schema_warnings,
@@ -1068,8 +1188,9 @@ impl QueryManager {
                 let policy_context_tables =
                     Self::merged_policy_context_tables(&sub.graph, &sub.policy_context_tables);
                 if self.client_bypasses_authorization_filtering(client_id, sub.session.as_ref()) {
+                    let scope_started = timing_now();
                     let result_scope = sub.graph.sync_scope_object_ids();
-                    Some(
+                    let scope = Some(
                         if self.should_sync_policy_context_rows(client_id, sub.session.as_ref())
                             || !policy_context_tables.is_empty()
                         {
@@ -1082,15 +1203,37 @@ impl QueryManager {
                         } else {
                             result_scope
                         },
-                    )
+                    );
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        %client_id,
+                        query_id = query_id.0,
+                        table = %table,
+                        elapsed_ms = timing_elapsed_ms(scope_started),
+                        scope_size = scope.as_ref().map(|scope| scope.len()).unwrap_or(0),
+                        "[jazz timing] server active subscription scope computed: bypass auth"
+                    );
+                    scope
                 } else {
-                    self.authorized_scope_from_graph_if_available(
+                    let scope_started = timing_now();
+                    let scope = self.authorized_scope_from_graph_if_available(
                         storage,
                         &sub.graph,
                         &sub.schema_context,
                         &branch_schema_map,
                         sub.session.as_ref(),
-                    )
+                    );
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        %client_id,
+                        query_id = query_id.0,
+                        table = %table,
+                        elapsed_ms = timing_elapsed_ms(scope_started),
+                        scope_ready = scope.is_some(),
+                        scope_size = scope.as_ref().map(|scope| scope.len()).unwrap_or(0),
+                        "[jazz timing] server active subscription authorized scope computed"
+                    );
+                    scope
                 }
             };
             let scope_unavailable = new_scope.is_none();
@@ -1116,6 +1259,16 @@ impl QueryManager {
                         .sync_manager
                         .max_local_durability_tier()
                         .unwrap_or(DurabilityTier::Local);
+                    tracing::warn!(
+                        target: "jazz_timing",
+                        %client_id,
+                        query_id = query_id.0,
+                        table = %table,
+                        ?settled_tier,
+                        elapsed_ms = timing_elapsed_ms(timing_started),
+                        scope_size = new_scope.len(),
+                        "[jazz timing] server active subscription first QuerySettled queued"
+                    );
                     settled_notifications.push((client_id, query_id, settled_tier, new_scope));
                 } else if scope_changed {
                     let settled_tier = self
@@ -1132,10 +1285,13 @@ impl QueryManager {
             }
 
             if scope_unavailable {
-                tracing::trace!(
+                tracing::debug!(
+                    target: "jazz_timing",
                     ?query_id,
                     %client_id,
-                    "server subscription scope unavailable; holding QuerySettled"
+                    table = %table,
+                    elapsed_ms = timing_elapsed_ms(timing_started),
+                    "[jazz timing] server subscription scope unavailable; holding QuerySettled"
                 );
             }
 
@@ -1155,6 +1311,14 @@ impl QueryManager {
 
         // Emit QuerySettled notifications
         for (client_id, query_id, tier, scope) in settled_notifications {
+            tracing::warn!(
+                target: "jazz_timing",
+                %client_id,
+                query_id = query_id.0,
+                ?tier,
+                scope_size = scope.len(),
+                "[jazz timing] server emitting active QuerySettled"
+            );
             self.sync_manager
                 .emit_query_settled(client_id, query_id, tier, &scope);
         }

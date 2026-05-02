@@ -22,6 +22,77 @@ enum SealedBatchMode {
 }
 
 impl SyncManager {
+    fn queue_batch_durability_ack_to_server(
+        &mut self,
+        server_id: ServerId,
+        tier: DurabilityTier,
+        row: &StoredRowBatch,
+        branch_name: BranchName,
+    ) {
+        if !row.state.is_visible() {
+            return;
+        }
+
+        let member = VisibleBatchMember {
+            object_id: row.row_id,
+            branch_name,
+            batch_id: row.batch_id,
+        };
+        let is_transactional = matches!(row.state, RowState::VisibleTransactional);
+
+        for entry in self.outbox.iter_mut().rev() {
+            if entry.destination != Destination::Server(server_id) {
+                continue;
+            }
+            let SyncPayload::BatchSettlement { settlement } = &mut entry.payload else {
+                continue;
+            };
+
+            match settlement {
+                BatchSettlement::DurableDirect {
+                    batch_id,
+                    confirmed_tier,
+                    visible_members,
+                } if !is_transactional && *batch_id == row.batch_id && *confirmed_tier == tier => {
+                    if !visible_members.contains(&member) {
+                        visible_members.push(member);
+                    }
+                    return;
+                }
+                BatchSettlement::AcceptedTransaction {
+                    batch_id,
+                    confirmed_tier,
+                    visible_members,
+                } if is_transactional && *batch_id == row.batch_id && *confirmed_tier == tier => {
+                    if !visible_members.contains(&member) {
+                        visible_members.push(member);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let settlement = if is_transactional {
+            BatchSettlement::AcceptedTransaction {
+                batch_id: row.batch_id,
+                confirmed_tier: tier,
+                visible_members: vec![member],
+            }
+        } else {
+            BatchSettlement::DurableDirect {
+                batch_id: row.batch_id,
+                confirmed_tier: tier,
+                visible_members: vec![member],
+            }
+        };
+
+        self.outbox.push(OutboxEntry {
+            destination: Destination::Server(server_id),
+            payload: SyncPayload::BatchSettlement { settlement },
+        });
+    }
+
     fn validate_sealed_batch_submission(
         &self,
         submission: &SealedBatchSubmission,
@@ -291,13 +362,15 @@ impl SyncManager {
         storage: &mut H,
         metadata: Option<RowMetadata>,
         mut row: StoredRowBatch,
+        record_local_settlement: bool,
     ) -> Option<AppliedRowBatch> {
-        if let Some(local_tier) = self.max_local_durability_tier() {
-            row.confirmed_tier = Some(match row.confirmed_tier {
-                Some(existing) => existing.max(local_tier),
-                None => local_tier,
-            });
-        }
+        let authoritative_tier = match (row.confirmed_tier, self.max_local_durability_tier()) {
+            (Some(incoming), Some(local)) => Some(incoming.max(local)),
+            (Some(incoming), None) => Some(incoming),
+            (None, Some(local)) => Some(local),
+            (None, None) => None,
+        };
+        row.confirmed_tier = None;
 
         let metadata = self.row_metadata_from_payload(storage, &row, metadata.as_ref())?;
         self.ensure_object_metadata(storage, row.row_id, metadata.clone());
@@ -315,6 +388,37 @@ impl SyncManager {
                     return None;
                 }
             };
+        if record_local_settlement
+            && let Some(confirmed_tier) = authoritative_tier
+            && row.state.is_visible()
+        {
+            let visible_members = vec![VisibleBatchMember {
+                object_id: row.row_id,
+                branch_name,
+                batch_id: row.batch_id,
+            }];
+            let settlement = match row.state {
+                RowState::VisibleDirect => BatchSettlement::DurableDirect {
+                    batch_id: row.batch_id,
+                    confirmed_tier,
+                    visible_members,
+                },
+                RowState::VisibleTransactional => BatchSettlement::AcceptedTransaction {
+                    batch_id: row.batch_id,
+                    confirmed_tier,
+                    visible_members,
+                },
+                RowState::StagingPending | RowState::Superseded | RowState::Rejected => {
+                    unreachable!("row.state.is_visible() guarded non-visible states")
+                }
+            };
+            if self
+                .persist_authoritative_batch_settlement(storage, &settlement)
+                .is_ok()
+            {
+                self.pending_batch_settlements.push(settlement.clone());
+            }
+        }
 
         Some(AppliedRowBatch {
             metadata,
@@ -333,6 +437,10 @@ impl SyncManager {
         confirmed_tier: Option<DurabilityTier>,
     ) {
         if confirmed_tier.is_none() && state.is_none() {
+            return;
+        }
+
+        if state.is_none() && confirmed_tier.is_some() {
             return;
         }
 
@@ -447,6 +555,40 @@ impl SyncManager {
                             visible_members,
                         })
                     }
+                }
+            })
+            .or_else(|| {
+                let confirmed_tier = confirmed_tier?;
+                let row_locator = storage.load_row_locator(row_id).ok().flatten()?;
+                let row = storage
+                    .load_history_row_batch(
+                        row_locator.table.as_str(),
+                        branch_name.as_str(),
+                        row_id,
+                        batch_id,
+                    )
+                    .ok()
+                    .flatten()?;
+                if !row.state.is_visible() {
+                    return None;
+                }
+                let visible_members = vec![VisibleBatchMember {
+                    object_id: row_id,
+                    branch_name,
+                    batch_id,
+                }];
+                match row.state {
+                    RowState::VisibleDirect => Some(BatchSettlement::DurableDirect {
+                        batch_id,
+                        confirmed_tier,
+                        visible_members,
+                    }),
+                    RowState::VisibleTransactional => Some(BatchSettlement::AcceptedTransaction {
+                        batch_id,
+                        confirmed_tier,
+                        visible_members,
+                    }),
+                    RowState::StagingPending | RowState::Superseded | RowState::Rejected => None,
                 }
             })
     }
@@ -1033,25 +1175,25 @@ impl SyncManager {
             | SyncPayload::RowBatchNeeded { metadata, row } => {
                 let object_id = row.row_id;
                 let branch_name = BranchName::new(&row.branch);
+                let incoming_confirmed_tier = row.confirmed_tier;
                 tracing::debug!(
                     %object_id,
                     %branch_name,
                     "server→row-batch payload"
                 );
-                if let Some(applied) = self.apply_row_updated(storage, metadata, row.clone()) {
-                    let batch_id = applied.row.batch_id;
-
-                    for tier in self.my_tiers.iter().copied() {
-                        self.outbox.push(OutboxEntry {
-                            destination: Destination::Server(server_id),
-                            payload: SyncPayload::RowBatchStateChanged {
-                                row_id: object_id,
-                                branch_name,
-                                batch_id,
-                                state: None,
-                                confirmed_tier: Some(tier),
-                            },
-                        });
+                if let Some(applied) = self.apply_row_updated(storage, metadata, row.clone(), true)
+                {
+                    let local_tiers = self.my_tiers.iter().copied().collect::<Vec<_>>();
+                    for tier in local_tiers {
+                        if incoming_confirmed_tier.is_some_and(|confirmed| confirmed >= tier) {
+                            continue;
+                        }
+                        self.queue_batch_durability_ack_to_server(
+                            server_id,
+                            tier,
+                            &applied.row,
+                            branch_name,
+                        );
                     }
 
                     if let Some(update) = applied.visibility_change {
@@ -1105,6 +1247,10 @@ impl SyncManager {
                         .is_ok()
                 });
                 if let Some(settlement) = persisted_settlement.clone() {
+                    if let Some(tier) = confirmed_tier {
+                        self.received_row_batch_acks
+                            .push((RowBatchKey::new(row_id, branch_name, batch_id), tier));
+                    }
                     self.pending_batch_settlements.push(settlement);
                 }
                 for cid in interested {
@@ -1177,6 +1323,21 @@ impl SyncManager {
                 scope,
                 through_seq,
             } => {
+                let relay_client_count = self
+                    .query_origin
+                    .get(&query_id)
+                    .map(|clients| clients.len())
+                    .unwrap_or(0);
+                tracing::warn!(
+                    target: "jazz_timing",
+                    %server_id,
+                    query_id = query_id.0,
+                    ?tier,
+                    scope_size = scope.len(),
+                    through_seq,
+                    relay_client_count,
+                    "[jazz timing] server QuerySettled received for relay"
+                );
                 let scope_set: HashSet<(ObjectId, BranchName)> = scope.iter().copied().collect();
                 let scope_changed = self
                     .remote_query_scopes
@@ -1200,6 +1361,16 @@ impl SyncManager {
                 // Relay to interested clients
                 if let Some(clients) = self.query_origin.get(&query_id) {
                     for &cid in clients {
+                        tracing::warn!(
+                            target: "jazz_timing",
+                            %server_id,
+                            %cid,
+                            query_id = query_id.0,
+                            ?tier,
+                            scope_size = scope.len(),
+                            through_seq,
+                            "[jazz timing] server QuerySettled relayed to client"
+                        );
                         self.outbox.push(OutboxEntry {
                             destination: Destination::Client(cid),
                             payload: SyncPayload::QuerySettled {
@@ -1610,7 +1781,8 @@ impl SyncManager {
                     .or_default()
                     .insert(client_id);
 
-                if let Some(applied) = self.apply_row_updated(storage, metadata, row.clone()) {
+                if let Some(applied) = self.apply_row_updated(storage, metadata, row.clone(), false)
+                {
                     if let Some(table) = applied.metadata.get(MetadataKey::Table.as_str()).cloned()
                     {
                         self.forward_row_batch_to_servers_with_storage(

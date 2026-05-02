@@ -796,20 +796,14 @@ impl Storage for MemoryStorage {
             return Ok(None);
         };
         let context = resolve_history_row_write_context(self, table, &entry.current_row)?;
-        if entry
-            .current_row
-            .confirmed_tier
-            .is_some_and(|tier| tier >= required_tier)
-            || entry.batch_id_for_tier(required_tier).is_some()
-        {
-            return entry.materialize_preview_for_tier_with_storage(
-                self,
-                table,
-                context.user_descriptor.as_ref(),
-                required_tier,
-            );
+        let current_tier = row_confirmed_tier_with_batch_settlement(self, &entry.current_row)?;
+        if current_tier.is_some_and(|tier| tier >= required_tier) {
+            let mut current_row = entry.current_row.clone();
+            current_row.confirmed_tier = current_tier;
+            return Ok(Some(current_row));
         }
-        let history_rows = regions.history_rows_for(branch, row_id);
+        let mut history_rows = regions.history_rows_for(branch, row_id);
+        apply_batch_settlement_tiers_to_rows(self, &mut history_rows)?;
         crate::row_histories::visible_row_preview_from_history_rows(
             context.user_descriptor.as_ref(),
             &history_rows,
@@ -3184,6 +3178,7 @@ mod tests {
 
     #[test]
     fn exact_visible_row_tier_load_uses_persisted_winner_sidecar() {
+        use crate::batch_fate::VisibleBatchMember;
         use crate::query_manager::types::{SchemaBuilder, TableSchema, Value};
         use crate::row_format::decode_row;
         use crate::row_histories::{RowState, VisibleRowEntry};
@@ -3267,6 +3262,23 @@ mod tests {
         storage
             .upsert_visible_region_rows("tasks", std::slice::from_ref(&entry))
             .unwrap();
+        for (row, confirmed_tier) in [
+            (&base, DurabilityTier::GlobalServer),
+            (&edge_title, DurabilityTier::EdgeServer),
+            (&worker_done, DurabilityTier::Local),
+        ] {
+            storage
+                .upsert_authoritative_batch_settlement(&BatchSettlement::DurableDirect {
+                    batch_id: row.batch_id,
+                    confirmed_tier,
+                    visible_members: vec![VisibleBatchMember {
+                        object_id: row_id,
+                        branch_name: BranchName::new("main"),
+                        batch_id: row.batch_id,
+                    }],
+                })
+                .unwrap();
+        }
 
         let worker_preview = Storage::load_visible_region_row_for_tier(
             &storage,
@@ -3307,6 +3319,90 @@ mod tests {
         assert_eq!(
             decode_row(&user_descriptor, &global_preview.data).unwrap(),
             vec![Value::Text("task".into()), Value::Boolean(false)]
+        );
+    }
+
+    #[test]
+    fn exact_visible_row_tier_load_uses_authoritative_batch_settlement() {
+        use crate::batch_fate::VisibleBatchMember;
+        use crate::query_manager::types::{SchemaBuilder, TableSchema, Value};
+        use crate::row_format::decode_row;
+        use crate::row_histories::{RowState, VisibleRowEntry};
+
+        let mut storage = MemoryStorage::new();
+        let schema = SchemaBuilder::new()
+            .table(
+                TableSchema::builder("tasks")
+                    .column("title", ColumnType::Text)
+                    .column("done", ColumnType::Boolean),
+            )
+            .build();
+        let user_descriptor = schema[&"tasks".into()].columns.clone();
+        let schema_hash = persist_test_schema(&mut storage, &schema);
+        let row_id = ObjectId::new();
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: "tasks".into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .unwrap();
+
+        let row = StoredRowBatch::new(
+            row_id,
+            "main",
+            Vec::new(),
+            encode_row(
+                &user_descriptor,
+                &[Value::Text("settled".into()), Value::Boolean(false)],
+            )
+            .unwrap(),
+            RowProvenance::for_insert("alice".to_string(), 10),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        let entry =
+            VisibleRowEntry::rebuild_with_descriptor(&user_descriptor, std::slice::from_ref(&row))
+                .unwrap()
+                .expect("visible entry");
+        storage
+            .append_history_region_rows("tasks", std::slice::from_ref(&row))
+            .unwrap();
+        storage
+            .upsert_visible_region_rows("tasks", std::slice::from_ref(&entry))
+            .unwrap();
+        storage
+            .upsert_authoritative_batch_settlement(&BatchSettlement::DurableDirect {
+                batch_id: row.batch_id,
+                confirmed_tier: DurabilityTier::GlobalServer,
+                visible_members: vec![VisibleBatchMember {
+                    object_id: row_id,
+                    branch_name: BranchName::new("main"),
+                    batch_id: row.batch_id,
+                }],
+            })
+            .unwrap();
+
+        let global_preview = Storage::load_visible_region_row_for_tier(
+            &storage,
+            "tasks",
+            "main",
+            row_id,
+            DurabilityTier::GlobalServer,
+        )
+        .unwrap()
+        .expect("global preview");
+
+        assert_eq!(
+            global_preview.confirmed_tier,
+            Some(DurabilityTier::GlobalServer)
+        );
+        assert_eq!(
+            decode_row(&user_descriptor, &global_preview.data).unwrap(),
+            vec![Value::Text("settled".into()), Value::Boolean(false)]
         );
     }
 

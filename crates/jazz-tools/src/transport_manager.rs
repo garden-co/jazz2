@@ -670,6 +670,19 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                                     });
                                     self.tick.notify();
                                 }
+                                crate::transport_protocol::ServerEvent::SyncUpdateBatch { updates } => {
+                                    for update in updates {
+                                        let entry = InboxEntry {
+                                            source: crate::sync_manager::types::Source::Server(self.server_id),
+                                            payload: update.payload,
+                                        };
+                                        let _ = self.inbound_tx.unbounded_send(TransportInbound::Sync {
+                                            entry: Box::new(entry),
+                                            sequence: update.seq,
+                                        });
+                                    }
+                                    self.tick.notify();
+                                }
                                 crate::transport_protocol::ServerEvent::Heartbeat => {}
                                 crate::transport_protocol::ServerEvent::Connected { .. } => {
                                     tracing::warn!("unexpected Connected frame mid-stream; ignoring");
@@ -877,6 +890,19 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                                         entry: Box::new(entry),
                                         sequence: seq,
                                     });
+                                    self.tick.notify();
+                                }
+                                crate::transport_protocol::ServerEvent::SyncUpdateBatch { updates } => {
+                                    for update in updates {
+                                        let entry = InboxEntry {
+                                            source: crate::sync_manager::types::Source::Server(self.server_id),
+                                            payload: update.payload,
+                                        };
+                                        let _ = self.inbound_tx.unbounded_send(TransportInbound::Sync {
+                                            entry: Box::new(entry),
+                                            sequence: update.seq,
+                                        });
+                                    }
                                     self.tick.notify();
                                 }
                                 crate::transport_protocol::ServerEvent::Heartbeat => {}

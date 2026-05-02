@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -30,6 +31,22 @@ use super::types::{
     Schema, SchemaHash, TableName, TablePolicies, TableSchema, Tuple, Value,
     build_ordered_delta_with_post_ids,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+fn timing_now() -> Option<Instant> {
+    Some(Instant::now())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timing_now() -> Option<Instant> {
+    None
+}
+
+fn timing_elapsed_ms(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| started.elapsed().as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Error types for QueryManager operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1075,6 +1092,21 @@ impl QueryManager {
         }
     }
 
+    pub(crate) fn mark_subscriptions_visibility_recompute_for_tier(
+        &mut self,
+        confirmed_tier: DurabilityTier,
+    ) {
+        for subscription in self.subscriptions.values_mut() {
+            if subscription
+                .durability_tier
+                .is_some_and(|required_tier| confirmed_tier >= required_tier)
+            {
+                subscription.needs_visibility_recompute = true;
+                subscription.graph.mark_all_dirty();
+            }
+        }
+    }
+
     /// Remove a client and all its server-side state (subscriptions, in-flight policy checks).
     ///
     /// Returns `false` if the client has unprocessed inbox entries.
@@ -1119,6 +1151,20 @@ impl QueryManager {
         for query_id in remote_scope_dirty_query_ids {
             if let Some(sub) = self.subscriptions.get_mut(&QuerySubscriptionId(query_id.0)) {
                 sub.needs_visibility_recompute = true;
+            }
+        }
+        let batch_settlements = self.sync_manager.pending_batch_settlements().to_vec();
+        for settlement in &batch_settlements {
+            if let Some(confirmed_tier) = settlement.confirmed_tier() {
+                self.mark_subscriptions_visibility_recompute_for_tier(confirmed_tier);
+            }
+            for member in settlement.visible_members() {
+                if let Ok(Some(locator)) = storage.load_row_locator(member.object_id) {
+                    self.mark_row_updated_in_subscriptions(
+                        locator.table.as_str(),
+                        member.object_id,
+                    );
+                }
             }
         }
         self.pending_catalogue_updates.extend(
@@ -1168,11 +1214,30 @@ impl QueryManager {
         // RuntimeCore, which tracks per-server stream progress.
         let pending_query_settled = self.sync_manager.take_pending_query_settled();
         if !pending_query_settled.is_empty() {
+            tracing::debug!(
+                target: "jazz_timing",
+                count = pending_query_settled.len(),
+                "[jazz timing] client/runtime pending QuerySettled messages"
+            );
             let mut blocked = Vec::new();
             for pending_settled in pending_query_settled {
                 if pending_settled.through_seq == 0 {
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        query_id = pending_settled.query_id.0,
+                        ?pending_settled.tier,
+                        through_seq = pending_settled.through_seq,
+                        "[jazz timing] client/runtime applying QuerySettled immediately"
+                    );
                     self.apply_query_settled(pending_settled.query_id, pending_settled.tier);
                 } else {
+                    tracing::debug!(
+                        target: "jazz_timing",
+                        query_id = pending_settled.query_id.0,
+                        ?pending_settled.tier,
+                        through_seq = pending_settled.through_seq,
+                        "[jazz timing] client/runtime QuerySettled blocked on stream watermark"
+                    );
                     blocked.push(pending_settled);
                 }
             }
@@ -1207,6 +1272,7 @@ impl QueryManager {
         let subscription_ids: Vec<_> = self.subscriptions.keys().copied().collect();
 
         for sub_id in subscription_ids {
+            let subscription_started = timing_now();
             let should_process_subscription =
                 self.subscriptions.get(&sub_id).is_some_and(|subscription| {
                     subscription.needs_recompile
@@ -1230,6 +1296,7 @@ impl QueryManager {
             let include_deleted = subscription.query.include_deleted;
 
             let delta = {
+                let settle_started = timing_now();
                 let schema_context = &self.schema_context;
                 let branch_schema_map = &self.branch_schema_map;
                 let row_loader =
@@ -1275,7 +1342,18 @@ impl QueryManager {
                         )
                     };
 
-                subscription.graph.settle(storage_ref, row_loader)
+                let delta = subscription.graph.settle(storage_ref, row_loader);
+                tracing::debug!(
+                    target: "jazz_timing",
+                    sub_id = sub_id.0,
+                    table = %table,
+                    elapsed_ms = timing_elapsed_ms(settle_started),
+                    added = delta.added.len(),
+                    removed = delta.removed.len(),
+                    settled_once = subscription.settled_once,
+                    "[jazz timing] client/runtime subscription graph settled"
+                );
+                delta
             };
             subscription.needs_visibility_recompute = false;
             let new_schema_warnings = Self::finalize_schema_warnings(
@@ -1302,7 +1380,14 @@ impl QueryManager {
                 // initial upstream frontier has been replayed — or until every
                 // still-pending server has exceeded PENDING_SERVER_TIMEOUT,
                 // which means nothing upstream is going to replay.
-                tracing::trace!("query frontier incomplete, holding first delivery");
+                tracing::debug!(
+                    target: "jazz_timing",
+                    sub_id = sub_id.0,
+                    table = %table,
+                    elapsed_ms = timing_elapsed_ms(subscription_started),
+                    has_servers_or_pending = self.sync_manager.has_servers_or_pending_servers(),
+                    "[jazz timing] client/runtime query frontier incomplete; holding first delivery"
+                );
                 self.subscriptions.insert(sub_id, subscription);
                 continue;
             }
@@ -1365,10 +1450,13 @@ impl QueryManager {
                 );
                 subscription.current_ordered_ids = ordered.ordered_ids_after;
                 subscription.current_visible_rows = visible_rows_by_id;
-                tracing::debug!(
+                tracing::warn!(
+                    target: "jazz_timing",
                     sub_id = sub_id.0,
+                    table = %table,
                     added = visible_delta.added.len(),
-                    "first delivery (snapshot)"
+                    elapsed_ms = timing_elapsed_ms(subscription_started),
+                    "[jazz timing] client/runtime first delivery queued"
                 );
                 self.update_outbox.push(QueryUpdate {
                     subscription_id: sub_id,
@@ -1416,10 +1504,6 @@ impl QueryManager {
 
         // 8. Settle server-side subscriptions and update scopes
         self.settle_server_subscriptions(storage_ref);
-    }
-
-    pub(crate) fn enqueue_row_visibility_change(&mut self, update: RowVisibilityChange) {
-        self.pending_row_visibility_changes.push(update);
     }
 
     pub(super) fn handle_row_update_with_origin(
@@ -1731,7 +1815,7 @@ impl QueryManager {
     /// Mark a row as updated in all subscriptions for a table.
     /// This triggers content change detection during settle().
     /// Checks all tables involved in the subscription (including joined tables).
-    pub(super) fn mark_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+    pub(crate) fn mark_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
         // Mark local subscriptions
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
@@ -1746,7 +1830,7 @@ impl QueryManager {
         }
     }
 
-    pub(super) fn mark_local_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+    pub(crate) fn mark_local_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_row_updated(id);

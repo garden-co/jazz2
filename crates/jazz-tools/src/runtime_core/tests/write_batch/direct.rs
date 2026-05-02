@@ -330,9 +330,23 @@ fn rc_worker_direct_batch_persists_visible_members_on_seal() {
             .unwrap()
             .expect("sealed direct batch member should stay visible");
     assert_eq!(
-        first_visible_row.confirmed_tier,
+        first_visible_row.confirmed_tier, None,
+        "sealing a direct batch should leave row-local tier empty"
+    );
+    let first_local_row =
+        s.b.storage()
+            .load_visible_region_row_for_tier(
+                "users",
+                branch_name.as_str(),
+                first_row_id,
+                DurabilityTier::Local,
+            )
+            .unwrap()
+            .expect("sealed direct batch member should be locally durable via settlement storage");
+    assert_eq!(
+        first_local_row.confirmed_tier,
         Some(DurabilityTier::Local),
-        "sealing a direct batch should make member rows locally durable"
+        "tiered reads should project local durability from the batch settlement"
     );
 }
 

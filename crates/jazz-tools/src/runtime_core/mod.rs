@@ -35,6 +35,7 @@ use std::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use tracing::{debug, debug_span, info, trace, trace_span};
+use web_time::Instant;
 
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::QuerySubscriptionId;
@@ -273,6 +274,76 @@ struct PendingOneShotQuery {
     sender: Option<QuerySender>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncReceiveStats {
+    started_at: Instant,
+    highest_received_seq: u64,
+    highest_applied_seq: u64,
+    received_total: u64,
+    applied_total: u64,
+    received_by_type: BTreeMap<&'static str, u64>,
+    applied_by_type: BTreeMap<&'static str, u64>,
+    received_settlement_batches: HashMap<BatchId, u64>,
+    applied_settlement_batches: HashMap<BatchId, u64>,
+    next_log_at: u64,
+}
+
+impl SyncReceiveStats {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            highest_received_seq: 0,
+            highest_applied_seq: 0,
+            received_total: 0,
+            applied_total: 0,
+            received_by_type: BTreeMap::new(),
+            applied_by_type: BTreeMap::new(),
+            received_settlement_batches: HashMap::new(),
+            applied_settlement_batches: HashMap::new(),
+            next_log_at: 500,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
+    fn received_settlement_duplicates(&self) -> u64 {
+        self.received_settlement_batches
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum()
+    }
+
+    fn applied_settlement_duplicates(&self) -> u64 {
+        self.applied_settlement_batches
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum()
+    }
+
+    fn top_received_settlement_duplicates(&self) -> Vec<(BatchId, u64)> {
+        top_settlement_duplicates(&self.received_settlement_batches)
+    }
+
+    fn top_applied_settlement_duplicates(&self) -> Vec<(BatchId, u64)> {
+        top_settlement_duplicates(&self.applied_settlement_batches)
+    }
+}
+
+fn top_settlement_duplicates(counts: &HashMap<BatchId, u64>) -> Vec<(BatchId, u64)> {
+    let mut top: Vec<_> = counts
+        .iter()
+        .filter_map(|(batch_id, count)| {
+            let duplicates = count.saturating_sub(1);
+            (duplicates > 0).then_some((*batch_id, duplicates))
+        })
+        .collect();
+    top.sort_by(|(_, left), (_, right)| right.cmp(left));
+    top.truncate(8);
+    top
+}
+
 /// Unified runtime core for both native and WASM platforms.
 ///
 /// Generic over `Storage` for data persistence and `Scheduler` for tick scheduling.
@@ -298,6 +369,8 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     next_expected_server_seq: HashMap<ServerId, u64>,
     /// Highest per-server stream sequence already applied to the inbox.
     last_applied_server_seq: HashMap<ServerId, u64>,
+    /// Lightweight receive-side counters for diagnosing watermarked query release.
+    sync_receive_stats: HashMap<ServerId, SyncReceiveStats>,
 
     /// Subscription tracking with callbacks.
     subscriptions: HashMap<SubscriptionHandle, SubscriptionState>,
@@ -361,6 +434,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             parked_sync_messages_by_server_seq: HashMap::new(),
             next_expected_server_seq: HashMap::new(),
             last_applied_server_seq: HashMap::new(),
+            sync_receive_stats: HashMap::new(),
             subscriptions: HashMap::new(),
             subscription_reverse: HashMap::new(),
             next_subscription_handle: 0,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,9 @@ struct ConnectionStreamState {
     client_id: ClientId,
     next_sync_seq: u64,
     sender: mpsc::UnboundedSender<SequencedSyncUpdate>,
+    sent_total: u64,
+    sent_by_type: BTreeMap<&'static str, u64>,
+    next_log_at: u64,
 }
 
 #[derive(Default)]
@@ -62,6 +65,9 @@ impl ConnectionEventHub {
                 client_id,
                 next_sync_seq: 1,
                 sender,
+                sent_total: 0,
+                sent_by_type: BTreeMap::new(),
+                next_log_at: 500,
             },
         );
         (1, receiver)
@@ -100,6 +106,26 @@ impl ConnectionEventHub {
                 },
                 _ => payload.clone(),
             };
+            let kind = payload.variant_name();
+            state.sent_total += 1;
+            *state.sent_by_type.entry(kind).or_default() += 1;
+            if matches!(payload, SyncPayload::QuerySettled { .. })
+                || state.sent_total >= state.next_log_at
+            {
+                tracing::warn!(
+                    target: "jazz_timing",
+                    connection_id,
+                    %client_id,
+                    seq,
+                    kind,
+                    sent_total = state.sent_total,
+                    sent_by_type = ?state.sent_by_type,
+                    "[jazz timing] server stream fanout summary"
+                );
+                while state.sent_total >= state.next_log_at {
+                    state.next_log_at += 500;
+                }
+            }
 
             prepared.push(PreparedSyncDispatch {
                 connection_id,

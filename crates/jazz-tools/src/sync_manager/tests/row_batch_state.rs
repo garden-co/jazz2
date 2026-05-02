@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn row_batch_created_emits_row_batch_state_changed_to_source() {
+fn row_batch_created_emits_batch_settlement_to_source() {
     let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
     let mut io = MemoryStorage::new();
     let server_id = ServerId::new();
@@ -26,23 +26,23 @@ fn row_batch_created_emits_row_batch_state_changed_to_source() {
     match &outbox[0] {
         OutboxEntry {
             destination: Destination::Server(id),
-            payload:
-                SyncPayload::RowBatchStateChanged {
-                    row_id: ack_row_id,
-                    branch_name,
-                    batch_id,
-                    state,
-                    confirmed_tier,
-                },
+            payload: SyncPayload::BatchSettlement { settlement },
         } => {
             assert_eq!(*id, server_id);
-            assert_eq!(*ack_row_id, row_id);
-            assert_eq!(*branch_name, BranchName::new("main"));
-            assert_eq!(*batch_id, row.batch_id);
-            assert_eq!(*state, None);
-            assert_eq!(*confirmed_tier, Some(DurabilityTier::Local));
+            assert_eq!(
+                *settlement,
+                BatchSettlement::DurableDirect {
+                    batch_id: row.batch_id,
+                    confirmed_tier: DurabilityTier::Local,
+                    visible_members: vec![VisibleBatchMember {
+                        object_id: row_id,
+                        branch_name: BranchName::new("main"),
+                        batch_id: row.batch_id,
+                    }],
+                }
+            );
         }
-        other => panic!("expected RowBatchStateChanged to server, got {other:?}"),
+        other => panic!("expected BatchSettlement to server, got {other:?}"),
     }
 }
 
@@ -79,11 +79,20 @@ fn row_batch_created_stamps_local_durability_into_storage() {
         )
         .unwrap();
 
-    assert_eq!(visible.confirmed_tier, Some(DurabilityTier::EdgeServer));
+    assert_eq!(visible.confirmed_tier, None);
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].confirmed_tier, Some(DurabilityTier::EdgeServer));
+    assert_eq!(history[0].confirmed_tier, None);
     assert_eq!(
-        load_visible_row(&io, "users", row_id, "main").confirmed_tier,
+        io.load_authoritative_batch_settlement(history[0].batch_id)
+            .unwrap()
+            .and_then(|settlement| settlement.confirmed_tier()),
+        Some(DurabilityTier::EdgeServer)
+    );
+    assert_eq!(
+        io.load_visible_region_row_for_tier("users", "main", row_id, DurabilityTier::EdgeServer)
+            .unwrap()
+            .expect("tiered visible row")
+            .confirmed_tier,
         Some(DurabilityTier::EdgeServer)
     );
 }
@@ -130,12 +139,20 @@ fn row_batch_state_changed_updates_row_region_confirmed_tier_monotonically() {
         .unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(history.len(), 1);
-    assert_eq!(visible[0].confirmed_tier, Some(DurabilityTier::EdgeServer));
-    assert_eq!(history[0].confirmed_tier, Some(DurabilityTier::EdgeServer));
+    // Tier-only acks are stored as authoritative batch settlements. They must
+    // not force visible/history row rewrites.
+    assert_eq!(visible[0].confirmed_tier, None);
+    assert_eq!(history[0].confirmed_tier, None);
+    assert_eq!(
+        io.load_authoritative_batch_settlement(batch_id)
+            .unwrap()
+            .and_then(|settlement| settlement.confirmed_tier()),
+        Some(DurabilityTier::EdgeServer)
+    );
 }
 
 #[test]
-fn row_batch_state_changed_enqueues_pending_row_update_for_visible_row() {
+fn row_batch_state_changed_tier_only_does_not_enqueue_pending_row_update() {
     let mut sm = SyncManager::new();
     let mut io = MemoryStorage::new();
     let row_id = ObjectId::new();
@@ -155,12 +172,61 @@ fn row_batch_state_changed_enqueues_pending_row_update_for_visible_row() {
         },
     );
 
-    let updates = sm.take_pending_row_visibility_changes();
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].object_id, row_id);
+    assert!(sm.take_pending_row_visibility_changes().is_empty());
     assert_eq!(
-        updates[0].row.confirmed_tier,
+        io.load_visible_region_row("users", "main", row_id)
+            .unwrap()
+            .expect("visible row")
+            .confirmed_tier,
+        None
+    );
+    assert_eq!(
+        io.load_history_row_batch("users", "main", row_id, batch_id)
+            .unwrap()
+            .expect("history row")
+            .confirmed_tier,
+        None
+    );
+    assert_eq!(
+        io.load_authoritative_batch_settlement(batch_id)
+            .unwrap()
+            .and_then(|settlement| settlement.confirmed_tier()),
         Some(DurabilityTier::EdgeServer)
+    );
+}
+
+#[test]
+fn row_batch_state_changed_tier_only_persists_authoritative_settlement() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    let batch_id = row.batch_id;
+    seed_visible_row(&mut sm, &mut io, "users", row);
+
+    sm.process_from_server(
+        &mut io,
+        ServerId::new(),
+        SyncPayload::RowBatchStateChanged {
+            row_id,
+            branch_name: BranchName::new("main"),
+            batch_id,
+            state: None,
+            confirmed_tier: Some(DurabilityTier::EdgeServer),
+        },
+    );
+
+    assert_eq!(
+        io.load_authoritative_batch_settlement(batch_id).unwrap(),
+        Some(BatchSettlement::DurableDirect {
+            batch_id,
+            confirmed_tier: DurabilityTier::EdgeServer,
+            visible_members: vec![VisibleBatchMember {
+                object_id: row_id,
+                branch_name: BranchName::new("main"),
+                batch_id,
+            }],
+        })
     );
 }
 

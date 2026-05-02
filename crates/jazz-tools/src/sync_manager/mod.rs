@@ -824,6 +824,14 @@ impl SyncManager {
         std::mem::take(&mut self.pending_batch_settlements)
     }
 
+    pub fn pending_batch_settlements(&self) -> &[BatchSettlement] {
+        &self.pending_batch_settlements
+    }
+
+    pub fn push_pending_batch_settlement(&mut self, settlement: BatchSettlement) {
+        self.pending_batch_settlements.push(settlement);
+    }
+
     /// Take received row batch-member persistence state since last call.
     /// Used by RuntimeCore to resolve row `_persisted` mutation receivers.
     pub fn take_received_row_batch_acks(&mut self) -> Vec<(RowBatchKey, DurabilityTier)> {

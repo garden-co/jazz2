@@ -34,6 +34,11 @@ impl QueryGraph {
         self.dirty_bitmap.fill(false);
     }
 
+    /// Force a full graph recompute.
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty_bitmap.fill(true);
+    }
+
     /// Mark index scan nodes dirty for a given table/column.
     /// Also propagates dirty marks to downstream nodes.
     pub fn mark_dirty_for_column(&mut self, table: &str, column: &str) {

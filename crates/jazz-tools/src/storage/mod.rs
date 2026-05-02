@@ -60,6 +60,60 @@ use crate::sync_manager::DurabilityTier;
 
 type EncodedTableRowHistories = BTreeMap<ObjectId, BTreeMap<(SharedString, BatchId), Vec<u8>>>;
 
+pub(super) fn batch_settlement_confirmed_tier_for_row(
+    settlement: &BatchSettlement,
+    row: &StoredRowBatch,
+) -> Option<DurabilityTier> {
+    let confirmed_tier = settlement.confirmed_tier()?;
+    let is_visible_member = match settlement {
+        BatchSettlement::DurableDirect {
+            visible_members, ..
+        }
+        | BatchSettlement::AcceptedTransaction {
+            visible_members, ..
+        } => visible_members.iter().any(|member| {
+            member.object_id == row.row_id
+                && member.branch_name.as_str() == row.branch.as_str()
+                && member.batch_id == row.batch_id
+        }),
+        BatchSettlement::Missing { .. } | BatchSettlement::Rejected { .. } => false,
+    };
+    is_visible_member.then_some(confirmed_tier)
+}
+
+pub(super) fn row_confirmed_tier_with_batch_settlement<H: Storage + ?Sized>(
+    storage: &H,
+    row: &StoredRowBatch,
+) -> Result<Option<DurabilityTier>, StorageError> {
+    Ok(storage
+        .load_authoritative_batch_settlement(row.batch_id)?
+        .as_ref()
+        .and_then(|settlement| batch_settlement_confirmed_tier_for_row(settlement, row)))
+}
+
+pub(super) fn apply_batch_settlement_tiers_to_rows<H: Storage + ?Sized>(
+    storage: &H,
+    rows: &mut [StoredRowBatch],
+) -> Result<(), StorageError> {
+    let mut settlement_cache = HashMap::<BatchId, Option<BatchSettlement>>::new();
+    for row in rows {
+        let settlement = if let Some(settlement) = settlement_cache.get(&row.batch_id) {
+            settlement
+        } else {
+            let settlement = storage.load_authoritative_batch_settlement(row.batch_id)?;
+            settlement_cache.insert(row.batch_id, settlement);
+            settlement_cache
+                .get(&row.batch_id)
+                .expect("settlement cache should contain inserted batch")
+        };
+
+        row.confirmed_tier = settlement
+            .as_ref()
+            .and_then(|settlement| batch_settlement_confirmed_tier_for_row(settlement, row));
+    }
+    Ok(())
+}
+
 /// Errors from storage operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageError {

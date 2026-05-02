@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::batch_fate::BatchMode;
+use crate::batch_fate::{BatchMode, BatchSettlement, VisibleBatchMember};
 use crate::metadata::{DeleteKind, RowProvenance, SYSTEM_PRINCIPAL_ID, row_provenance_metadata};
 use crate::object::{BranchName, ObjectId};
 use crate::row_format::compiled_row_layout;
@@ -239,7 +239,7 @@ impl QueryManager {
                 authoring.provenance.clone(),
                 metadata,
                 authoring.row_state,
-                self.sync_manager.max_local_durability_tier(),
+                None,
             )
         } else {
             StoredRowBatch::new(
@@ -250,7 +250,7 @@ impl QueryManager {
                 authoring.provenance.clone(),
                 metadata,
                 authoring.row_state,
-                self.sync_manager.max_local_durability_tier(),
+                None,
             )
         }
     }
@@ -318,6 +318,41 @@ impl QueryManager {
         let row = update.row.clone();
         self.handle_row_update_with_origin(storage, update, true, false);
         Ok(row)
+    }
+
+    fn maybe_record_local_direct_settlement<H: Storage>(
+        &self,
+        storage: &mut H,
+        branch_name: &BranchName,
+        row_id: ObjectId,
+        batch_id: BatchId,
+        write_context: Option<&WriteContext>,
+        visibility_change: &Option<RowVisibilityChange>,
+    ) -> Result<(), QueryError> {
+        if visibility_change.is_none()
+            || matches!(
+                write_context.map(WriteContext::batch_mode),
+                Some(BatchMode::Transactional)
+            )
+        {
+            return Ok(());
+        }
+
+        let Some(confirmed_tier) = self.sync_manager.max_local_durability_tier() else {
+            return Ok(());
+        };
+
+        storage
+            .upsert_authoritative_batch_settlement(&BatchSettlement::DurableDirect {
+                batch_id,
+                confirmed_tier,
+                visible_members: vec![VisibleBatchMember {
+                    object_id: row_id,
+                    branch_name: *branch_name,
+                    batch_id,
+                }],
+            })
+            .map_err(|err| QueryError::EncodingError(format!("persist batch settlement: {err}")))
     }
 
     fn maybe_track_local_pending_transaction_overlay(
@@ -844,6 +879,14 @@ impl QueryManager {
             false,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            id,
+            batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         if let Some(visibility_change) = visibility_change {
             let _ = self.apply_local_row_batch(storage, visibility_change)?;
@@ -1098,6 +1141,14 @@ impl QueryManager {
             false,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            object_id,
+            row_batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         tracing::trace!(%object_id, ?row_batch_id, "apply local row insert");
         if let Some(visibility_change) = visibility_change {
@@ -1289,6 +1340,14 @@ impl QueryManager {
             false,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            object_id,
+            row_batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         if let Some(visibility_change) = visibility_change {
             let _ = self.apply_local_row_batch(storage, visibility_change)?;
@@ -1436,6 +1495,14 @@ impl QueryManager {
             false,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            object_id,
+            row_batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         if let Some(visibility_change) = visibility_change {
             let _ = self.apply_local_row_batch(storage, visibility_change)?;
@@ -2397,6 +2464,14 @@ impl QueryManager {
             true,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            id,
+            delete_batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         tracing::trace!(%id, ?delete_batch_id, "apply local soft delete");
         if let Some(visibility_change) = visibility_change {
@@ -2588,6 +2663,14 @@ impl QueryManager {
             true,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            id,
+            delete_batch_id,
+            write_context,
+            &visibility_change,
+        )?;
 
         let _ = old_branch_data;
         if let Some(visibility_change) = visibility_change {
@@ -2702,6 +2785,14 @@ impl QueryManager {
             false,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            id,
+            row_batch_id,
+            None,
+            &visibility_change,
+        )?;
 
         if let Some(visibility_change) = visibility_change {
             let _ = self.apply_local_row_batch(storage, visibility_change)?;
@@ -2794,6 +2885,14 @@ impl QueryManager {
             true,
             &visibility_change,
         );
+        self.maybe_record_local_direct_settlement(
+            storage,
+            &branch_name,
+            id,
+            delete_batch_id,
+            None,
+            &visibility_change,
+        )?;
 
         let _ = old_data;
         if let Some(visibility_change) = visibility_change {

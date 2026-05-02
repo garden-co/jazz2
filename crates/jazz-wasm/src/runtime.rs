@@ -25,6 +25,7 @@ use serde::Serialize;
 #[cfg(target_arch = "wasm32")]
 use tracing::warn;
 use tracing::{debug_span, info, info_span};
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 
 /// Initialize wasm-tracing exactly once (idempotent across multiple WasmRuntime instances).
@@ -445,7 +446,7 @@ impl WasmScheduler {
 }
 
 fn schedule_batched_tick_task(core_ref: Weak<RefCell<WasmCoreType>>, flag: Rc<RefCell<bool>>) {
-    wasm_bindgen_futures::spawn_local(async move {
+    let task = Closure::once_into_js(move || {
         *flag.borrow_mut() = false;
 
         let Some(core_rc) = core_ref.upgrade() else {
@@ -471,6 +472,14 @@ fn schedule_batched_tick_task(core_ref: Weak<RefCell<WasmCoreType>>, flag: Rc<Re
             schedule_batched_tick_task(core_ref.clone(), flag.clone());
         }
     });
+
+    let global = js_sys::global();
+    let Ok(set_timeout) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+        .and_then(|value| value.dyn_into::<Function>())
+    else {
+        return;
+    };
+    let _ = set_timeout.call2(&global, &task, &JsValue::from_f64(0.0));
 }
 
 impl Scheduler for WasmScheduler {

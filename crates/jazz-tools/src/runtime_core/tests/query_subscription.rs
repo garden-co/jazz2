@@ -1,5 +1,23 @@
 use super::*;
 
+fn persist_direct_settlement_for_row(
+    core: &mut TestCore,
+    row: &crate::row_histories::StoredRowBatch,
+    tier: DurabilityTier,
+) {
+    core.storage_mut()
+        .upsert_authoritative_batch_settlement(&crate::batch_fate::BatchSettlement::DurableDirect {
+            batch_id: row.batch_id,
+            confirmed_tier: tier,
+            visible_members: vec![crate::batch_fate::VisibleBatchMember {
+                object_id: row.row_id,
+                branch_name: BranchName::new(&row.branch),
+                batch_id: row.batch_id,
+            }],
+        })
+        .unwrap();
+}
+
 #[test]
 fn rc_query_no_settled_tier_immediate() {
     let mut s = create_3tier_rc();
@@ -752,14 +770,7 @@ fn query_reads_pick_row_batches_by_required_durability_tier() {
         .load_visible_region_row("users", &branch_name, object_id)
         .unwrap()
         .expect("first visible row");
-    core.storage_mut()
-        .patch_row_region_rows_by_batch(
-            "users",
-            first_visible.batch_id,
-            None,
-            Some(DurabilityTier::GlobalServer),
-        )
-        .unwrap();
+    persist_direct_settlement_for_row(&mut core, &first_visible, DurabilityTier::GlobalServer);
 
     core.update(
         object_id,
@@ -774,14 +785,7 @@ fn query_reads_pick_row_batches_by_required_durability_tier() {
         .load_visible_region_row("users", &branch_name, object_id)
         .unwrap()
         .expect("second visible row");
-    core.storage_mut()
-        .patch_row_region_rows_by_batch(
-            "users",
-            second_visible.batch_id,
-            None,
-            Some(DurabilityTier::Local),
-        )
-        .unwrap();
+    persist_direct_settlement_for_row(&mut core, &second_visible, DurabilityTier::Local);
 
     let worker_rows = execute_runtime_query_with_durability_and_propagation(
         &mut core,
@@ -848,14 +852,7 @@ fn query_reads_merge_conflicting_row_batches_by_required_durability_tier() {
         .load_visible_region_row("todos", &branch_name, row_id)
         .unwrap()
         .expect("base visible row");
-    core.storage_mut()
-        .patch_row_region_rows_by_batch(
-            "todos",
-            base.batch_id,
-            None,
-            Some(DurabilityTier::GlobalServer),
-        )
-        .unwrap();
+    persist_direct_settlement_for_row(&mut core, &base, DurabilityTier::GlobalServer);
     let base = core
         .storage()
         .load_visible_region_row("todos", &branch_name, row_id)
@@ -874,7 +871,7 @@ fn query_reads_merge_conflicting_row_batches_by_required_durability_tier() {
         crate::metadata::RowProvenance::for_update(&base.row_provenance(), "alice".to_string(), 20),
         HashMap::new(),
         crate::row_histories::RowState::VisibleDirect,
-        Some(DurabilityTier::EdgeServer),
+        None,
     );
     let worker_done = crate::row_histories::StoredRowBatch::new(
         row_id,
@@ -888,8 +885,10 @@ fn query_reads_merge_conflicting_row_batches_by_required_durability_tier() {
         crate::metadata::RowProvenance::for_update(&base.row_provenance(), "bob".to_string(), 21),
         HashMap::new(),
         crate::row_histories::RowState::VisibleDirect,
-        Some(DurabilityTier::Local),
+        None,
     );
+    persist_direct_settlement_for_row(&mut core, &edge_title, DurabilityTier::EdgeServer);
+    persist_direct_settlement_for_row(&mut core, &worker_done, DurabilityTier::Local);
 
     core.storage_mut()
         .append_history_region_rows("todos", &[edge_title.clone(), worker_done.clone()])
@@ -1037,7 +1036,7 @@ fn rc_query_settled_before_data_should_not_drop_upstream_rows() {
     // Force QuerySettled before row delivery to expose ordering assumptions.
     let mut settled_to_a = Vec::new();
     let mut rows_to_a = Vec::new();
-    let mut row_state_to_a = Vec::new();
+    let mut durability_to_a = Vec::new();
     for entry in b_out {
         if entry.destination != Destination::Client(s.a_client_of_b) {
             continue;
@@ -1045,7 +1044,8 @@ fn rc_query_settled_before_data_should_not_drop_upstream_rows() {
         match entry.payload {
             payload @ SyncPayload::QuerySettled { .. } => settled_to_a.push(payload),
             payload @ SyncPayload::RowBatchNeeded { .. } => rows_to_a.push(payload),
-            payload @ SyncPayload::RowBatchStateChanged { .. } => row_state_to_a.push(payload),
+            payload @ SyncPayload::RowBatchStateChanged { .. }
+            | payload @ SyncPayload::BatchSettlement { .. } => durability_to_a.push(payload),
             _ => {}
         }
     }
@@ -1059,7 +1059,7 @@ fn rc_query_settled_before_data_should_not_drop_upstream_rows() {
     s.a.set_next_expected_server_sequence(s.b_server_for_a, 1);
 
     let mut next_update_seq = 1u64;
-    let settled_seq_base = (rows_to_a.len() + row_state_to_a.len()) as u64 + 1;
+    let settled_seq_base = (rows_to_a.len() + durability_to_a.len()) as u64 + 1;
 
     for (idx, payload) in settled_to_a.into_iter().enumerate() {
         s.a.park_sync_message_with_sequence(
@@ -1088,7 +1088,7 @@ fn rc_query_settled_before_data_should_not_drop_upstream_rows() {
         );
         next_update_seq += 1;
     }
-    for payload in row_state_to_a {
+    for payload in durability_to_a {
         s.a.park_sync_message_with_sequence(
             InboxEntry {
                 source: Source::Server(s.b_server_for_a),
@@ -1156,9 +1156,12 @@ fn rc_subscribe_settled_tier() {
         !calls.is_empty(),
         "Callback should fire after Worker QuerySettled"
     );
-    let first_delivery = &calls[0];
-    assert_eq!(first_delivery.len(), 1, "Should have one row");
-    assert_eq!(first_delivery[0].0, id);
+    assert!(
+        calls
+            .iter()
+            .any(|delivery| delivery.iter().any(|(row_id, _)| *row_id == id)),
+        "Should eventually deliver the locally inserted row after Worker settlement"
+    );
 }
 
 #[test]

@@ -19,6 +19,7 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -396,12 +397,19 @@ impl NapiScheduler {
 impl Scheduler for NapiScheduler {
     fn schedule_batched_tick(&self) {
         if !self.scheduled.swap(true, Ordering::SeqCst) {
-            if let Some(ref tsfn) = self.tsfn {
-                // CalleeHandled = false: pass value directly, not wrapped in Result
-                tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
-            } else {
-                self.scheduled.store(false, Ordering::SeqCst);
-            }
+            let scheduled = Arc::clone(&self.scheduled);
+            let core_ref = self.core_ref.clone();
+            std::thread::spawn(move || {
+                // Give bursts of inbound websocket frames a chance to coalesce
+                // before the runtime drains the queue.
+                std::thread::sleep(Duration::from_millis(1));
+                scheduled.store(false, Ordering::SeqCst);
+                if let Some(core_arc) = core_ref.upgrade()
+                    && let Ok(mut core) = core_arc.lock()
+                {
+                    core.batched_tick();
+                }
+            });
         }
     }
 }

@@ -430,14 +430,95 @@ async fn handle_ws_connection(
             },
             update = sync_rx.recv() => {
                 let Some(u) = update else { break };
-                let event = crate::jazz_transport::ServerEvent::SyncUpdate {
+                let mut updates = Vec::with_capacity(256);
+                updates.push(crate::jazz_transport::SequencedSyncPayload {
                     seq: Some(u.seq),
-                    payload: Box::new(u.payload),
+                    payload: u.payload,
+                });
+                while updates.len() < 256 {
+                    match sync_rx.try_recv() {
+                        Ok(u) => updates.push(crate::jazz_transport::SequencedSyncPayload {
+                            seq: Some(u.seq),
+                            payload: u.payload,
+                        }),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let event = if updates.len() == 1 {
+                    let update = updates.pop().expect("single update is present");
+                    crate::jazz_transport::ServerEvent::SyncUpdate {
+                        seq: update.seq,
+                        payload: Box::new(update.payload),
+                    }
+                } else {
+                    crate::jazz_transport::ServerEvent::SyncUpdateBatch { updates }
                 };
                 let bytes = match serde_json::to_vec(&event) {
                     Ok(b) => b,
                     Err(_) => continue,
                 };
+                let mut batch_settlements = 0usize;
+                let mut settlement_batches =
+                    std::collections::HashMap::<crate::row_histories::BatchId, usize>::new();
+                let mut row_batches = 0usize;
+                let mut query_settled = 0usize;
+                let mut count_payload = |payload: &crate::sync_manager::SyncPayload| {
+                    match payload {
+                        crate::sync_manager::SyncPayload::BatchSettlement { settlement } => {
+                            batch_settlements += 1;
+                            *settlement_batches.entry(settlement.batch_id()).or_default() += 1;
+                        }
+                        crate::sync_manager::SyncPayload::RowBatchCreated { .. }
+                        | crate::sync_manager::SyncPayload::RowBatchNeeded { .. } => {
+                            row_batches += 1;
+                        }
+                        crate::sync_manager::SyncPayload::QuerySettled { .. } => {
+                            query_settled += 1;
+                        }
+                        _ => {}
+                    }
+                };
+                match &event {
+                    crate::jazz_transport::ServerEvent::SyncUpdate { payload, .. } => {
+                        count_payload(payload);
+                    }
+                    crate::jazz_transport::ServerEvent::SyncUpdateBatch { updates } => {
+                        for update in updates {
+                            count_payload(&update.payload);
+                        }
+                    }
+                    _ => {}
+                }
+                let settlement_duplicate_messages: usize = settlement_batches
+                    .values()
+                    .map(|count| count.saturating_sub(1))
+                    .sum();
+                let mut top_settlement_duplicates: Vec<_> = settlement_batches
+                    .iter()
+                    .filter_map(|(batch_id, count)| {
+                        let duplicates = count.saturating_sub(1);
+                        (duplicates > 0).then_some((*batch_id, duplicates))
+                    })
+                    .collect();
+                top_settlement_duplicates.sort_by(|(_, left), (_, right)| right.cmp(left));
+                top_settlement_duplicates.truncate(8);
+                tracing::warn!(
+                    target: "jazz_timing",
+                    update_count = match &event {
+                        crate::jazz_transport::ServerEvent::SyncUpdate { .. } => 1,
+                        crate::jazz_transport::ServerEvent::SyncUpdateBatch { updates } => updates.len(),
+                        _ => 0,
+                    },
+                    bytes = bytes.len(),
+                    row_batches,
+                    query_settled,
+                    batch_settlements,
+                    settlement_unique_batches = settlement_batches.len(),
+                    settlement_duplicate_messages,
+                    top_settlement_duplicates = ?top_settlement_duplicates,
+                    "[jazz timing] server websocket sending sync frame"
+                );
                 if socket
                     .send(Message::Binary(
                         crate::transport_manager::frame_encode(&bytes),

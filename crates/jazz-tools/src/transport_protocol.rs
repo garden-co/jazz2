@@ -87,6 +87,13 @@ pub enum ServerEvent {
         payload: Box<SyncPayload>,
     },
 
+    /// Multiple ordered sync updates in one transport frame.
+    ///
+    /// Each item keeps its own stream sequence so clients can preserve the
+    /// exact same ordering/watermark semantics as individual `SyncUpdate`
+    /// frames while avoiding thousands of tiny websocket messages.
+    SyncUpdateBatch { updates: Vec<SequencedSyncPayload> },
+
     /// Error response.
     Error { message: String, code: ErrorCode },
 
@@ -101,10 +108,17 @@ impl ServerEvent {
             ServerEvent::Connected { .. } => "Connected",
             ServerEvent::Subscribed { .. } => "Subscribed",
             ServerEvent::SyncUpdate { .. } => "SyncUpdate",
+            ServerEvent::SyncUpdateBatch { .. } => "SyncUpdateBatch",
             ServerEvent::Error { .. } => "Error",
             ServerEvent::Heartbeat => "Heartbeat",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequencedSyncPayload {
+    pub seq: Option<u64>,
+    pub payload: SyncPayload,
 }
 
 /// Error codes for server errors.

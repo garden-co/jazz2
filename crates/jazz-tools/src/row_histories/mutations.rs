@@ -4,7 +4,7 @@
 //! visible region consistent afterward:
 //! - [`apply_row_batch`] — insert or update a history batch, then recompute and
 //!   persist visibility (and supersede stale staging siblings if needed)
-//! - [`patch_row_batch_state`] — flip an existing batch's state/tier and
+//! - [`patch_row_batch_state`] — flip an existing batch's state and
 //!   recompute visibility
 //!
 //! Each mutation captures the visible row before/after the change as an

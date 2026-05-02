@@ -92,6 +92,72 @@ impl BatchSettlement {
         }
     }
 
+    pub fn visible_members(&self) -> &[VisibleBatchMember] {
+        match self {
+            Self::DurableDirect {
+                visible_members, ..
+            }
+            | Self::AcceptedTransaction {
+                visible_members, ..
+            } => visible_members,
+            Self::Missing { .. } | Self::Rejected { .. } => &[],
+        }
+    }
+
+    pub fn merged_with(&self, incoming: &BatchSettlement) -> BatchSettlement {
+        match (self, incoming) {
+            (
+                Self::DurableDirect {
+                    batch_id,
+                    confirmed_tier: existing_tier,
+                    visible_members: existing_members,
+                },
+                Self::DurableDirect {
+                    confirmed_tier: incoming_tier,
+                    visible_members: incoming_members,
+                    ..
+                },
+            ) => {
+                let mut visible_members = existing_members.clone();
+                for member in incoming_members {
+                    if !visible_members.contains(member) {
+                        visible_members.push(member.clone());
+                    }
+                }
+                Self::DurableDirect {
+                    batch_id: *batch_id,
+                    confirmed_tier: (*existing_tier).max(*incoming_tier),
+                    visible_members,
+                }
+            }
+            (
+                Self::AcceptedTransaction {
+                    batch_id,
+                    confirmed_tier: existing_tier,
+                    visible_members: existing_members,
+                },
+                Self::AcceptedTransaction {
+                    confirmed_tier: incoming_tier,
+                    visible_members: incoming_members,
+                    ..
+                },
+            ) => {
+                let mut visible_members = existing_members.clone();
+                for member in incoming_members {
+                    if !visible_members.contains(member) {
+                        visible_members.push(member.clone());
+                    }
+                }
+                Self::AcceptedTransaction {
+                    batch_id: *batch_id,
+                    confirmed_tier: (*existing_tier).max(*incoming_tier),
+                    visible_members,
+                }
+            }
+            _ => incoming.clone(),
+        }
+    }
+
     pub fn encode_storage_row(&self) -> Result<Vec<u8>, String> {
         let (kind, code, reason, confirmed_tier, visible_members) = match self {
             Self::Missing { .. } => (

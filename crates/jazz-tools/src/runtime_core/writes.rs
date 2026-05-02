@@ -5,7 +5,7 @@ use crate::batch_fate::{
 };
 use crate::object::BranchName;
 use crate::query_manager::types::SchemaHash;
-use crate::row_histories::{BatchId, patch_row_batch_state};
+use crate::row_histories::BatchId;
 use crate::sync_manager::RowBatchKey;
 
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
@@ -296,6 +296,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .map(WriteContext::batch_mode)
             .unwrap_or(BatchMode::Direct);
         self.track_local_batch(row_id, batch_id, batch_mode)?;
+        if Self::should_auto_seal_direct_write(batch_mode, write_context) {
+            self.seal_batch(batch_id)?;
+        }
         debug!(object_id = %row_id, "inserted");
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -328,6 +331,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .map(WriteContext::batch_mode)
             .unwrap_or(BatchMode::Direct);
         self.track_local_batch(row_id, batch_id, batch_mode)?;
+        if Self::should_auto_seal_direct_write(batch_mode, write_context) {
+            self.seal_batch(batch_id)?;
+        }
         debug!(object_id = %row_id, "inserted");
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -351,6 +357,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .map(WriteContext::batch_mode)
             .unwrap_or(BatchMode::Direct);
         self.track_local_batch(object_id, batch_id, batch_mode)?;
+        if Self::should_auto_seal_direct_write(batch_mode, write_context) {
+            self.seal_batch(batch_id)?;
+        }
 
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -407,6 +416,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .map(WriteContext::batch_mode)
             .unwrap_or(BatchMode::Direct);
         self.track_local_batch(object_id, batch_id, batch_mode)?;
+        if Self::should_auto_seal_direct_write(batch_mode, write_context) {
+            self.seal_batch(batch_id)?;
+        }
         debug!("deleted");
         self.mark_storage_write_pending_flush();
         self.immediate_tick();
@@ -774,31 +786,12 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     batch_id,
                 })
                 .collect();
-            for member in &visible_members {
-                let visibility_change = patch_row_batch_state(
-                    &mut self.storage,
-                    member.object_id,
-                    &member.branch_name,
-                    member.batch_id,
-                    None,
-                    Some(confirmed_tier),
-                )
-                .map_err(|err| {
-                    RuntimeError::WriteError(format!(
-                        "mark direct batch row locally durable: {err:?}"
-                    ))
-                })?;
-                if let Some(update) = visibility_change {
-                    self.schema_manager
-                        .query_manager_mut()
-                        .enqueue_row_visibility_change(update);
-                }
-            }
-            record.apply_settlement(BatchSettlement::DurableDirect {
+            let settlement = BatchSettlement::DurableDirect {
                 batch_id,
                 confirmed_tier,
                 visible_members,
-            });
+            };
+            record.apply_settlement(settlement.clone());
         }
         self.storage
             .upsert_local_batch_record(&record)

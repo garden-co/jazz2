@@ -617,7 +617,22 @@ fn rc_insert_persisted_resolves_from_batch_settlement_without_row_state_changed(
             .load_visible_region_row("users", branch_name.as_str(), row_id)
             .unwrap()
             .expect("settled direct row should remain visible");
-    assert_eq!(visible_row.confirmed_tier, Some(DurabilityTier::EdgeServer));
+    assert_eq!(visible_row.confirmed_tier, None);
+
+    let edge_visible_row =
+        s.a.storage()
+            .load_visible_region_row_for_tier(
+                "users",
+                branch_name.as_str(),
+                row_id,
+                DurabilityTier::EdgeServer,
+            )
+            .unwrap()
+            .expect("settled direct row should satisfy edge-tier reads");
+    assert_eq!(
+        edge_visible_row.confirmed_tier,
+        Some(DurabilityTier::EdgeServer)
+    );
 }
 
 #[test]
