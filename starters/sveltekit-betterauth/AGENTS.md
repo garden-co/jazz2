@@ -31,3 +31,18 @@ Only fetch the pages you actually need.
 - **Concepts** — local-first data model, how sync works, branches
 - **Recipes** — user-owned data, shared access, real-time collaboration, nested data
 - **Reference** — column types, operators, framework patterns, FAQ
+
+## Agent skill
+
+Install the Jazz skill for richer, automatic doc lookup:
+
+```bash
+# Claude Code
+npx @anthropic-ai/claude-code skills install garden-co/jazz-skill
+
+# Gemini CLI
+gemini skills install garden-co/jazz-skill
+
+# Any agent (via skills.sh)
+npx skills add garden-co/jazz-skill
+```
