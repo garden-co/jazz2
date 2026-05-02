@@ -9,6 +9,14 @@ import {
 } from "../react-core/provider.js";
 import { createJazzClient, type JazzClient as CreatedJazzClient } from "./create-jazz-client.js";
 
+// In dev builds, pull in a generated module that withJazz (next.ts/vite.ts/...)
+// rewrites on every schema push. The bundler tracks this as a dependency of the
+// React provider, so any push to the file forces a full reload of the host app
+// without each framework plugin needing its own dev-server WebSocket wiring.
+if (process.env.NODE_ENV === "development" && typeof window !== "undefined") {
+  import("jazz-tools/_dev/schema-hash").catch(() => {});
+}
+
 export { JazzClientProvider, type JazzClientProviderProps } from "../react-core/provider.js";
 
 interface JazzClientContextValue {
