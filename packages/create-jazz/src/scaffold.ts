@@ -8,7 +8,7 @@ import {
   type ResolveProgressCallback,
 } from "./deps.js";
 
-const REPO = "garden-co/jazz2";
+const REPO = "garden-co/jazz";
 const BRANCH = "main";
 const DEFAULT_STARTER = "next-betterauth";
 
