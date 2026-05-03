@@ -282,11 +282,13 @@ async function getServerWithPermissions(
 ): Promise<{ appId: string; serverUrl: string; adminSecret: string }> {
   const { appId, serverUrl, adminSecret } = await getIsolatedTestingServerInfo();
   const { hash: schemaHash } = await publishStoredSchema(serverUrl, {
+    appId,
     adminSecret,
     schema: app.wasmSchema,
   });
-  const { head } = await fetchPermissionsHead(serverUrl, { adminSecret });
+  const { head } = await fetchPermissionsHead(serverUrl, { appId, adminSecret });
   await publishStoredPermissions(serverUrl, {
+    appId,
     adminSecret,
     schemaHash,
     permissions,

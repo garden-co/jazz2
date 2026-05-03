@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "node ../../packages/jazz-tools/dist/cli.js validate && vite build",
     "preview": "vite preview",
-    "test": "vitest run --config vitest.config.browser.ts",
+    "test": "pnpm run test:unit && pnpm run test:browser",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:browser": "vitest run --config vitest.config.browser.ts",
+    "test:e2e": "playwright test",
     "walkthrough": "npx @marp-team/marp-cli --html --theme walkthrough/theme-jazz.css walkthrough/jazz-chat.md --preview",
     "walkthrough:shots": "playwright test --config playwright.screenshots.config.ts"
   },

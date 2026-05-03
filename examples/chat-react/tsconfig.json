@@ -13,5 +13,5 @@
     },
     "types": ["node"]
   },
-  "include": ["src", "schema", "e2e", "playwright.config.ts"]
+  "include": ["src", "schema.ts", "tests", "e2e", "playwright.config.ts"]
 }

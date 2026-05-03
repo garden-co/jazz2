@@ -1,20 +1,33 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { WasmSchema } from "../drivers/types.js";
-import { TestingServer, pushSchemaCatalogue, startLocalJazzServer } from "./index.js";
+import { anyOf, definePermissions } from "../permissions/index.js";
+import { schema as s } from "../index.js";
+import {
+  createPolicyTestApp,
+  TestingServer,
+  pushSchemaCatalogue,
+  startLocalJazzServer,
+} from "./index.js";
 
 const tempRoots: string[] = [];
-const TEST_SCHEMA: WasmSchema = {
-  todos: {
-    columns: [
-      { name: "title", column_type: { type: "Text" }, nullable: false },
-      { name: "done", column_type: { type: "Boolean" }, nullable: false },
-    ],
-  },
+const testSchema = {
+  todos: s.table({
+    title: s.string(),
+    done: s.boolean(),
+    ownerId: s.string().optional(),
+  }),
 };
+type TestSchema = s.Schema<typeof testSchema>;
+const testApp: s.App<TestSchema> = s.defineApp(testSchema);
+const testPermissions = definePermissions(testApp, ({ policy, session }) => {
+  policy.todos.allowRead.where(
+    anyOf([{ ownerId: session.user_id }, { ownerId: { isNull: true } }]),
+  );
+  policy.todos.allowInsert.where({ ownerId: session.user_id });
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -72,18 +85,6 @@ async function getAvailablePort(): Promise<number> {
   });
 }
 
-async function createFailingFakeJazzBinary(stderrText: string): Promise<string> {
-  const rootPath = await createTempRoot("jazz-tools-testing-fake-fail-");
-  const binaryPath = join(rootPath, "fake-jazz-fail");
-  const script = `#!/bin/sh
-echo "${stderrText}" 1>&2
-exit 13
-`;
-  await writeFile(binaryPath, script, "utf8");
-  await chmod(binaryPath, 0o755);
-  return binaryPath;
-}
-
 describe("TestingServer", () => {
   it("starts and is reachable at /health", async () => {
     const server = await TestingServer.start();
@@ -119,14 +120,14 @@ describe("TestingServer", () => {
       const allowed = await fetch(`${server.url}/apps/${server.appId}/admin/schemas`, {
         method: "POST",
         headers: { "content-type": "application/json", "X-Jazz-Admin-Secret": adminSecret },
-        body: JSON.stringify({ schema: TEST_SCHEMA }),
+        body: JSON.stringify({ schema: testApp.wasmSchema }),
       });
       expect(allowed.status).toBe(201);
 
       const denied = await fetch(`${server.url}/apps/${server.appId}/admin/schemas`, {
         method: "POST",
         headers: { "content-type": "application/json", "X-Jazz-Admin-Secret": "wrong-secret" },
-        body: JSON.stringify({ schema: TEST_SCHEMA }),
+        body: JSON.stringify({ schema: testApp.wasmSchema }),
       });
       expect(denied.status).toBe(401);
     } finally {
@@ -245,7 +246,7 @@ describe("startLocalJazzServer", () => {
           "content-type": "application/json",
           "X-Jazz-Admin-Secret": adminSecret,
         },
-        body: JSON.stringify({ schema: TEST_SCHEMA }),
+        body: JSON.stringify({ schema: testApp.wasmSchema }),
       });
 
       expect(response.status).toBe(201);
@@ -271,7 +272,7 @@ describe("startLocalJazzServer", () => {
           "content-type": "application/json",
           "X-Jazz-Admin-Secret": "wrong-admin-secret",
         },
-        body: JSON.stringify({ schema: TEST_SCHEMA }),
+        body: JSON.stringify({ schema: testApp.wasmSchema }),
       });
 
       expect(response.status).toBe(401);
@@ -339,4 +340,31 @@ describe("pushSchemaCatalogue", () => {
       }),
     ).rejects.toThrow();
   }, 10_000);
+});
+
+describe("createPolicyTestApp", () => {
+  it("creates a test app from an app definition and compiled permissions", async () => {
+    const policyTestApp = await createPolicyTestApp(testApp, testPermissions, expect);
+
+    try {
+      const seeded = policyTestApp.seed((db) => {
+        const { value } = db.insert(testApp.todos, {
+          title: "Ship the direct app API",
+          done: false,
+          ownerId: "alice",
+        });
+        return value;
+      });
+
+      const alice = policyTestApp.as({ user_id: "alice", claims: {}, authMode: "local-first" });
+      const bob = policyTestApp.as({ user_id: "bob", claims: {}, authMode: "local-first" });
+
+      await expect(alice.all(testApp.todos.where({ id: seeded.id }))).resolves.toEqual([
+        expect.objectContaining({ id: seeded.id }),
+      ]);
+      await expect(bob.all(testApp.todos.where({ id: seeded.id }))).resolves.toEqual([]);
+    } finally {
+      await policyTestApp.shutdown();
+    }
+  }, 30_000);
 });
