@@ -8,6 +8,7 @@
     "noEmit": true,
     "rootDir": ".",
     "sourceMap": false,
+    "inlineSources": false,
     "paths": {
       "jazz-tools": ["./src/index.ts"],
       "jazz-tools/*": ["./src/*"]
