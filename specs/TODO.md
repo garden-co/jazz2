@@ -40,6 +40,10 @@
 - [**text-encoded-storage-enums**](todo/issues/text-encoded-storage-enums.md) — Flat row storage currently encodes enum-like fields as text, which is larger than necessary and adds avoidable decode overhead on hot storage paths.
 - [**ws-route-clones-every-inbound-frame**](todo/issues/ws-route-clones-every-inbound-frame.md) — `crates/jazz-tools/src/routes.rs:1345` does `let inner = inner.to_vec();` before handing the payload to `process_ws_client_frame(&inner)`. The borrow from `frame_decode(&data)` would survive the `.await` because `data` owns the bytes, so the clone is avoidable — pass `&[u8]` through directly.
 
+### Unknown
+
+- [**unsealed-pending-rows-cleanup**](todo/issues/unsealed-pending-rows-cleanup.md) — Clean up hidden pending rows that were staged for a transaction but never sealed, for example because the user rolled back, disconnected before sending the seal, threw during application code, or hit a client bug.
+
 ## Ideas
 
 ### Mvp

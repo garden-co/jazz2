@@ -96,8 +96,8 @@ The current `Db` API centers around a small set of predictable operations:
 - `update(...)`
 - `delete(...)`
 - `subscribeAll(...)`
-- `beginBatch(...)`
-- `beginTransaction(...)`
+- `beginBatch()`
+- `beginTransaction()`
 
 Simple write calls are one-member direct batches under the hood. They seal immediately and return
 handles that callers can wait on for a specific durability tier.
@@ -130,6 +130,7 @@ Open batch writes are intentionally not individually waitable:
 - `tx.insert(...)` and `batch.insert(...)` return the inserted row
 - `tx.update(...)`, `tx.delete(...)`, `batch.update(...)`, and `batch.delete(...)` return `void`
 - `tx.commit()` and `batch.commit()` return the batch-shaped write handle
+- `tx.rollback()` closes an open transaction handle without sealing or committing the batch
 
 That makes the common durable path explicit in the type shape:
 
@@ -153,6 +154,10 @@ Both explicit batch handles add the explicit completion step:
 
 - `tx.commit()` in TypeScript
 - `batch.commit()` in TypeScript
+
+Transactional handles also expose `tx.rollback()` / `DbTransaction.rollback()`. Rollback only marks
+that transaction handle as rolled back: it does not seal the batch, does not remove pending staged
+rows, and makes any later write, read, `commit()`, or `rollback()` call on the same transaction fail.
 
 Persisted writes are batch-shaped too:
 

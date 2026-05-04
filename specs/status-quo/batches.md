@@ -446,6 +446,15 @@ The runtime creates a `LocalBatchRecord` with:
 
 After this point the transactional batch is no longer writable.
 
+### 4a. Explicit rollback
+
+`rollback()` on a TypeScript transaction handle marks only that handle as rolled back:
+
+- the batch is not sealed
+- no `SyncPayload::SealBatch` is emitted
+- pending staged rows are not deleted or rewritten
+- later writes, reads, `commit()`, or `rollback()` calls on that same transaction handle fail
+
 ### 5. Authority decision
 
 The authority validates:
@@ -506,6 +515,7 @@ Important APIs:
 - `client.localBatchRecords()`
 - `client.acknowledgeRejectedBatch(batchId)`
 - `tx.commit()`
+- `tx.rollback()`
 - `batch.commit()`
 - `db.beginBatch()`
 - `db.beginTransaction()`
@@ -525,6 +535,8 @@ Open explicit batch writes are not individually waitable:
 - `Transaction.update(...)`, `Transaction.delete(...)`, `DirectBatch.update(...)`, and
   `DirectBatch.delete(...)` return `void`
 - `Transaction.commit()` and `DirectBatch.commit()` return the waitable batch handle
+- `Transaction.rollback()` / `DbTransaction.rollback()` return `void` and close the transaction
+  handle without sealing the batch
 
 `PersistedWrite` also stays batch-shaped:
 

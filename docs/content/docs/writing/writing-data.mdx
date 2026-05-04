@@ -10,6 +10,7 @@ All writes execute against the local database first. `insert`, `update`, and `de
 
 Jazz also allows grouping writes together using [batches and transactions](#transactions-and-batches).
 Writes made through an open transaction or batch are not individually waitable. Call `.wait({ tier })` on the returned write result instead.
+Call `rollback()` on an open transaction if you want to close that transaction handle without committing it.
 
 <Callout type="info">
 For browser `Blob`, `File`, or `ReadableStream` uploads, use `db.createFileFromBlob(...)`
@@ -179,7 +180,19 @@ console.log(result.batchId);
 The changes made as part of the transaction are scoped to it, and will only be
 globally visible once it's committed and accepted by the authority.
 
-`DbTransaction` can read its own staged state through `all(...)` and `one(...)` before commit.
+`DbTransaction` can also read its own staged state through `all(...)` and `one(...)` before commit.
+Call `tx.rollback()` to explicitly abandon an open transaction handle without committing it:
+
+```ts
+const tx = db.beginTransaction();
+
+tx.insert(app.todos, { title: "Maybe later", done: false });
+tx.rollback();
+
+// Any later write, read, commit, or rollback call on this transaction throws.
+```
+
+Rollback prevents the same transaction handle from being committed or used again.
 
 You can also use a batch when you want to group several ordinary writes under one batch id, but still want them
 to be locally visible immediately:
