@@ -10,6 +10,30 @@ function defaultPersistentDataDir(projectRoot: string): string {
 
 const LOG_PREFIX = "[jazz]";
 
+function isSchemaPushNetworkError(error: unknown): boolean {
+  return error instanceof TypeError && error.message === "fetch failed";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function warnInitialSchemaPushSkipped(opts: {
+  serverUrl: string;
+  envServerUrlKey: string | null;
+  error: unknown;
+}): void {
+  const fallback =
+    opts.envServerUrlKey === null
+      ? "remove the remote server URL option"
+      : `comment out ${opts.envServerUrlKey}`;
+  console.warn(
+    `${LOG_PREFIX} schema auto-push skipped because ${opts.serverUrl} is unreachable (${errorMessage(
+      opts.error,
+    )}). The dev server will keep using this app and server URL. To use a local Jazz dev server while offline, ${fallback}. Save schema.ts/permissions.ts or restart after reconnecting to publish again.`,
+  );
+}
+
 function toRelativePath(absPath: string): string {
   const rel = relative(process.cwd(), absPath);
   if (!rel) return ".";
@@ -214,6 +238,8 @@ export class ManagedDevRuntime {
       let serverUrl: string;
       let adminSecret: string;
       let appId: string;
+      let usesExistingServer = false;
+      let existingServerEnvKey: string | null = null;
 
       try {
         if (serverOpt === false) {
@@ -221,6 +247,8 @@ export class ManagedDevRuntime {
         }
 
         if (process.env[this.envKeys.serverUrl]) {
+          usesExistingServer = true;
+          existingServerEnvKey = this.envKeys.serverUrl;
           serverUrl = process.env[this.envKeys.serverUrl]!;
           adminSecret = options.adminSecret ?? process.env.JAZZ_ADMIN_SECRET ?? "";
           appId = process.env[this.envKeys.appId] ?? options.appId ?? "";
@@ -237,6 +265,7 @@ export class ManagedDevRuntime {
           console.log(`${LOG_PREFIX} using server from env: ${serverUrl}`);
           console.log(`${LOG_PREFIX} app id: ${appId}`);
         } else if (typeof serverOpt === "string") {
+          usesExistingServer = true;
           serverUrl = serverOpt;
           adminSecret = options.adminSecret ?? "";
           appId = options.appId ?? "";
@@ -299,8 +328,20 @@ export class ManagedDevRuntime {
         await persistAppIdToEnv(envPath, this.envKeys.appId, appId);
 
         const { pushSchemaCatalogue } = await import("./dev-server.js");
-        await pushSchemaCatalogue({ serverUrl, appId, adminSecret, schemaDir });
-        console.log(`${LOG_PREFIX} schema published`);
+        try {
+          await pushSchemaCatalogue({ serverUrl, appId, adminSecret, schemaDir });
+          console.log(`${LOG_PREFIX} schema published`);
+        } catch (error) {
+          if (usesExistingServer && isSchemaPushNetworkError(error)) {
+            warnInitialSchemaPushSkipped({
+              serverUrl,
+              envServerUrlKey: existingServerEnvKey,
+              error,
+            });
+          } else {
+            throw error;
+          }
+        }
 
         const { watchSchema } = await import("./schema-watcher.js");
         this.watcher = watchSchema({
