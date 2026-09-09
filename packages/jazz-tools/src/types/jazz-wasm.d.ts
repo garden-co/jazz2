@@ -18,7 +18,6 @@ declare module "jazz-wasm" {
     nowSeconds: bigint,
   ): string;
 
-  export class WasmPreparedQuery {}
   type PendingNativeOperation<T> = {
     poll(): T | undefined;
     cancel(): void;
@@ -138,22 +137,18 @@ declare module "jazz-wasm" {
     commitTransaction(openTransactionId: string, kind?: string | null): WasmWrite;
     rollbackTransaction(openTransactionId: string): void;
 
-    prepareQuery(
-      query: Uint8Array,
-      kind: "query" | "relation",
-      author?: Uint8Array,
-      claims?: Record<string, unknown>,
-    ): WasmPreparedQuery | PendingNativeOperation<WasmPreparedQuery>;
     all(
-      query: WasmPreparedQuery,
+      query: Uint8Array,
       opts: unknown,
       openTransactionId?: string,
       author?: Uint8Array,
+      claims?: Record<string, unknown>,
     ): Uint8Array | PendingNativeRead;
     subscribe(
-      query: WasmPreparedQuery,
+      query: Uint8Array,
       opts: unknown,
       author?: Uint8Array,
+      claims?: Record<string, unknown>,
     ): ReadableStream<unknown> | PendingNativeOperation<ReadableStream<unknown>>;
 
     insert(table: string, cells: Uint8Array, options?: InsertOptions): WasmWrite;

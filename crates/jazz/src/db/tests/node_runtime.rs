@@ -1665,11 +1665,11 @@ fn db_sync_surface_edge_session_read_policy_filters_private_table_query() {
         server_writer_transport,
         alice,
         BTreeMap::from([(
-            "user_id".to_owned(),
+            crate::query::provider_claim_key("sub"),
             Value::String(alice.test_uuid().to_string()),
         )]),
     );
-    writer
+    let write = writer
         .insert(
             "messages",
             BTreeMap::from([
@@ -1684,6 +1684,11 @@ fn db_sync_surface_edge_session_read_policy_filters_private_table_query() {
         .unwrap();
     writer.tick().unwrap();
     server.tick().unwrap();
+    writer.tick().unwrap();
+    assert!(
+        matches!(write.write_state().unwrap().fate, Fate::Accepted),
+        "the private row must be accepted before testing Bob's read denial"
+    );
 
     let (reader_transport, server_reader_transport) = duplex();
     let _reader_upstream = crate::db::block_on(reader.connect_upstream(reader_transport));
@@ -1691,13 +1696,17 @@ fn db_sync_surface_edge_session_read_policy_filters_private_table_query() {
         server_reader_transport,
         bob,
         BTreeMap::from([(
-            "user_id".to_owned(),
+            crate::query::provider_claim_key("sub"),
             Value::String(bob.test_uuid().to_string()),
         )]),
     );
     let query = Query::from("messages");
     let mut subscription = prepared_subscribe(&reader, &query, edge_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
+    reader.tick().unwrap();
+    server.tick().unwrap();
+    reader.tick().unwrap();
+    assert!(opened_rows(next_settled_opening(&mut subscription)).is_empty());
     assert!(prepared_all(&reader, &query, edge_subscribe_opts()).is_empty());
 }
 
@@ -2041,11 +2050,11 @@ fn db_sync_surface_edge_session_read_policy_filters_after_runtime_schema_publish
     let query = Query::from("messages");
     let mut alice_subscription =
         prepared_subscribe(&alice_reader, &query, edge_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(alice_subscription.next_raw()).unwrap()).is_empty());
+    assert!(alice_subscription.try_next_event().is_none());
     alice_reader.tick().unwrap();
     server.tick().unwrap();
     alice_reader.tick().unwrap();
-    let (added, updated, removed) = delta_rows(block_on(alice_subscription.next_raw()).unwrap());
+    let (added, updated, removed) = delta_rows(next_settled_opening(&mut alice_subscription));
     assert_eq!(
         added.len(),
         1,
@@ -2069,8 +2078,12 @@ fn db_sync_surface_edge_session_read_policy_filters_after_runtime_schema_publish
         )]),
     );
     let mut subscription = prepared_subscribe(&reader, &query, edge_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
+    reader.tick().unwrap();
+    server.tick().unwrap();
+    reader.tick().unwrap();
+    assert!(opened_rows(next_settled_opening(&mut subscription)).is_empty());
     assert!(prepared_all(&reader, &query, edge_subscribe_opts()).is_empty());
 }
 
@@ -2091,13 +2104,14 @@ fn detached_subscriber_is_not_served_on_server_tick() {
 
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
     client.tick().unwrap();
 
     assert!(server.server.detach_connection(&subscriber));
     server.tick().unwrap();
     client.tick().unwrap();
 
+    assert!(subscription.try_next_event().is_none());
     assert!(prepared_read(&client, &query).is_empty());
 }
 
@@ -2124,7 +2138,7 @@ fn byte_wire_round_trips_subscription_to_client() {
 
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     {
@@ -2159,7 +2173,7 @@ fn byte_wire_round_trips_subscription_to_client() {
         rows[0].cell(table, "title"),
         Some(Value::String("from server".to_owned()))
     );
-    let (added, updated, removed) = delta_rows(block_on(subscription.next_raw()).unwrap());
+    let (added, updated, removed) = delta_rows(next_settled_opening(&mut subscription));
     assert_eq!(added.len(), 1);
     assert!(updated.is_empty());
     assert!(removed.is_empty());
@@ -2203,8 +2217,8 @@ fn single_upstream_tick_applies_multiple_subscription_updates() {
         prepared_subscribe(&client, &projects, global_subscribe_opts()).unwrap();
     let mut issue_subscription =
         prepared_subscribe(&client, &issues, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(project_subscription.next_raw()).unwrap()).is_empty());
-    assert!(opened_rows(block_on(issue_subscription.next_raw()).unwrap()).is_empty());
+    assert!(project_subscription.try_next_event().is_none());
+    assert!(issue_subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
@@ -2214,13 +2228,13 @@ fn single_upstream_tick_applies_multiple_subscription_updates() {
     assert_eq!(prepared_read(&client, &issues).len(), 1);
     assert_eq!(stats.subscription_events, 2);
     assert_eq!(
-        delta_rows(block_on(project_subscription.next_raw()).unwrap())
+        delta_rows(next_settled_opening(&mut project_subscription))
             .0
             .len(),
         1
     );
     assert_eq!(
-        delta_rows(block_on(issue_subscription.next_raw()).unwrap())
+        delta_rows(next_settled_opening(&mut issue_subscription))
             .0
             .len(),
         1
@@ -2244,14 +2258,14 @@ fn subscriber_connection_serves_current_rows_and_resumes_from_cursor() {
     let subscriber = server.accept_subscriber(server_transport, client_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     // The ordinary whole-table subscription owns its initial snapshot.
     client.tick().unwrap();
     server.tick().unwrap();
     client.tick().unwrap();
 
-    let (added, updated, removed) = delta_rows(block_on(subscription.next_raw()).unwrap());
+    let (added, updated, removed) = delta_rows(next_settled_opening(&mut subscription));
     assert_eq!(added.len(), 2);
     assert!(updated.is_empty());
     assert!(removed.is_empty());
@@ -2278,12 +2292,12 @@ fn subscriber_connection_serves_current_rows_and_resumes_from_cursor() {
     let full_subscriber = full_server.accept_subscriber(full_server_transport, client_author);
     let mut full_subscription =
         prepared_subscribe(&full_client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(full_subscription.next_raw()).unwrap()).is_empty());
+    assert!(full_subscription.try_next_event().is_none());
     full_client.tick().unwrap();
     full_server.tick().unwrap();
     full_client.tick().unwrap();
     assert_eq!(
-        delta_rows(block_on(full_subscription.next_raw()).unwrap())
+        delta_rows(next_settled_opening(&mut full_subscription))
             .0
             .len(),
         3
@@ -2404,13 +2418,13 @@ fn byte_wire_subscriber_connection_serves_current_rows_and_resumes_from_cursor()
     let subscriber = server.accept_subscriber(server_transport, client_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
     client.tick().unwrap();
 
-    let (added, updated, removed) = delta_rows(block_on(subscription.next_raw()).unwrap());
+    let (added, updated, removed) = delta_rows(next_settled_opening(&mut subscription));
     assert_eq!(added.len(), 2);
     assert!(updated.is_empty());
     assert!(removed.is_empty());
@@ -2438,12 +2452,12 @@ fn byte_wire_subscriber_connection_serves_current_rows_and_resumes_from_cursor()
     let full_subscriber = full_server.accept_subscriber(full_server_transport, client_author);
     let mut full_subscription =
         prepared_subscribe(&full_client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(full_subscription.next_raw()).unwrap()).is_empty());
+    assert!(full_subscription.try_next_event().is_none());
     full_client.tick().unwrap();
     full_server.tick().unwrap();
     full_client.tick().unwrap();
     assert_eq!(
-        delta_rows(block_on(full_subscription.next_raw()).unwrap())
+        delta_rows(next_settled_opening(&mut full_subscription))
             .0
             .len(),
         3
@@ -3129,13 +3143,13 @@ fn accepted_subscriber_is_served_under_subscriber_author_identity() {
     let _subscriber = server.accept_subscriber(server_transport, subscriber_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
     client.tick().unwrap();
 
-    let (rows, updated, removed) = delta_rows(block_on(subscription.next_raw()).unwrap());
+    let (rows, updated, removed) = delta_rows(next_settled_opening(&mut subscription));
     assert!(updated.is_empty());
     assert!(removed.is_empty());
     assert_eq!(row_ids(&rows), vec![visible]);
@@ -3160,6 +3174,7 @@ fn client_initial_sync_flush_cadence_preserves_public_snapshot_delivery() {
                         Value::String(format!("server {ordinal}")),
                     ),
                     ("done".to_owned(), Value::Bool(false)),
+                    ("owner".to_owned(), Value::Uuid(row(0xd4).0)),
                 ]),
             )
             .unwrap();
@@ -3177,15 +3192,23 @@ fn client_initial_sync_flush_cadence_preserves_public_snapshot_delivery() {
     let _subscriber = server.accept_subscriber(server_transport, client_author);
     let query = client.table("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    let _ = block_on(subscription.next_raw()).unwrap();
+    assert!(subscription.try_next_event().is_none());
 
     for _ in 0..20 {
         client.tick().unwrap();
         server.server.tick().unwrap();
         client.tick().unwrap();
-        if let Some(event) = subscription.try_next_event()
-            && opened_rows(event).len() == 3
-        {
+        if let Some(event) = subscription.try_next_event() {
+            assert!(matches!(
+                &event,
+                SubscriptionEvent::Delta {
+                    reset: true,
+                    publishable: true,
+                    settled: true,
+                    ..
+                }
+            ));
+            assert_eq!(opened_rows(event).len(), 3);
             return;
         }
     }

@@ -826,7 +826,10 @@ function translateBuiltRelationToRelExpr(
  * - hopTo => Join + Project
  * - gather => Gather with step Join + Project
  */
-function translateBuilderToRelationIr(builderJson: string, schema: WasmSchema): RelExpr {
+function translateBuilderToRelationIr(
+  builderJson: string,
+  schema: WasmSchema,
+): { relation: RelExpr; outputTable: string } {
   const builder = normalizeBuiltQuery(JSON.parse(builderJson));
   const relations = analyzeRelations(schema);
   const hops = builder.hops;
@@ -925,7 +928,7 @@ function translateBuilderToRelationIr(builderJson: string, schema: WasmSchema): 
     };
   }
 
-  return relation;
+  return { relation, outputTable: relationTable };
 }
 
 function usesNativeRelationFeatures(builder: ReturnType<typeof normalizeBuiltQuery>): boolean {
@@ -1003,9 +1006,9 @@ export function translateQuery(builderJson: string, schema: WasmSchema): string 
   });
 
   if (usesNativeRelationFeatures(builder)) {
-    const relation = translateBuilderToRelationIr(builderJson, schema);
+    const { relation, outputTable } = translateBuilderToRelationIr(builderJson, schema);
     return stringifyRuntimeQuery({
-      table: builder.table,
+      table: outputTable,
       array_subqueries: arraySubqueries,
       relation_ir: relation,
       ...(builder.includeDeleted ? { include_deleted: true } : {}),

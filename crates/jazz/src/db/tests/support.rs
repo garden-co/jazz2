@@ -537,6 +537,27 @@ pub(super) fn apply_subscription_event(snapshot: &mut RelationSnapshot, event: S
     }
 }
 
+/// Check the first public delivery after the fixture has driven synchronization.
+/// Polling instead of blocking makes missing progress fail here, not hang the test.
+pub(super) fn next_settled_opening(stream: &mut SubscriptionStream) -> SubscriptionEvent {
+    let event = stream
+        .try_next_event()
+        .expect("settled subscription opening after synchronization");
+    assert!(
+        matches!(
+            &event,
+            SubscriptionEvent::Delta {
+                reset: true,
+                publishable: true,
+                settled: true,
+                ..
+            }
+        ),
+        "expected a complete settled opening, got {event:?}"
+    );
+    event
+}
+
 pub(super) fn opened_rows(event: SubscriptionEvent) -> Vec<CurrentRow> {
     let mut snapshot = RelationSnapshot::default();
     apply_subscription_event(&mut snapshot, event);

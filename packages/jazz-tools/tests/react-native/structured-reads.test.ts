@@ -16,6 +16,19 @@ const query = app.groups
 // Browser donor: db.include-subscriptions.server.test.ts selected nested
 // includes. This fixture replaces browser transport with the real native owner.
 describe("React Native structured reads", () => {
+  it("returns empty local hop results before inserts and after removing their last match", async () => {
+    await withNativeRelayFixture(app, async (fixture) => {
+      const db = await fixture.createDb();
+      const related = app.tasks.where({ title: "included" }).hopTo("group").orderBy("name");
+      expect(await db.all(related, { tier: "local" })).toEqual([]);
+      const group = db.insert(app.groups, { name: "group" }).value;
+      const task = db.insert(app.tasks, { title: "included", group_id: group.id }).value;
+      expect(await db.all(related, { tier: "local" })).toEqual([group]);
+      db.delete(app.tasks, task.id);
+      expect(await db.all(related, { tier: "local" })).toEqual([]);
+    });
+  });
+
   it("executes a public hop through canonical async relation preparation", async () => {
     await withNativeRelayFixture(app, async (fixture) => {
       const db = await fixture.createDb();

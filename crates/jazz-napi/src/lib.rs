@@ -66,11 +66,11 @@ use jazz::db::{
     DbConfig as CoreDbConfig, DbIdentity as CoreDbIdentity,
     InitialSyncFlushCadence as CoreInitialSyncFlushCadence, LocalUpdates as CoreLocalUpdates,
     MutationErrorCallback as CoreMutationErrorCallback, PeerConnection as CorePeerConnection,
-    PreparedQuery as CorePreparedQuery, Propagation as CorePropagation,
-    QueryAttachment as CoreQueryAttachment, ReadOpts as CoreReadOpts, RowCells as CoreRowCells,
-    SeededRowIdSource as CoreSeededRowIdSource, StreamingValueUpload as CoreStreamingValueUpload,
-    SubscriptionEvent as CoreSubscriptionEvent, SubscriptionStream,
-    TickScheduler as CoreTickScheduler, TickUrgency as CoreTickUrgency,
+    Propagation as CorePropagation, ReadOpts as CoreReadOpts, RowCells as CoreRowCells,
+    SeededRowIdSource as CoreSeededRowIdSource, SerializedReadResult as CoreSerializedReadResult,
+    SerializedSubscriptionAuthorization as CoreSerializedSubscriptionAuthorization,
+    StreamingValueUpload as CoreStreamingValueUpload, SubscriptionEvent as CoreSubscriptionEvent,
+    SubscriptionStream, TickScheduler as CoreTickScheduler, TickUrgency as CoreTickUrgency,
     WireTransportAdapter as CoreWireTransportAdapter, WriteHandle, block_on as core_block_on,
 };
 use jazz::groove::records::Value as CoreValue;
@@ -87,7 +87,6 @@ use jazz::protocol::{
     PermissionAdvice as CorePermissionAdvice, PermissionAdviceAction as CorePermissionAdviceAction,
     ReadViewSpec as CoreReadViewSpec,
 };
-use jazz::query::{Query as CoreQuery, RelationQuery as CoreRelationQuery};
 use jazz::schema::JazzSchema;
 use jazz::storage_codec_profile::epoch_1_storage_codec_profile;
 use jazz::tools::OpenTransactionId as CoreOpenTransactionId;
@@ -382,12 +381,6 @@ impl CoreWireTransport for NapiWireTransport {
     }
 }
 
-#[napi(js_name = "PreparedQuery")]
-pub struct PreparedQuery {
-    inner: CorePreparedQuery,
-    is_relation: bool,
-}
-
 #[napi(js_name = "Write")]
 pub struct Write {
     payload: Vec<u8>,
@@ -407,51 +400,6 @@ type NativeReadCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 pub struct PendingNativeRead {
     future: Rc<RefCell<Option<LocalBoxFuture<'static, napi::Result<Uint8Array>>>>>,
     cleanup: NativeReadCleanup,
-}
-
-/// Thread-affine query preparation waiting for the core owner.
-#[napi]
-pub struct PendingNativePreparation {
-    future: RefCell<Option<LocalBoxFuture<'static, napi::Result<PreparedQuery>>>>,
-    wake: RefCell<Option<Waker>>,
-}
-
-#[napi]
-impl PendingNativePreparation {
-    #[napi(js_name = "setWake")]
-    pub fn set_wake(&self, callback: ThreadsafeFunction<String, ()>) {
-        *self.wake.borrow_mut() = Some(waker(std::sync::Arc::new(NapiQueryRuntimeWake {
-            callback: std::sync::Arc::new(callback),
-        })));
-    }
-
-    #[napi]
-    pub fn poll(&self) -> napi::Result<Option<PreparedQuery>> {
-        let Some(mut future) = self.future.borrow_mut().take() else {
-            return Err(napi::Error::from_reason(
-                "query preparation is complete or cancelled",
-            ));
-        };
-        let wake = self
-            .wake
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| Waker::noop().clone());
-        let mut context = Context::from_waker(&wake);
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => result.map(Some),
-            Poll::Pending => {
-                *self.future.borrow_mut() = Some(future);
-                Ok(None)
-            }
-        }
-    }
-
-    #[napi]
-    pub fn cancel(&self) {
-        self.future.borrow_mut().take();
-        self.wake.borrow_mut().take();
-    }
 }
 
 /// Thread-affine subscription opening waiting for the core owner.
@@ -2412,88 +2360,19 @@ impl NapiDb {
         Ok(())
     }
 
-    #[napi(
-        js_name = "prepareQuery",
-        ts_return_type = "PreparedQuery | PendingNativePreparation"
-    )]
-    pub fn prepare_query(
-        &self,
-        query: Uint8Array,
-        #[napi(ts_arg_type = "'query' | 'relation'")] kind: String,
-        author: Option<Uint8Array>,
-        claims: Option<JsonValue>,
-    ) -> napi::Result<Either<PreparedQuery, PendingNativePreparation>> {
-        enum Input {
-            Query(Box<CoreQuery>),
-            Relation(CoreRelationQuery),
-        }
-
-        let admission = author
-            .map(|author| {
-                let author = self.author_admissions.resolve(&author)?;
-                Ok::<_, napi::Error>((author, core_claims_from_json(author, claims)?))
-            })
-            .transpose()?;
-        let input = match kind.as_str() {
-            "query" => Input::Query(Box::new(
-                jazz::wire::decode_postcard_exact(&query)
-                    .map_err(|error| napi::Error::from_reason(format!("decode query: {error}")))?,
-            )),
-            "relation" => Input::Relation(core_relation_query_from_bytes(&query)?),
-            _ => {
-                return Err(napi::Error::from_reason(
-                    "prepared query kind must be query or relation",
-                ));
-            }
-        };
-        let is_relation = kind == "relation";
-        let db = self.inner.borrow();
-        let db = db
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
-        macro_rules! prepare {
-            ($db:expr) => {{
-                let db = Rc::clone($db);
-                let pending = PendingNativePreparation {
-                    wake: RefCell::new(None),
-                    future: RefCell::new(Some(Box::pin(async move {
-                        let inner = match input {
-                            Input::Query(query) => db.prepare_query_async(&query).await,
-                            Input::Relation(query) => db.prepare_relation_query_async(&query).await,
-                        }
-                        .map_err(napi_error)?;
-                        let inner = match admission {
-                            Some((author, claims)) => inner.with_identity_claims(author, claims),
-                            None => inner,
-                        };
-                        Ok(PreparedQuery { inner, is_relation })
-                    }))),
-                };
-                match pending.poll()? {
-                    Some(query) => Ok(Either::A(query)),
-                    None => Ok(Either::B(pending)),
-                }
-            }};
-        }
-        match db {
-            NapiDbInnerStorage::Memory(db) => prepare!(db),
-            NapiDbInnerStorage::Persistent(db) => prepare!(db),
-        }
-    }
-
-    /// Execute any prepared read. The prepared handle selects flat rows,
-    /// relation output, or a relation snapshot; transaction and authorization
-    /// context remain ordinary call options.
+    /// Decode, prepare, and execute one read inside Rust. Query-plan ownership
+    /// never crosses the language boundary.
     #[napi]
     pub fn all(
         &self,
-        query: &PreparedQuery,
+        query: Uint8Array,
         #[napi(
             ts_arg_type = "{ tier?: string; local_updates?: string; propagation?: string; include_deleted?: boolean; sync?: boolean } | undefined | null"
         )]
         opts: Option<JsonValue>,
         open_transaction_id: Option<String>,
         author: Option<Uint8Array>,
+        claims: Option<JsonValue>,
     ) -> napi::Result<Either<Uint8Array, PendingNativeRead>> {
         let synchronous = opts
             .as_ref()
@@ -2506,8 +2385,14 @@ impl NapiDb {
             .map(|id| id.parse::<CoreOpenTransactionId>())
             .transpose()
             .map_err(napi::Error::from_reason)?;
-        let author = match author {
-            Some(author) => Some(self.author_admissions.resolve(&author)?),
+        let explicit_author = author
+            .map(|author| self.author_admissions.resolve(&author))
+            .transpose()?;
+        let admission = explicit_author
+            .map(|author| Ok::<_, napi::Error>((author, core_claims_from_json(author, claims)?)))
+            .transpose()?;
+        let author = match explicit_author {
+            Some(author) => Some(author),
             None if self.trusted_backend => Some(CoreAuthorSubject::SYSTEM),
             None => None,
         };
@@ -2519,11 +2404,7 @@ impl NapiDb {
         macro_rules! read {
             ($db:expr) => {{
                 let db = Rc::clone($db);
-                let is_relation = query.is_relation;
-                let query = query.inner.clone();
-                let attachment = Rc::new(RefCell::new(None::<CoreQueryAttachment>));
-                let cleanup_attachment = Rc::clone(&attachment);
-                let cleanup_db = Rc::clone(&db);
+                let release_db = Rc::clone(&db);
                 let preceding_writes =
                     (!synchronous && open_tx.is_none()).then(|| db.queued_mutation_barrier());
                 let future = Box::pin(async move {
@@ -2540,116 +2421,30 @@ impl NapiDb {
                     let requires_coverage = non_durable_client
                         || (opts.tier >= jazz::tx::DurabilityTier::Edge
                             && opts.propagation == CorePropagation::Full);
-                    if !synchronous && requires_coverage {
-                        let attached = db
-                            .attach_query_with_opts_async(&query, opts.clone(), open_tx, author)
-                            .await
-                            .map_err(napi_error)?;
-                        *attachment.borrow_mut() = Some(attached);
-                        let coverage_deadline = Instant::now() + Duration::from_secs(15);
-                        futures::future::poll_fn(|_| {
-                            let covered = attachment.borrow().as_ref().is_some_and(|attachment| {
-                                db.query_attachment_is_covered(attachment)
-                            });
-                            if covered {
-                                Poll::Ready(Ok(()))
-                            } else if Instant::now() >= coverage_deadline {
-                                Poll::Ready(Err(napi::Error::from_reason(
-                                    "Timed out waiting for query coverage",
-                                )))
-                            } else {
-                                Poll::Pending
-                            }
-                        })
-                        .await?;
-                    }
-
-                    let result = async {
-                        if !is_relation && query.shape().query().array_subqueries.is_empty() {
-                            let mut rows = match open_tx {
-                                Some(open_tx) => {
-                                    db.all_in_open_transaction(open_tx, &query, opts, author)
-                                        .await
-                                }
-                                None => match author {
-                                    Some(author) => db.all_for_identity(&query, opts, author).await,
-                                    None => db.all(&query, opts).await,
-                                },
-                            }
-                            .map_err(napi_error)?;
-                            db.hydrate_rows_for_binding(&mut rows)
-                                .await
-                                .map_err(napi_error)?;
-                            encode_core_rows(&rows)
-                                .map(Uint8Array::new)
-                                .map_err(napi_error)
-                        } else if is_relation {
-                            // Relation programs change the root row set itself (for example,
-                            // Union + OrderBy). Execute that prepared program through the
-                            // ordinary row path so its occurrence order is retained, then wrap
-                            // those roots in the one canonical relation-result envelope.
-                            let mut rows = match open_tx {
-                                Some(open_tx) => {
-                                    db.all_in_open_transaction(open_tx, &query, opts, author)
-                                        .await
-                                }
-                                None => match author {
-                                    Some(author) => db.all_for_identity(&query, opts, author).await,
-                                    None => db.all(&query, opts).await,
-                                },
-                            }
-                            .map_err(napi_error)?;
-                            db.hydrate_rows_for_binding(&mut rows)
-                                .await
-                                .map_err(napi_error)?;
-                            let snapshot = jazz::node::RelationSnapshot {
-                                root_count: rows.len(),
-                                rows,
-                                edges: Vec::new(),
-                            };
+                    let coverage_deadline = Instant::now() + Duration::from_secs(15);
+                    let result = db
+                        .all_serialized_query(
+                            &query,
+                            opts,
+                            open_tx,
+                            admission,
+                            author,
+                            !synchronous && requires_coverage,
+                            || Instant::now() >= coverage_deadline,
+                            move |attachment| release_db.detach_query(attachment),
+                        )
+                        .await
+                        .map_err(napi_error)?;
+                    match result {
+                        CoreSerializedReadResult::Rows(rows) => encode_core_rows(&rows),
+                        CoreSerializedReadResult::Relation(snapshot) => {
                             encode_core_relation_snapshot(&snapshot)
-                                .map(Uint8Array::new)
-                                .map_err(napi_error)
-                        } else {
-                            let in_transaction = open_tx.is_some();
-                            let mut snapshot = match open_tx {
-                                Some(open_tx) => {
-                                    db.relation_snapshot_in_open_transaction(
-                                        open_tx, &query, opts, author,
-                                    )
-                                    .await
-                                }
-                                None => match author {
-                                    Some(author) => {
-                                        db.all_relation_snapshot_for_identity(&query, opts, author)
-                                            .await
-                                    }
-                                    None => db.all_relation_snapshot(&query, opts).await,
-                                },
-                            }
-                            .map_err(napi_error)?;
-                            if !in_transaction {
-                                db.hydrate_relation_snapshot_for_binding(&mut snapshot)
-                                    .await
-                                    .map_err(napi_error)?;
-                            }
-                            encode_core_relation_snapshot(&snapshot)
-                                .map(Uint8Array::new)
-                                .map_err(napi_error)
                         }
                     }
-                    .await;
-                    if let Some(attached) = attachment.borrow_mut().take() {
-                        db.detach_query(attached);
-                    }
-                    result
+                    .map(Uint8Array::new)
+                    .map_err(napi_error)
                 });
-                let cleanup = Box::new(move || {
-                    if let Some(attached) = cleanup_attachment.borrow_mut().take() {
-                        cleanup_db.detach_query(attached);
-                    }
-                });
-                native_covered_read_or_pending(future, cleanup)
+                native_covered_read_or_pending(future, Box::new(|| {}))
             }};
         }
         match db {
@@ -2730,31 +2525,27 @@ impl NapiDb {
     #[napi(ts_return_type = "Subscription | PendingNativeSubscription")]
     pub fn subscribe(
         &self,
-        query: &PreparedQuery,
+        query: Uint8Array,
         #[napi(
             ts_arg_type = "{ tier?: string; local_updates?: string; propagation?: string; include_deleted?: boolean } | undefined | null"
         )]
         opts: Option<JsonValue>,
         author: Option<Uint8Array>,
+        claims: Option<JsonValue>,
     ) -> napi::Result<Either<Subscription, PendingNativeSubscription>> {
         let opts = core_read_opts_from_json(opts)?;
         let trusted_client = self.trusted_backend;
-        let author = match author {
-            Some(author) => Some(self.author_admissions.resolve(&author)?),
+        let explicit_author = author
+            .map(|author| self.author_admissions.resolve(&author))
+            .transpose()?;
+        let admission = explicit_author
+            .map(|author| Ok::<_, napi::Error>((author, core_claims_from_json(author, claims)?)))
+            .transpose()?;
+        let author = match explicit_author {
+            Some(author) => Some(author),
             None if self.trusted_backend => Some(CoreAuthorSubject::SYSTEM),
             None => None,
         };
-        if trusted_client
-            && author.is_some_and(|author| {
-                author != CoreAuthorSubject::SYSTEM
-                    && query.inner.request_identity() != Some(author)
-            })
-        {
-            return Err(napi::Error::from_reason(
-                "trusted client subscription requires immutable request claims",
-            ));
-        }
-        let query = query.inner.clone();
         let db = self.inner.borrow();
         let db = db
             .as_ref()
@@ -2765,14 +2556,19 @@ impl NapiDb {
                 let pending = PendingNativeSubscription {
                     wake: RefCell::new(None),
                     future: RefCell::new(Some(Box::pin(async move {
-                        let stream = match author {
+                        let authorization = match author {
                             Some(author) if trusted_client => {
-                                db.subscribe_client_for_identity(&query, opts, author).await
+                                CoreSerializedSubscriptionAuthorization::TrustedClient(author)
                             }
-                            Some(author) => db.subscribe_for_identity(&query, opts, author).await,
-                            None => db.subscribe(&query, opts).await,
-                        }
-                        .map_err(napi_error)?;
+                            Some(author) => {
+                                CoreSerializedSubscriptionAuthorization::TrustedServing(author)
+                            }
+                            None => CoreSerializedSubscriptionAuthorization::ClientLocal,
+                        };
+                        let stream = db
+                            .subscribe_serialized_query(&query, opts, admission, authorization)
+                            .await
+                            .map_err(napi_error)?;
                         Ok(Subscription {
                             inner: Some(NapiSubscription::$variant {
                                 db,
@@ -4053,11 +3849,6 @@ fn terminal_bytes_to_numbers(bytes: &[u8]) -> Vec<u32> {
     bytes.iter().copied().map(u32::from).collect()
 }
 
-fn core_relation_query_from_bytes(query_bytes: &[u8]) -> napi::Result<CoreRelationQuery> {
-    jazz::query::decode_relation_query_postcard(query_bytes)
-        .map_err(|err| napi::Error::from_reason(err.to_string()))
-}
-
 // ============================================================================
 // TestJwtIssuer
 // ============================================================================
@@ -4523,12 +4314,12 @@ mod tests {
         CoreOpenDbConfig, CoreSelfSignedClientProof, InsertOptions, JazzServer, JazzServerInner,
         NapiDb, NapiDbInnerStorage, NapiWrite, NativeAuthorAdmissions, ParsedUpsertOptions,
         PendingNativeRead, PendingNativeSubscriptionBatch, PendingSubscriptionBatchOutcome,
-        PendingSubscriptionBatchPoll, PreparedQuery, RestoreOptions, UpdateOptions,
-        authority_epoch_from_bigint, close_after_cleanup, core_author_id_from_bytes, core_block_on,
-        core_claim_value_from_json, core_drive_direct_mutation_once, core_insert_options,
-        core_open_backend_identity, core_open_identity, core_read_opts_from_json,
-        core_read_tier_from_str, core_restore_options, core_subscription_event_to_napi,
-        core_update_options, core_upsert_options, core_write_memory, core_write_state_to_json,
+        PendingSubscriptionBatchPoll, RestoreOptions, UpdateOptions, authority_epoch_from_bigint,
+        close_after_cleanup, core_author_id_from_bytes, core_block_on, core_claim_value_from_json,
+        core_drive_direct_mutation_once, core_insert_options, core_open_backend_identity,
+        core_open_identity, core_read_opts_from_json, core_read_tier_from_str,
+        core_restore_options, core_subscription_event_to_napi, core_update_options,
+        core_upsert_options, core_write_memory, core_write_state_to_json,
         encode_core_subscription_delta, requeue_retryable_subscription_batch,
         unknown_transaction_kind_message,
     };
@@ -6522,13 +6313,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        let query = PreparedQuery {
-            inner: owner.prepare_query(&owner.table("items")).unwrap(),
-            is_relation: false,
-        };
+        let query =
+            Uint8Array::new(postcard::to_allocvec(&owner.table("items")).expect("encode query"));
         assert!(
             binding
-                .all(&query, None, Some(bound.to_string()), None)
+                .all(query, None, Some(bound.to_string()), None, None)
                 .is_ok(),
             "planted positive: the bound transaction reads successfully"
         );
@@ -6541,13 +6330,11 @@ mod tests {
             trusted_backend: false,
             author_admissions: NativeAuthorAdmissions::default(),
         };
-        let view_query = PreparedQuery {
-            inner: view.prepare_query(&view.table("items")).unwrap(),
-            is_relation: false,
-        };
+        let view_query =
+            Uint8Array::new(postcard::to_allocvec(&view.table("items")).expect("encode query"));
         assert!(
             view_binding
-                .all(&view_query, None, Some(bound.to_string()), None)
+                .all(view_query, None, Some(bound.to_string()), None, None)
                 .is_ok(),
             "a registered schema facade shares its owner's transaction runtime"
         );

@@ -386,7 +386,7 @@ surface orderly:
 | ------------------------ | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | lifecycle and scheduling | `Probe`, `tick`, `close`, `setTickScheduler`, `onMutationError`                               | probe and bounded tick are synchronous; close is idempotent; native-to-JS wakes are coalesced callbacks, never a borrowed Rust closure |
 | schema and identity      | `registerSchema`, `setIdentityClaims`, `setNonDurableClient`, `setRelayAuthoritySessionOwner` | schema/view handles are opaque native IDs scoped to their foreground                                                                   |
-| queries                  | `prepareQuery`, `all`                                                                         | query handles are opaque; rows are existing encoded row-batch bytes                                                                    |
+| queries                  | `all`                                                                                         | canonical `Query` bytes are prepared inside core; rows use the existing encoded row-batch bytes                                        |
 | subscriptions            | `subscribe`, drain, cancel                                                                    | subscription handles are opaque; batches are existing encoded subscription payloads                                                    |
 | writes and transactions  | `begin/commit/rollback`, insert/update/upsert/delete/restore, `writeState`, `wait`            | transaction and write handles are opaque; write receipts retain the existing encoded receipt contract                                  |
 | large values and advice  | streaming upload, large-value update, permission advice                                       | existing value and advice payload codecs; streaming handles are opaque and explicitly finished/cancelled                               |
@@ -407,48 +407,46 @@ JS-owned memory before Rust frees its response allocation.
 | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
 | 0       | Probe                    | none                                                                                                             |
 | 1       | Tick                     | none                                                                                                             |
-| 2       | PrepareQuery             | query byte vector, kind enum                                                                                     |
-| 3       | All                      | query u64, options_json string, transaction option u64                                                           |
-| 4       | Subscribe                | query u64, options_json string                                                                                   |
-| 5       | DrainSubscription        | subscription u64                                                                                                 |
-| 6       | Unsubscribe              | subscription u64                                                                                                 |
-| 7       | Close                    | none                                                                                                             |
-| 8       | Poll                     | operation u64                                                                                                    |
-| 9       | Cancel                   | operation u64                                                                                                    |
-| 10      | BeginTransaction         | kind enum                                                                                                        |
-| 11      | Insert                   | transaction u64, table string, cells byte vector, row_id option 16 raw bytes                                     |
-| 12      | Update                   | transaction u64, table string, row_id 16 raw bytes, patch byte vector                                            |
-| 13      | Upsert                   | transaction u64, table string, row_id 16 raw bytes, cells byte vector                                            |
-| 14      | Delete                   | transaction u64, table string, row_id 16 raw bytes                                                               |
-| 15      | CommitTransaction        | transaction u64                                                                                                  |
-| 16      | RollbackTransaction      | transaction u64                                                                                                  |
-| 17      | WaitForCoreTransaction   | tx_id 16 raw bytes                                                                                               |
-| 18      | WaitForTransaction       | tx_id 16 raw bytes, tier string                                                                                  |
-| 19      | StageMutation            | transaction u64, mutation enum, table string, row_id option 16 raw bytes, cells byte vector, options_json string |
-| 20      | DisconnectNativeUpstream | none                                                                                                             |
-| 21      | ReconnectNativeUpstream  | none                                                                                                             |
-| 22      | NativeConnectionStatus   | none                                                                                                             |
-| 23      | NativeSessionMetadata    | none                                                                                                             |
-| 24      | WriteState               | tx_id 16 raw bytes                                                                                               |
-| 25      | DrainMutationErrors      | none                                                                                                             |
-| 26      | BeginStreamingMutation   | mutation enum, table string, row_id 16 raw bytes, cells byte vector, column string, options_json string          |
-| 27      | PushStreamingMutation    | upload u64, chunk byte vector                                                                                    |
-| 28      | FinishStreamingMutation  | upload u64                                                                                                       |
-| 29      | AbortStreamingMutation   | upload u64                                                                                                       |
-| 30      | LocalCurrentRow          | table string, row_id 16 raw bytes                                                                                |
-| 31      | UpdateLargeValues        | table string, row_id 16 raw bytes, patch byte vector, descriptors_json string, updated_at_ms option u64          |
-| 32      | DirectMutation           | mutation enum, table string, row_id option 16 raw bytes, cells byte vector, options_json string                  |
-| 33      | PermissionAdvice         | action enum                                                                                                      |
-| 34      | WaitForPendingWrites     | tier string                                                                                                      |
+| 2       | All                      | canonical Query byte vector, options_json string, transaction option u64                                         |
+| 3       | Subscribe                | canonical Query byte vector, options_json string                                                                 |
+| 4       | DrainSubscription        | subscription u64                                                                                                 |
+| 5       | Unsubscribe              | subscription u64                                                                                                 |
+| 6       | Close                    | none                                                                                                             |
+| 7       | Poll                     | operation u64                                                                                                    |
+| 8       | Cancel                   | operation u64                                                                                                    |
+| 9       | BeginTransaction         | kind enum                                                                                                        |
+| 10      | Insert                   | transaction u64, table string, cells byte vector, row_id option 16 raw bytes                                     |
+| 11      | Update                   | transaction u64, table string, row_id 16 raw bytes, patch byte vector                                            |
+| 12      | Upsert                   | transaction u64, table string, row_id 16 raw bytes, cells byte vector                                            |
+| 13      | Delete                   | transaction u64, table string, row_id 16 raw bytes                                                               |
+| 14      | CommitTransaction        | transaction u64                                                                                                  |
+| 15      | RollbackTransaction      | transaction u64                                                                                                  |
+| 16      | WaitForCoreTransaction   | tx_id 16 raw bytes                                                                                               |
+| 17      | WaitForTransaction       | tx_id 16 raw bytes, tier string                                                                                  |
+| 18      | StageMutation            | transaction u64, mutation enum, table string, row_id option 16 raw bytes, cells byte vector, options_json string |
+| 19      | DisconnectNativeUpstream | none                                                                                                             |
+| 20      | ReconnectNativeUpstream  | none                                                                                                             |
+| 21      | NativeConnectionStatus   | none                                                                                                             |
+| 22      | NativeSessionMetadata    | none                                                                                                             |
+| 23      | WriteState               | tx_id 16 raw bytes                                                                                               |
+| 24      | DrainMutationErrors      | none                                                                                                             |
+| 25      | BeginStreamingMutation   | mutation enum, table string, row_id 16 raw bytes, cells byte vector, column string, options_json string          |
+| 26      | PushStreamingMutation    | upload u64, chunk byte vector                                                                                    |
+| 27      | FinishStreamingMutation  | upload u64                                                                                                       |
+| 28      | AbortStreamingMutation   | upload u64                                                                                                       |
+| 29      | LocalCurrentRow          | table string, row_id 16 raw bytes                                                                                |
+| 30      | UpdateLargeValues        | table string, row_id 16 raw bytes, patch byte vector, descriptors_json string, updated_at_ms option u64          |
+| 31      | DirectMutation           | mutation enum, table string, row_id option 16 raw bytes, cells byte vector, options_json string                  |
+| 32      | PermissionAdvice         | action enum                                                                                                      |
+| 33      | WaitForPendingWrites     | tier string                                                                                                      |
 
 The command bytes are pinned by
 `foreground_transaction_postcard_layout_matches_the_handwritten_ts_codec`,
 `foreground_extension_v1_byte_contract`,
 `foreground_continuation_v1_byte_contract`, and
-`relation_preparation_uses_the_v1_query_kind_byte_contract`. PrepareQuery kind
-ordinals are Query=0 and Relation=1. A relation query uses the same
-retained-query lifecycle as an ordinary query and requires the default read
-view when subscribed.
+`relation_read_uses_the_canonical_query_byte_contract`. Both ordinary and
+relational reads carry one canonical `Query`; relational syntax is nested in
+`Query.relation` and is normalized while core prepares the read.
 
 Response 24 is MutationCommitted:
 tx_id 16 raw bytes followed by row_id 16 raw bytes. Direct writes use the core's
@@ -494,9 +492,10 @@ ticks and reads. Relation snapshots use
 ordinary reset/settled/tier/row-delta fields. Event 0 remains unchanged. The new
 event byte contract is pinned by `foreground_structured_delta_v1_byte_contract`.
 
-`PrepareQuery` accepts either the bounded typed Postcard query payload or the
-bounded typed Postcard relation-query payload selected by its explicit kind and
-uses asynchronous canonical query preparation for both.
+`All` and `Subscribe` each accept one bounded canonical Postcard `Query`.
+Preparation, including relation lowering, happens behind those core operations;
+the native boundary exposes neither a prepared-query handle nor a query-kind
+discriminator.
 
 ### Relation-query Postcard carrier
 
@@ -506,8 +505,8 @@ Relation-query payloads use the same typed Postcard grammar as their enclosing
 column/key/project references, recursion bound, and a typed JSON literal tree.
 The literal tree explicitly distinguishes null, boolean, i64, u64, f64 bits,
 string, array, and object entries; it does not serialize `serde_json::Value`
-directly and does not embed JSON or a second custom byte codec. Native relation
-preparation receives that same standalone Postcard relation payload.
+directly and does not embed JSON or a second custom byte codec. Native reads
+carry that relation value only as the `Query.relation` field.
 
 Relation payloads are capped at 1 MiB, nesting at 128, structural collections
 at 4,096, strings at 65,536 UTF-8 bytes, and semantic dimensions at `u32::MAX`.
@@ -515,10 +514,10 @@ Union labels remain unique, UTF-8, NUL-free, and 1 through 4,096 bytes. Rows,
 cells, snapshots, and subscription deltas retain their existing native binding
 encodings; only the relation-query AST carrier changes.
 
-The standalone relation preparation payload is `WireRelationQuery { rel }`. Within a
-`Query.relation` option and a `ShapeBody::Relation` variant, that same struct is
-nested directly in the enclosing Postcard value; it is never length-wrapped as a
-byte vector. Postcard enum ordinals follow the declared Rust order: relation
+Within a `Query.relation` option and a `ShapeBody::Relation` variant,
+`WireRelationQuery { rel }` is nested directly in the enclosing Postcard value;
+it is never length-wrapped as a byte vector at the native read boundary.
+Postcard enum ordinals follow the declared Rust order: relation
 expressions are `TableScan`, `Filter`, `Union`, `Join`, `Project`, `Gather`,
 `Distinct`, `OrderBy`, `Offset`, `Limit`; predicates are `Cmp`, `IsNull`,
 `IsNotNull`, `In`, `Contains`, `EnumMatch`, `And`, `Or`, `Not`, `True`, `False`;
@@ -531,20 +530,18 @@ payload with no trailing bytes or overlong alternative spelling.
 
 **V1 vertical slice.** Native relay ABI V1 defines the concrete foreground
 foreground vocabulary: `Probe`, bounded `Tick`, idempotent `Close`, and the
-local-first query lifecycle `PrepareQuery`, `All`, `Subscribe`,
-`DrainSubscription`, `Unsubscribe`. Query inputs are exactly the canonical
-postcard `Query` or `WireRelationQuery` bytes selected by `PrepareQuery.kind`; read output
-is the existing `binding_codec::encode_rows` payload and subscription deltas
-are the existing `binding_codec::encode_subscription_delta` payload. Query and
-subscription identifiers are owner-thread-local opaque u64 handles allocated
+local-first query lifecycle `All`, `Subscribe`, `DrainSubscription`,
+`Unsubscribe`. Query inputs are exactly canonical postcard `Query` bytes; read
+output is the existing `binding_codec::encode_rows` payload and subscription
+deltas are the existing `binding_codec::encode_subscription_delta` payload.
+Subscription identifiers are owner-thread-local opaque u64 handles allocated
 once across every foreground attached to that relay, so a value copied from a
 sibling foreground cannot alias a same-number local resource. JavaScript handle
 responses require one complete, minimally encoded postcard u64 and reject
 trailing bytes or values above `Number.MAX_SAFE_INTEGER`; they never round or
-truncate an opaque native handle.
-`PrepareQuery` retains asynchronous canonical preparation behind its ordinary
-query handle when a retained tick already owns the node. Reads await that same
-preparation; subscription opening is likewise retained behind its ordinary
+truncate an opaque native handle. Core retains asynchronous canonical
+preparation inside the read operation when a retained tick already owns the
+node. Subscription opening is likewise retained behind its ordinary
 subscription handle, and drain polls it with the live relay wake. Cancelling an
 unopened subscription retires its opener before it can publish events. Neither
 preparation nor subscription admission may block or reenter the node owner.

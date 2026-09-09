@@ -12,6 +12,25 @@ pub enum BindingHydrationError {
     Error(Error),
 }
 
+struct SerializedReadCoverage<F>
+where
+    F: FnOnce(QueryAttachment),
+{
+    attachment: Option<QueryAttachment>,
+    release: Option<F>,
+}
+
+impl<F> Drop for SerializedReadCoverage<F>
+where
+    F: FnOnce(QueryAttachment),
+{
+    fn drop(&mut self) {
+        if let (Some(attachment), Some(release)) = (self.attachment.take(), self.release.take()) {
+            release(attachment);
+        }
+    }
+}
+
 fn binding_hydration_error(error: crate::node::Error) -> BindingHydrationError {
     use groove::chunks::ChunkError;
     use groove::ivm::runtime::IvmRuntimeError;
@@ -173,6 +192,214 @@ where
     ) -> Result<PreparedQuery, Error> {
         self.prepare_query_async(&relation_query_to_query(query)?)
             .await
+    }
+
+    /// Decode and prepare the canonical serialized query accepted by host
+    /// bindings. Keeping this here gives every binding the same validation,
+    /// normalization, plan ownership, and immutable request scope.
+    pub(crate) async fn prepare_serialized_query_async(
+        &self,
+        query: &[u8],
+        request_scope: Option<(AuthorSubject, BTreeMap<String, Value>)>,
+    ) -> Result<PreparedQuery, Error> {
+        let query: Query = crate::wire::decode_postcard_exact(query)
+            .map_err(|error| Error::new(ErrorCode::Query, format!("decode query: {error}")))?;
+        let prepared = self.prepare_query_async(&query).await?;
+        Ok(match request_scope {
+            Some((author, claims)) => prepared.with_identity_claims(author, claims),
+            None => prepared,
+        })
+    }
+
+    /// Execute the complete serialized-query path for a host binding.
+    ///
+    /// Decoding, normalization, preparation, request-scope binding, coverage,
+    /// execution, and binding hydration all remain owned by the core. The
+    /// release callback lets a host defer attachment cleanup when dropping a
+    /// pending operation while its runtime owner is already borrowed.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn all_serialized_query<F, E>(
+        &self,
+        query: &[u8],
+        opts: ReadOpts,
+        open_tx: Option<OpenTransactionId>,
+        request_scope: Option<(AuthorSubject, BTreeMap<String, Value>)>,
+        author: Option<AuthorSubject>,
+        require_coverage: bool,
+        coverage_expired: E,
+        release_coverage: F,
+    ) -> Result<SerializedReadResult, Error>
+    where
+        F: FnOnce(QueryAttachment),
+        E: Fn() -> bool,
+    {
+        let decoded: Query = crate::wire::decode_postcard_exact(query)
+            .map_err(|error| Error::new(ErrorCode::Query, format!("decode query: {error}")))?;
+        let is_relation = decoded.relation.is_some();
+        if open_tx.is_some() && is_relation {
+            return Err(Error::new(
+                ErrorCode::Query,
+                "relation reads inside a transaction are not supported",
+            ));
+        }
+        let prepared = self.prepare_query_async(&decoded).await?;
+        let prepared = match request_scope {
+            Some((author, claims)) => prepared.with_identity_claims(author, claims),
+            None => prepared,
+        };
+        // Read the maintained result itself, not just its coverage signal.
+        // Dropping the subscription and re-evaluating below would retire its
+        // exact request-scoped inputs before the one-shot consumes them.
+        // Remote publication waits for settlement. A local foreground also
+        // needs a fresh delivery from its durable owner, while the maintained
+        // subscription drives the complete multi-hop input closure.
+        if require_coverage && is_relation {
+            let local_coverage = if effective_read_tier(&opts) == DurabilityTier::Local {
+                Some(SerializedReadCoverage {
+                    attachment: Some(
+                        self.attach_query_with_opts_async(&prepared, opts.clone(), None, author)
+                            .await?,
+                    ),
+                    release: Some(release_coverage),
+                })
+            } else {
+                None
+            };
+            let mut stream = match author {
+                Some(author) => {
+                    self.subscribe_client_for_identity(&prepared, opts.clone(), author)
+                        .await?
+                }
+                None => self.subscribe(&prepared, opts.clone()).await?,
+            };
+            let outcome = async {
+                let mut next = Box::pin(stream.next_event());
+                let event = std::future::poll_fn(|cx| {
+                    if coverage_expired() {
+                        return Poll::Ready(Err(Error::new(
+                            ErrorCode::NotObserved,
+                            "Timed out waiting for query coverage",
+                        )));
+                    }
+                    if local_coverage.as_ref().is_some_and(|coverage| {
+                        !self.query_attachment_is_covered(
+                            coverage
+                                .attachment
+                                .as_ref()
+                                .expect("live local read coverage"),
+                        )
+                    }) {
+                        return Poll::Pending;
+                    }
+                    std::future::Future::poll(next.as_mut(), cx).map(Ok)
+                })
+                .await?;
+                drop(next);
+                match event {
+                    Some(SubscriptionEvent::Delta { reset: true, .. }) => {
+                        let mut snapshot = stream.settled_receiver_local_snapshot()?;
+                        self.hydrate_relation_snapshot_for_binding(&mut snapshot)
+                            .await?;
+                        if prepared.shape().query().array_subqueries.is_empty() {
+                            Ok(SerializedReadResult::Rows(
+                                snapshot
+                                    .rows
+                                    .into_iter()
+                                    .take(snapshot.root_count)
+                                    .collect(),
+                            ))
+                        } else {
+                            Ok(SerializedReadResult::Relation(snapshot))
+                        }
+                    }
+                    Some(SubscriptionEvent::Rejected { reason }) => Err(Error::new(
+                        ErrorCode::Query,
+                        format!("query subscription rejected: {reason:?}"),
+                    )),
+                    Some(SubscriptionEvent::Closed) | None => Err(Error::new(
+                        ErrorCode::NotObserved,
+                        "query subscription ended before its published result",
+                    )),
+                    Some(SubscriptionEvent::Delta { .. }) => Err(Error::new(
+                        ErrorCode::Protocol,
+                        "query subscription did not open with a reset",
+                    )),
+                }
+            }
+            .await;
+            let finalization = stream.close().await;
+            return match (outcome, finalization) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            };
+        }
+        let coverage = if require_coverage {
+            let attachment = self
+                .attach_query_with_opts_async(&prepared, opts.clone(), open_tx, author)
+                .await?;
+            Some(SerializedReadCoverage {
+                attachment: Some(attachment),
+                release: Some(release_coverage),
+            })
+        } else {
+            None
+        };
+        if let Some(coverage) = coverage.as_ref() {
+            std::future::poll_fn(|_| {
+                if self.query_attachment_is_covered(
+                    coverage
+                        .attachment
+                        .as_ref()
+                        .expect("live serialized read coverage"),
+                ) {
+                    Poll::Ready(Ok(()))
+                } else if coverage_expired() {
+                    Poll::Ready(Err(Error::new(
+                        ErrorCode::NotObserved,
+                        "Timed out waiting for query coverage",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+        }
+
+        if !prepared.shape().query().array_subqueries.is_empty() {
+            let in_transaction = open_tx.is_some();
+            let mut snapshot = match open_tx {
+                Some(open_tx) => {
+                    self.relation_snapshot_in_open_transaction(open_tx, &prepared, opts, author)
+                        .await
+                }
+                None => match author {
+                    Some(author) => {
+                        self.all_relation_snapshot_for_identity(&prepared, opts, author)
+                            .await
+                    }
+                    None => self.all_relation_snapshot(&prepared, opts).await,
+                },
+            }?;
+            if !in_transaction {
+                self.hydrate_relation_snapshot_for_binding(&mut snapshot)
+                    .await?;
+            }
+            return Ok(SerializedReadResult::Relation(snapshot));
+        }
+
+        let mut rows = match open_tx {
+            Some(open_tx) => {
+                self.all_in_open_transaction(open_tx, &prepared, opts, author)
+                    .await
+            }
+            None => match author {
+                Some(author) => self.all_for_identity(&prepared, opts, author).await,
+                None => self.all(&prepared, opts).await,
+            },
+        }?;
+        self.hydrate_rows_for_binding(&mut rows).await?;
+        Ok(SerializedReadResult::Rows(rows))
     }
 
     /// Prepare a query with explicit parameter bindings.

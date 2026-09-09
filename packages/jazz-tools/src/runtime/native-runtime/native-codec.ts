@@ -48,12 +48,6 @@ export type {
   ValueType,
 } from "./native-row-codec.js";
 
-export type SubscriptionSnapshotChunk = {
-  type: "snapshot";
-  rows: NativeRowBatch[];
-  settled?: boolean;
-  tier?: string;
-};
 export type SubscriptionDeltaChunk = {
   type: "delta";
   delta: NativeSubscriptionDelta;
@@ -76,10 +70,7 @@ export type SubscriptionRejectedChunk = {
         transition: string;
       };
 };
-export type SubscriptionStreamChunk =
-  | SubscriptionSnapshotChunk
-  | SubscriptionDeltaChunk
-  | SubscriptionRejectedChunk;
+export type SubscriptionStreamChunk = SubscriptionDeltaChunk | SubscriptionRejectedChunk;
 
 /** A self-signed proof may derive a Jazz-owned client author only at DB open. */
 export type NativeSelfSignedClientProof = {
@@ -103,16 +94,6 @@ export function authorForNativeOpenConfig(
   selfSignedClientProof?: NativeSelfSignedClientProof,
 ): Uint8Array {
   return selfSignedClientProof ? SELF_SIGNED_OPEN_CONFIG_AUTHOR : author;
-}
-
-export async function readSubscriptionSnapshot(
-  reader: ReadableStreamDefaultReader<SubscriptionStreamChunk>,
-): Promise<SubscriptionSnapshotChunk> {
-  const next = await reader.read();
-  if (next.done || next.value.type !== "snapshot") {
-    throw new Error("expected subscription snapshot chunk");
-  }
-  return next.value;
 }
 
 export async function readSubscriptionDelta(

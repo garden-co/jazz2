@@ -251,12 +251,9 @@ export async function proveSameJsiRuntimeWriteSubscription(
     codec.decode(foreground.execute(codec.encode(command)));
   try {
     markFailure("same-runtime-subscribe-failed");
-    const prepared = execute(b, { type: "prepareQuery", query: todosQuery, kind: "query" });
-    if (prepared.type !== "preparedQuery")
-      throw new Error("foreground B could not prepare the todos subscription");
     const subscribed = execute(b, {
       type: "subscribe",
-      query: prepared.query,
+      query: todosQuery,
       optionsJson: "{}",
     });
     if (subscribed.type !== "subscribed")
@@ -633,10 +630,7 @@ async function readScopeRows(
             ? "rows"
             : "none";
   };
-  const prepared = execute({ type: "prepareQuery", query: scopeQuery, kind: "query" });
-  if (prepared.type !== "preparedQuery")
-    throw new Error("scope isolation fixture could not prepare the owner-protected scope query");
-  const subscribed = execute({ type: "subscribe", query: prepared.query, optionsJson: "{}" });
+  const subscribed = execute({ type: "subscribe", query: scopeQuery, optionsJson: "{}" });
   if (subscribed.type !== "subscribed")
     throw new Error(
       "scope isolation fixture could not subscribe to the owner-protected scope query",
@@ -681,7 +675,7 @@ async function readScopeRows(
         if (observation) observation.polls += 1;
         response = execute({ type: "poll", operation: pendingOperation });
       } else if (published) {
-        response = execute({ type: "all", query: prepared.query, optionsJson: "{}" });
+        response = execute({ type: "all", query: scopeQuery, optionsJson: "{}" });
       } else {
         response = execute({ type: "drainSubscription", subscription: subscribed.subscription });
       }
@@ -701,7 +695,7 @@ async function readScopeRows(
         }
         if (!response.events.some((event) => event.type === "delta")) continue;
         published = true;
-        response = execute({ type: "all", query: prepared.query, optionsJson: "{}" });
+        response = execute({ type: "all", query: scopeQuery, optionsJson: "{}" });
         pendingOperation = response.type === "pending" ? response.operation : undefined;
         observeResponse(response);
         if (timing.now() >= deadline) break;

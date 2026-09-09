@@ -182,50 +182,48 @@ describe("React Native binding scaffolding in the Node test runtime", () => {
     nativeForegroundTest.execute = (command) => {
       commandTags.push(command[0]!);
       switch (command[0]) {
-        case 2:
-          return Uint8Array.of(2, 11);
+        case 2: {
+          const reader = new PostcardReader(command.subarray(1));
+          expect(reader.bytes().length).toBeGreaterThan(0);
+          readOptions.push(JSON.parse(reader.string()));
+          expect(reader.u64()).toBe(0); // no transaction
+          return encodeBytesResponse(2, rows);
+        }
         case 3: {
           const reader = new PostcardReader(command.subarray(1));
-          expect(reader.u64()).toBe(11);
+          expect(reader.bytes().length).toBeGreaterThan(0);
           readOptions.push(JSON.parse(reader.string()));
-          return encodeBytesResponse(3, rows);
+          return Uint8Array.of(3, 12);
         }
-        case 4:
-          return Uint8Array.of(4, 12);
-        case 5: {
+        case 4: {
           subscriptionDrainCount += 1;
-          if (subscriptionDrainCount === 1 || subscriptionDrainCount > 2) {
-            return Uint8Array.of(5, 0);
-          }
-          return encodeSubscriptionEvents(delta);
+          return subscriptionDrainCount === 1
+            ? encodeSubscriptionEvents(delta)
+            : Uint8Array.of(4, 0);
         }
+        case 5:
+          return Uint8Array.of(5, 1);
         case 6:
           return Uint8Array.of(6, 1);
         case 7:
           return Uint8Array.of(7, 1);
-        case 10:
-          return Uint8Array.of(11, 13);
-        case 32: {
+        case 31: {
           const reader = new PostcardReader(command.subarray(1));
-          expect(reader.u64()).toBe(0); // direct insert
+          expect(reader.u64()).toBe(0); // insert
           expect(reader.string()).toBe("notes");
           expect(reader.u64()).toBe(0); // native allocates the row id
           expect(reader.bytes().length).toBeGreaterThan(0);
           expect(JSON.parse(reader.string())).toEqual({ updatedAtMs: expect.any(Number) });
-          return Uint8Array.from([24, ...new Uint8Array(16).fill(4), ...rowId]);
+          return Uint8Array.from([23, ...new Uint8Array(16).fill(4), ...rowId]);
         }
+        case 21:
+          return Uint8Array.of(16, 1, 0, 1);
         case 22:
-          return Uint8Array.of(17, 1, 0, 1);
-        case 18:
-          return Uint8Array.from([16, ...command.subarray(1, 17)]);
-        case 25:
-          return Uint8Array.of(20, 2, 91, 93); // mutationErrors: "[]"
-        case 23:
           return encodeNativeSession("reader");
-        case 15:
-          return Uint8Array.from([14, ...new Uint8Array(16).fill(4)]);
-        case 16:
-          return Uint8Array.of(15, 1);
+        case 24:
+          return Uint8Array.of(19, 2, 91, 93); // mutationErrors: "[]"
+        case 17:
+          return Uint8Array.from([15, ...command.subarray(1, 17)]);
         default:
           throw new Error(`unexpected foreground command ${command[0]}`);
       }
@@ -262,7 +260,7 @@ describe("React Native binding scaffolding in the Node test runtime", () => {
       { title: "Native note" },
     ]);
     expect(readOptions).toContainEqual({ tier: "edge" });
-    expect(commandTags).toEqual(expect.arrayContaining([2, 3, 4, 5, 6, 32, 18, 22, 23, 25]));
+    expect(commandTags).toEqual(expect.arrayContaining([2, 3, 4, 5, 6, 17, 21, 22, 24, 31]));
     expect(nativeForegroundTest.tick.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(nativeForegroundTest.turboModule).not.toHaveProperty("installForegroundRuntime");
     expect(nativeForegroundTest.setTickScheduler).toHaveBeenCalledTimes(1);
@@ -275,7 +273,7 @@ describe("React Native binding scaffolding in the Node test runtime", () => {
     const closedBeforeShutdown = nativeForegroundTest.close.mock.calls.length;
     await client.shutdown();
     client = undefined;
-    expect(commandTags).toContain(7);
+    expect(commandTags).toContain(17);
     expect(nativeForegroundTest.close).toHaveBeenCalledTimes(closedBeforeShutdown + 1);
     // Native metadata/status preflights own temporary foregrounds too. Every
     // opened facade must be released exactly once, including the actual Db.
@@ -295,11 +293,11 @@ describe("React Native binding scaffolding in the Node test runtime", () => {
       },
     ]);
     nativeForegroundTest.execute = (command) => {
-      if (command[0] === 2) return Uint8Array.of(2, 21);
-      if (command[0] === 3) return encodeBytesResponse(3, rows);
-      if (command[0] === 22) return Uint8Array.of(17, 1, 0, 1);
-      if (command[0] === 23) return encodeNativeSession("old-reader");
-      if (command[0] === 25) return Uint8Array.of(20, 2, 91, 93);
+      if (command[0] === 2) return encodeBytesResponse(2, rows);
+      if (command[0] === 21) return Uint8Array.of(16, 1, 0, 1);
+      if (command[0] === 22) return encodeNativeSession("old-reader");
+      if (command[0] === 24) return Uint8Array.of(19, 2, 91, 93);
+      if (command[0] === 6) return Uint8Array.of(6, 1);
       if (command[0] === 7) return Uint8Array.of(7, 1);
       throw new Error(`unexpected foreground command ${command[0]}`);
     };
@@ -448,12 +446,10 @@ function encodeBytesResponse(tag: number, bytes: Uint8Array): Uint8Array {
 
 function encodeSubscriptionEvents(delta: Uint8Array): Uint8Array {
   const tier = new TextEncoder().encode("local");
-  return Uint8Array.from([5, 1, 0, 1, 1, tier.length, ...tier, ...varint(delta.length), ...delta]);
+  return Uint8Array.from([4, 1, 0, 1, 1, tier.length, ...tier, ...varint(delta.length), ...delta]);
 }
 
 function encodeNativeSession(userId: string): Uint8Array {
-  const writer = new PostcardWriter();
-  writer.u64(18);
   const identity = new PostcardWriter();
   identity.string(accountRegistryUrl("https://core.example", selectedConfig.appId));
   identity.u64(1);
@@ -465,7 +461,7 @@ function encodeNativeSession(userId: string): Uint8Array {
   principal.string("https://issuer.example");
   principal.string(userId);
   return Uint8Array.from([
-    ...writer.finish(),
+    17,
     ...new Uint8Array(16).fill(4),
     ...identity.finish(),
     ...accountBytes,

@@ -236,7 +236,29 @@ fn validate_query_canonical_parts(
     let mut params = BTreeMap::new();
     if let Some(relation) = &query.relation {
         validate_retained_relation_outer_query(query)?;
+        if relation_union_parts(&relation.rel).is_none() {
+            let mut resolved = relation_query_to_query(relation)?;
+            if resolved.table != query.table {
+                return Err(QueryError::UnsupportedRelationQuery(
+                    "relation query output table does not match its Query envelope".to_owned(),
+                ));
+            }
+            resolved.array_subqueries = query.array_subqueries.clone();
+            resolved.select = query.select.clone();
+            return validate_query_canonical_parts(&resolved, schema);
+        }
         validate_retained_relation_union(relation, &query.table, schema, &mut params)?;
+        validate_array_subqueries(
+            schema,
+            &root,
+            &mut resolved_query.array_subqueries,
+            &mut params,
+        )?;
+        if let Some(select) = &query.select {
+            for column in select {
+                validate_select_column(&root, column)?;
+            }
+        }
         let normalized = normalize_query(&resolved_query);
         let canonical = canonical_query_bytes_for_schema(&normalized, schema)?;
         return Ok((normalized, params, canonical));
@@ -329,9 +351,10 @@ fn validate_query_canonical_parts(
     Ok((normalized, params, canonical))
 }
 
-/// Relation output is already complete row-set syntax. Keeping ordinary query
-/// clauses beside it would make policy or result modifiers disappear behind
-/// the retained-relation validation fast path, so reject that unlowered mix.
+/// Relation syntax owns row membership and its terminal ordering/window. The
+/// outer Query envelope may still describe the returned row shape through
+/// select projections and array subqueries; reject other clauses because they
+/// would compete with or disappear behind the relation row-set syntax.
 fn validate_retained_relation_outer_query(query: &Query) -> Result<(), QueryError> {
     let has_outer_clause = !query.filters.is_empty()
         || !query.joins.is_empty()
@@ -340,8 +363,6 @@ fn validate_retained_relation_outer_query(query: &Query) -> Result<(), QueryErro
         || !query.reachable.is_empty()
         || !query.inherits.is_empty()
         || !query.includes.is_empty()
-        || !query.array_subqueries.is_empty()
-        || query.select.is_some()
         || !query.order_by.is_empty()
         || query.aggregate.is_some()
         || query.limit.is_some()

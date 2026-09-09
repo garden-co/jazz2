@@ -10,7 +10,6 @@ export default nativeBinding;
 export const {
   JazzServer,
   NapiDb,
-  PreparedQuery,
   StreamingMutation,
   Subscription,
   TestJwtIssuer,

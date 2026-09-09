@@ -408,6 +408,7 @@ describe("translateQuery", () => {
       translateQuery(app.todos.where({ done: false }).hopTo("owner")._build(), app.wasmSchema),
     );
 
+    expect(translated.table).toBe("users");
     expect(translated.relation_ir).toBeDefined();
     expect(translated.conditions).toBeUndefined();
   });

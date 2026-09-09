@@ -6,6 +6,7 @@ use groove::storage::TestStorage;
 mod authorization;
 mod coverage;
 mod materialization;
+mod publication;
 mod structured;
 
 /// Internal because the test-only refresh rendezvous owns thread-local state.

@@ -24,10 +24,18 @@ type ForegroundCommand =
   | { type: "reconnectNativeUpstream" }
   | { type: "nativeConnectionStatus" }
   | { type: "nativeSessionMetadata" }
-  | { type: "prepareQuery"; query: Uint8Array; kind: "query" | "relation" }
-  | { type: "all"; query: number; optionsJson: string; transaction?: number }
+  | {
+      type: "all";
+      query: Uint8Array;
+      optionsJson: string;
+      transaction?: number;
+    }
   | { type: "localCurrentRow"; table: string; rowId: Uint8Array }
-  | { type: "subscribe"; query: number; optionsJson: string }
+  | {
+      type: "subscribe";
+      query: Uint8Array;
+      optionsJson: string;
+    }
   | { type: "drainSubscription"; subscription: number }
   | { type: "unsubscribe"; subscription: number }
   | { type: "poll"; operation: number }
@@ -129,7 +137,6 @@ type ForegroundResponse =
     }
   | NativeConnectionStatus
   | { type: "ticked" }
-  | { type: "preparedQuery"; query: number }
   | { type: "rows"; rows: Uint8Array }
   | { type: "subscribed"; subscription: number }
   | { type: "subscriptionEvents"; events: ForegroundEvent[] }
@@ -225,14 +232,8 @@ export class NativeForegroundDb {
     this.mutationErrorCallback = callback;
   }
 
-  prepareQuery(query: Uint8Array, kind: "query" | "relation"): object {
-    const response = this.execute({ type: "prepareQuery", query, kind });
-    if (response.type !== "preparedQuery") return unexpected("prepareQuery", response.type);
-    return { nativeForegroundQuery: response.query };
-  }
-
   all(
-    query: object,
+    query: Uint8Array,
     opts: unknown,
     openTransactionId?: string,
   ): Uint8Array | { poll(): Uint8Array | null } {
@@ -247,7 +248,7 @@ export class NativeForegroundDb {
     this.tick();
     const response = this.execute({
       type: "all",
-      query: queryHandle(query),
+      query,
       optionsJson: JSON.stringify(opts ?? {}),
       transaction,
     });
@@ -266,11 +267,11 @@ export class NativeForegroundDb {
     return response.rows;
   }
 
-  subscribe(query: object, opts: unknown): NativeForegroundSubscription {
+  subscribe(query: Uint8Array, opts: unknown): NativeForegroundSubscription {
     this.tick();
     const response = this.execute({
       type: "subscribe",
-      query: queryHandle(query),
+      query,
       optionsJson: JSON.stringify(opts ?? {}),
     });
     if (response.type === "operationError") throw new Error(response.reason);
@@ -948,14 +949,6 @@ class NativeForegroundSubscription {
     this.closed = true;
     return this.db.unsubscribe(this.handle);
   }
-}
-
-function queryHandle(query: object): number {
-  const handle = (query as { nativeForegroundQuery?: unknown }).nativeForegroundQuery;
-  if (!Number.isSafeInteger(handle) || (handle as number) < 0) {
-    throw new Error("React Native native foreground received an invalid prepared query handle");
-  }
-  return handle as number;
 }
 
 function unsupported(operation: string): never {

@@ -96,9 +96,7 @@ fn malformed_authority_closure_reaches_only_its_public_subscription() {
     let alice_query = Query::from("todos");
     let mut alice_subscription =
         prepared_subscribe(&client, &alice_query, global_subscribe_opts()).unwrap();
-    let local_opening = block_on(alice_subscription.next_raw()).expect("local opening");
-    assert!(!event_settled(&local_opening));
-    assert!(opened_rows(local_opening).is_empty());
+    assert!(alice_subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     for _ in 0..32 {
@@ -145,7 +143,7 @@ fn malformed_authority_closure_reaches_only_its_public_subscription() {
         .tick()
         .expect("malformed closure becomes a subscription error, not a peer-tick failure");
     assert_eq!(
-        block_on(alice_subscription.next_raw()),
+        alice_subscription.try_next_event(),
         Some(SubscriptionEvent::Rejected {
             reason: SubscribeRejectReason::InvalidAuthoritySourceClosure {
                 transition: "invalid or duplicate supporting physical row version".to_owned(),
@@ -170,7 +168,7 @@ fn malformed_authority_closure_reaches_only_its_public_subscription() {
     let bob_query = Query::from("todos").filter(eq(col("title"), lit("persisted upstream")));
     let mut bob_subscription =
         prepared_subscribe(&client, &bob_query, global_subscribe_opts()).unwrap();
-    let _ = block_on(bob_subscription.next_raw()).expect("bob local opening");
+    assert!(bob_subscription.try_next_event().is_none());
     client.tick().unwrap();
     let mut bob_rows = Vec::new();
     for _ in 0..32 {
@@ -599,9 +597,7 @@ fn db_sync_surface_round_trips_subscription_to_client() {
     let _subscriber = server.accept_subscriber(server_transport, client_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    let opened = block_on(subscription.next_raw()).unwrap();
-    assert!(!event_settled(&opened));
-    assert!(opened_rows(opened).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
@@ -614,7 +610,7 @@ fn db_sync_surface_round_trips_subscription_to_client() {
         rows[0].cell(table, "title"),
         Some(Value::String("from server".to_owned()))
     );
-    let (added, updated, removed) = delta_rows(block_on(subscription.next_raw()).unwrap());
+    let (added, updated, removed) = delta_rows(next_settled_opening(&mut subscription));
     assert_eq!(added.len(), 1);
     assert!(updated.is_empty());
     assert!(removed.is_empty());
@@ -642,9 +638,7 @@ fn persisted_upstream_batch_survives_subscription_refresh_failure_without_redeli
     let _subscriber = server.accept_subscriber(server_transport, client_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    let opened = block_on(subscription.next_raw()).unwrap();
-    assert!(!event_settled(&opened));
-    assert!(opened_rows(opened).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
@@ -664,7 +658,9 @@ fn persisted_upstream_batch_survives_subscription_refresh_failure_without_redeli
         "the routed subscription error must remain visible in tick progress"
     );
     assert_eq!(
-        block_on(subscription.next_raw()).expect("refresh failure event"),
+        subscription
+            .try_next_event()
+            .expect("refresh failure event"),
         SubscriptionEvent::Rejected {
             reason: SubscribeRejectReason::ServerFailure {
                 code: SubscribeServerFailureCode::Internal,
@@ -747,7 +743,7 @@ fn globally_accepted_client_rows_survive_writer_disconnect_for_fresh_reader() {
     let _reader_subscriber = server.accept_subscriber(server_reader_transport, reader_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&reader, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     let mut received = RelationSnapshot::default();
     for _ in 0..32 {
@@ -790,9 +786,7 @@ fn large_logical_snapshot_crosses_byte_peer_transport_and_settles() {
     let _subscriber = server.accept_subscriber(server_transport, client_author);
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    let opened = block_on(subscription.next_raw()).unwrap();
-    assert!(!event_settled(&opened));
-    assert!(opened_rows(opened).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     for _ in 0..200 {
         client.tick().unwrap();
@@ -850,7 +844,7 @@ fn branch_view_subscription_projects_base_resumes_and_unsubscribes_exact_view() 
     let opts = global_subscribe_opts()
         .branch_view(head.clone(), Some(BranchViewBase::Current(base.clone())));
     let mut subscription = prepared_subscribe(&client, &query, opts.clone()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     let mut snapshot = RelationSnapshot::default();
     for _ in 0..10 {
@@ -998,8 +992,8 @@ fn branch_view_subscriptions_disambiguate_same_row_and_tx_by_branch() {
         global_subscribe_opts().branch_view(right.clone(), None),
     )
     .unwrap();
-    assert!(opened_rows(block_on(left_subscription.next_raw()).unwrap()).is_empty());
-    assert!(opened_rows(block_on(right_subscription.next_raw()).unwrap()).is_empty());
+    assert!(left_subscription.try_next_event().is_none());
+    assert!(right_subscription.try_next_event().is_none());
 
     let mut left_snapshot = RelationSnapshot::default();
     let mut right_snapshot = RelationSnapshot::default();
@@ -1095,7 +1089,7 @@ fn default_current_subscription_reconciles_deletion_witness_without_reset() {
     let _upstream = crate::db::block_on(client.connect_upstream(client_transport));
     let _subscriber = server.accept_subscriber(server_transport, client_author);
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     let mut snapshot = RelationSnapshot::default();
     for _ in 0..10 {

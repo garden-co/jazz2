@@ -26,7 +26,6 @@ it("drains pending reads and subscriptions, then drops a delayed native wake aft
           typeof command === "object" && command !== null
             ? (command as { type?: unknown }).type
             : command;
-        if (type === "prepareQuery") return Uint8Array.of(0);
         if (type === "all") return Uint8Array.of(1);
         if (type === "subscribe") return Uint8Array.of(2);
         if (type === "drainSubscription") return Uint8Array.of(3);
@@ -36,8 +35,6 @@ it("drains pending reads and subscriptions, then drops a delayed native wake aft
       },
       decodeNativeForegroundResponse(bytes: Uint8Array) {
         switch (bytes[0]) {
-          case 0:
-            return { type: "preparedQuery", query: 10 };
           case 1:
             return { type: "pending", operation: 11 };
           case 2:
@@ -74,7 +71,7 @@ it("drains pending reads and subscriptions, then drops a delayed native wake aft
 
   const wakes: string[] = [];
   db.setTickScheduler((urgency) => wakes.push(String(urgency)));
-  const query = db.prepareQuery(Uint8Array.of(1), "query");
+  const query = Uint8Array.of(1);
   const pendingRows = db.all(query, { tier: "local" });
   expect(typeof pendingRows).toBe("object");
   expect("poll" in pendingRows && pendingRows.poll()).toEqual(Uint8Array.of(9));
@@ -107,7 +104,7 @@ it("rejects unknown transaction reads before invoking native commands", () => {
   const execute = vi.fn();
   const tick = vi.fn();
   const db = new NativeForegroundDb({ execute, tick, close: () => true }, {} as never);
-  expect(() => db.all({ nativeForegroundQuery: 2 }, { tier: "local" }, "missing")).toThrow(
+  expect(() => db.all(Uint8Array.of(2), { tier: "local" }, "missing")).toThrow(
     "cannot read unknown transaction missing",
   );
   expect(execute).not.toHaveBeenCalled();

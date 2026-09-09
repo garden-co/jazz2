@@ -3614,7 +3614,7 @@ struct DetachedSubscriptionRefresh {
     snapshot_index: RelationSnapshotIndex,
     snapshot_source: SubscriptionSnapshotSource,
     settled: bool,
-    sender: UnboundedSender<SubscriptionEvent>,
+    sender: SubscriptionSender,
     local_subscription_cleanup: Rc<Cell<Option<(u64, groove::ivm::SubscriptionId)>>>,
 }
 
@@ -4040,6 +4040,12 @@ where
                 *publishable = settled || !added.is_empty() || !removed.is_empty();
             }
             let mut state_ref = state.borrow_mut();
+            let publication_before = state_ref.sender.checkpoint(
+                read_tier,
+                settled,
+                &state_ref.snapshot,
+                &state_ref.snapshot_index,
+            )?;
             state_ref.groove_runtime_token = groove_runtime_token;
             state_ref.snapshot = relation_snapshot_with_delta_slack(&snapshot);
             state_ref.snapshot_index = RelationSnapshotIndex::from_snapshot(&state_ref.snapshot);
@@ -4064,9 +4070,17 @@ where
             // Do not enqueue that provisional frame merely for the stream
             // facade to discard later: raw/poll consumers must not observe a
             // stale empty opening before the authoritative reset.
-            if subscription_event_is_publishable(&event)
-                && state_ref.sender.unbounded_send(event).is_ok()
-            {
+            let materialized =
+                state_ref
+                    .sender
+                    .materialized(&node.borrow(), shape.query(), &event)?;
+            if state_ref.sender.publish(
+                event,
+                publication_before,
+                &state_ref.snapshot,
+                &state_ref.snapshot_index,
+                materialized,
+            )? {
                 changed += 1;
             }
             drop(state_ref);
@@ -4351,6 +4365,12 @@ where
                         .await;
                     refresh.maintained = Some(maintained);
                     let materialized = materialized?;
+                    let publication_before = refresh.sender.checkpoint(
+                        read_tier,
+                        false,
+                        &refresh.snapshot,
+                        &refresh.snapshot_index,
+                    )?;
                     let replacement = materialized.snapshot;
                     refresh.snapshot = relation_snapshot_with_delta_slack(&replacement);
                     refresh.snapshot_index = relation_snapshot_index_with_root_occurrences(
@@ -4403,7 +4423,17 @@ where
                         );
                     }
                     retained.push(Rc::downgrade(&state));
-                    if refresh.sender.unbounded_send(event).is_ok() {
+                    let materialized =
+                        refresh
+                            .sender
+                            .materialized(&node.borrow(), shape.query(), &event)?;
+                    if refresh.sender.publish(
+                        event,
+                        publication_before,
+                        &refresh.snapshot,
+                        &refresh.snapshot_index,
+                        materialized,
+                    )? {
                         changed += 1;
                     }
                     continue;
@@ -4449,6 +4479,12 @@ where
                                         )
                                     })
                                     .transpose()?;
+                                let publication_before = refresh.sender.checkpoint(
+                                    read_tier,
+                                    settled,
+                                    &refresh.snapshot,
+                                    &refresh.snapshot_index,
+                                )?;
                                 let event = apply_terminal_operations_to_subscription_snapshot(
                                     &mut refresh.snapshot,
                                     &mut refresh.snapshot_index,
@@ -4492,7 +4528,18 @@ where
                                 }
                                 refresh.settled = settled;
                                 retained.push(Rc::downgrade(&state));
-                                if refresh.sender.unbounded_send(event).is_ok() {
+                                let materialized = refresh.sender.materialized(
+                                    &node.borrow(),
+                                    shape.query(),
+                                    &event,
+                                )?;
+                                if refresh.sender.publish(
+                                    event,
+                                    publication_before,
+                                    &refresh.snapshot,
+                                    &refresh.snapshot_index,
+                                    materialized,
+                                )? {
                                     changed += 1;
                                 }
                                 continue;
@@ -4510,6 +4557,12 @@ where
                             ..
                         }) => {
                             let state_ref = &mut refresh;
+                            let publication_before = state_ref.sender.checkpoint(
+                                read_tier,
+                                false,
+                                &state_ref.snapshot,
+                                &state_ref.snapshot_index,
+                            )?;
                             let previous_snapshot = materialized_subscription_snapshot(
                                 &state_ref.snapshot,
                                 &state_ref.snapshot_index,
@@ -4570,7 +4623,18 @@ where
                             }
                             state_ref.settled = settled;
                             retained.push(Rc::downgrade(&state));
-                            if state_ref.sender.unbounded_send(event).is_ok() {
+                            let materialized = state_ref.sender.materialized(
+                                &node.borrow(),
+                                shape.query(),
+                                &event,
+                            )?;
+                            if state_ref.sender.publish(
+                                event,
+                                publication_before,
+                                &state_ref.snapshot,
+                                &state_ref.snapshot_index,
+                                materialized,
+                            )? {
                                 changed += 1;
                             }
                             continue;
@@ -4583,6 +4647,12 @@ where
                         .as_ref()
                         .is_some_and(LocalMaintainedViewSubscription::has_covered_input_sources)
                 {
+                    let publication_before = refresh.sender.checkpoint(
+                        read_tier,
+                        false,
+                        &refresh.snapshot,
+                        &refresh.snapshot_index,
+                    )?;
                     // Local-first may already have published the exact same
                     // collector state from its provisional local input. The
                     // first authority closure still becomes installed below,
@@ -4653,7 +4723,17 @@ where
                     refresh.snapshot_source = SubscriptionSnapshotSource::LocalMaintained;
                     refresh.settled = settled;
                     retained.push(Rc::downgrade(&state));
-                    let delivered = refresh.sender.unbounded_send(event).is_ok();
+                    let materialized =
+                        refresh
+                            .sender
+                            .materialized(&node.borrow(), shape.query(), &event)?;
+                    let delivered = refresh.sender.publish(
+                        event,
+                        publication_before,
+                        &refresh.snapshot,
+                        &refresh.snapshot_index,
+                        materialized,
+                    )?;
                     if std::env::var_os("JAZZ_COVERED_INPUT_TRACE").is_some() {
                         eprintln!(
                             "JAZZ_COVERED_INPUT_TRACE stage=covered_reset_delivery delivered={delivered}"
@@ -4787,6 +4867,12 @@ where
         }
         if force_reset_event || snapshot != previous || settled != previous_settled {
             let mut state = state.borrow_mut();
+            let publication_before = state.sender.checkpoint(
+                read_tier,
+                settled,
+                &state.snapshot,
+                &state.snapshot_index,
+            )?;
             let event = if force_reset_event {
                 subscription_delta_event_with_reset(
                     snapshot_tier,
@@ -4822,7 +4908,17 @@ where
                 .unwrap_or_default();
             state.snapshot_source = snapshot_source;
             state.settled = settled;
-            if state.sender.unbounded_send(event).is_ok() {
+            let SubscriptionKind::Prepared { shape, .. } = &state.kind;
+            let materialized = state
+                .sender
+                .materialized(&node.borrow(), shape.query(), &event)?;
+            if state.sender.publish(
+                event,
+                publication_before,
+                &state.snapshot,
+                &state.snapshot_index,
+                materialized,
+            )? {
                 changed += 1;
             }
         }

@@ -8,17 +8,12 @@ import {
   todos,
   bundleItems,
   bundles,
-  makeQuery,
   conditionCases,
   seedTodosForConditions,
   assertConditionQuery,
   assertByteaQuery,
   assertUuidOrderQuery,
   assertWindowQuery,
-  type Org,
-  type Team,
-  type User,
-  type BundleItem,
 } from "../shared/local-query-scenarios.js";
 
 function uniqueDbName(label: string): string {
@@ -98,25 +93,25 @@ describe("db.all browser integration", () => {
 
     const {
       value: { id: orgId },
-    } = await db.insert(orgs, { name: "Acme" });
+    } = db.insert(orgs, { name: "Acme" });
     const {
       value: { id: teamId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "Core",
       org_id: orgId,
       parent_id: undefined,
     });
     const {
       value: { id: ownerId },
-    } = await db.insert(users, { name: "Owner", team_id: teamId });
-    await db.insert(todos, {
+    } = db.insert(users, { name: "Owner", team_id: teamId });
+    db.insert(todos, {
       title: "with-owner-1",
       done: false,
       priority: 1,
       owner_id: ownerId,
       tags: ["x"],
     });
-    await db.insert(todos, {
+    db.insert(todos, {
       title: "with-owner-2",
       done: true,
       priority: 2,
@@ -124,12 +119,7 @@ describe("db.all browser integration", () => {
       tags: ["y"],
     });
 
-    const rows = await db.all<User>(
-      makeQuery<User>("users", {
-        conditions: [{ column: "id", op: "eq", value: ownerId }],
-        includes: { todosViaOwner: true },
-      }),
-    );
+    const rows = await db.all(users.where({ id: ownerId }).include({ todosViaOwner: true }));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -155,24 +145,19 @@ describe("db.all browser integration", () => {
 
     const {
       value: { id: orgId },
-    } = await db.insert(orgs, { name: "Org A" });
+    } = db.insert(orgs, { name: "Org A" });
     const {
       value: { id: teamId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "Team A",
       org_id: orgId,
       parent_id: undefined,
     });
     const {
       value: { id: userId },
-    } = await db.insert(users, { name: "User A", team_id: teamId });
+    } = db.insert(users, { name: "User A", team_id: teamId });
 
-    const rows = await db.all<Org>(
-      makeQuery<Org>("users", {
-        conditions: [{ column: "id", op: "eq", value: userId }],
-        hops: ["team", "org"],
-      }),
-    );
+    const rows = await db.all(users.where({ id: userId }).hopTo("team").hopTo("org"));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toEqual({ id: orgId, name: "Org A" });
@@ -188,43 +173,33 @@ describe("db.all browser integration", () => {
 
     const {
       value: { id: orgId },
-    } = await db.insert(orgs, { name: "FK Org" });
+    } = db.insert(orgs, { name: "FK Org" });
     const {
       value: { id: teamId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "FK Team",
       org_id: orgId,
       parent_id: undefined,
     });
     const {
       value: { id: userId },
-    } = await db.insert(users, { name: "FK User", team_id: teamId });
+    } = db.insert(users, { name: "FK User", team_id: teamId });
 
     const {
       value: { id: partAId },
-    } = await db.insert(bundleItems, { label: "A" });
+    } = db.insert(bundleItems, { label: "A" });
     const {
       value: { id: partBId },
-    } = await db.insert(bundleItems, { label: "B" });
+    } = db.insert(bundleItems, { label: "B" });
     const {
       value: { id: bundleId },
-    } = await db.insert(bundles, { name: "Bundle 1", items: [partBId, partAId] });
+    } = db.insert(bundles, { name: "Bundle 1", items: [partBId, partAId] });
 
-    const teamRows = await db.all<Team>(
-      makeQuery<Team>("users", {
-        conditions: [{ column: "id", op: "eq", value: userId }],
-        hops: ["team"],
-      }),
-    );
+    const teamRows = await db.all(users.where({ id: userId }).hopTo("team"));
     expect(teamRows).toHaveLength(1);
     expect(teamRows[0]).toMatchObject({ id: teamId, name: "FK Team" });
 
-    const itemRows = await db.all<BundleItem>(
-      makeQuery<BundleItem>("bundles", {
-        conditions: [{ column: "id", op: "eq", value: bundleId }],
-        hops: ["items"],
-      }),
-    );
+    const itemRows = await db.all(bundles.where({ id: bundleId }).hopTo("items"));
     expect(itemRows).toHaveLength(2);
     expect(itemRows.map((row) => row.label).sort()).toEqual(["A", "B"]);
   });
@@ -239,36 +214,30 @@ describe("db.all browser integration", () => {
 
     const {
       value: { id: rootId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "root",
       org_id: undefined,
       parent_id: undefined,
     });
     const {
       value: { id: midId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "mid",
       org_id: undefined,
       parent_id: rootId,
     });
     const {
       value: { id: leafId },
-    } = await db.insert(teams, {
+    } = db.insert(teams, {
       name: "leaf",
       org_id: undefined,
       parent_id: midId,
     });
 
-    const rows = await db.all<Team>(
-      makeQuery<Team>("teams", {
-        conditions: [{ column: "id", op: "eq", value: leafId }],
-        gather: {
-          max_depth: 10,
-          step_table: "teams",
-          step_current_column: "id",
-          step_conditions: [],
-          step_hops: ["parent"],
-        },
+    const rows = await db.all(
+      teams.where({ id: leafId }).gather({
+        maxDepth: 10,
+        step: ({ current }) => teams.where({ id: current }).hopTo("parent"),
       }),
     );
 

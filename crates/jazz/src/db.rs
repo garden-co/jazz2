@@ -4308,7 +4308,198 @@ struct SubscriptionState {
     /// until the replacement has its first local terminal batch, then publish
     /// one complete reset from that retained baseline.
     cold_runtime_replacement: bool,
+    sender: SubscriptionSender,
+}
+
+/// One application publication boundary shared by every refresh path. Retain
+/// a baseline only while withholding changes, not a second live result tree.
+#[derive(Clone)]
+struct SubscriptionSender {
     sender: UnboundedSender<SubscriptionEvent>,
+    publication: Rc<RefCell<SubscriptionPublication>>,
+    requested_tier: DurabilityTier,
+}
+
+#[derive(Default)]
+struct SubscriptionPublication {
+    opened: bool,
+    deferred: Option<SubscriptionPublicationSnapshot>,
+    reset: bool,
+    unresolved: BTreeSet<OutputOccurrenceId>,
+}
+
+struct SubscriptionPublicationSnapshot {
+    snapshot: RelationSnapshot,
+    occurrences: Vec<OutputOccurrenceId>,
+}
+
+impl SubscriptionPublicationSnapshot {
+    fn capture(snapshot: &RelationSnapshot, index: &RelationSnapshotIndex) -> Result<Self, Error> {
+        Ok(Self {
+            snapshot: materialized_subscription_snapshot(snapshot, index)?,
+            occurrences: snapshot_root_occurrences(snapshot, index)?,
+        })
+    }
+}
+
+impl SubscriptionSender {
+    /// Validate only changed roots. Descendant edits do not change a root's
+    /// required scalar cells; unchanged roots must not be rescanned here.
+    fn materialized<S: OrderedKvStorage>(
+        &self,
+        node: &NodeState<S>,
+        query: &Query,
+        event: &SubscriptionEvent,
+    ) -> Result<bool, Error> {
+        let mut publication = self.publication.borrow_mut();
+        if let SubscriptionEvent::Delta {
+            reset,
+            added,
+            updated,
+            removed,
+            ..
+        } = event
+        {
+            if *reset {
+                publication.unresolved.clear();
+            }
+            for row in removed {
+                publication.unresolved.remove(&row.occurrence_id);
+            }
+            for row in added.iter().chain(updated) {
+                let changed = RelationSnapshot {
+                    root_count: 1,
+                    rows: vec![row.row.clone()],
+                    edges: Vec::new(),
+                };
+                if node.relation_snapshot_has_materialized_required_cells(query, &changed)? {
+                    publication.unresolved.remove(&row.occurrence_id);
+                } else {
+                    publication.unresolved.insert(row.occurrence_id.clone());
+                }
+            }
+        }
+        Ok(publication.unresolved.is_empty())
+    }
+
+    fn checkpoint(
+        &self,
+        tier: DurabilityTier,
+        settled: bool,
+        snapshot: &RelationSnapshot,
+        index: &RelationSnapshotIndex,
+    ) -> Result<Option<SubscriptionPublicationSnapshot>, Error> {
+        let publication = self.publication.borrow();
+        if tier >= DurabilityTier::Edge
+            && !settled
+            && publication.opened
+            && publication.deferred.is_none()
+        {
+            SubscriptionPublicationSnapshot::capture(snapshot, index).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn publish(
+        &self,
+        mut event: SubscriptionEvent,
+        before: Option<SubscriptionPublicationSnapshot>,
+        snapshot: &RelationSnapshot,
+        index: &RelationSnapshotIndex,
+        materialized: bool,
+    ) -> Result<bool, Error> {
+        let SubscriptionEvent::Delta {
+            reset,
+            publishable,
+            settled,
+            tier,
+            ..
+        } = &event
+        else {
+            return Ok(self.unbounded_send(event).is_ok());
+        };
+        let (reset, publishable, settled, tier) = (*reset, *publishable, *settled, *tier);
+        if !publishable
+            && matches!(&event, SubscriptionEvent::Delta {
+            reset: false, added, updated, removed, terminal_operations, ..
+        } if added.is_empty() && updated.is_empty() && removed.is_empty() && terminal_operations.is_empty())
+        {
+            return Ok(false);
+        }
+        if settled && !materialized {
+            return Err(Error::new(
+                ErrorCode::Protocol,
+                "settled subscription retained unresolved required cells",
+            ));
+        }
+        let mut publication = self.publication.borrow_mut();
+        if !publishable
+            || !materialized
+            || (self.requested_tier >= DurabilityTier::Edge && !settled)
+        {
+            if publication.opened
+                && publication.deferred.is_none()
+                && self.requested_tier >= DurabilityTier::Edge
+            {
+                publication.deferred = Some(before.ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Protocol,
+                        "withheld subscription change has no publication baseline",
+                    )
+                })?);
+            }
+            // Local coverage can be unsettled during perfectly ordinary
+            // immediate delivery. Do not checkpoint those updates. If local
+            // required cells are actually missing, resume with a canonical
+            // reset when the maintained result becomes materialized again.
+            publication.reset |= reset || self.requested_tier < DurabilityTier::Edge;
+            return Ok(false);
+        }
+        if !publication.opened || publication.reset || (reset && publication.deferred.is_some()) {
+            let current = SubscriptionPublicationSnapshot::capture(snapshot, index)?;
+            event = SubscriptionEvent::Delta {
+                reset: true,
+                publishable: true,
+                added: subscription_outputs_with_occurrence_sidecar(
+                    &current.snapshot,
+                    &current.occurrences,
+                )?,
+                updated: Vec::new(),
+                removed: Vec::new(),
+                terminal_operations: Vec::new(),
+                settled,
+                tier,
+            };
+        } else if let Some(previous) = &publication.deferred {
+            let current = SubscriptionPublicationSnapshot::capture(snapshot, index)?;
+            event = subscription_terminal_delta_event(
+                tier,
+                settled,
+                &previous.snapshot,
+                &previous.occurrences,
+                &current.snapshot,
+                &current.occurrences,
+            )?;
+        }
+        publication.opened = true;
+        publication.deferred = None;
+        publication.reset = false;
+        Ok(self.sender.unbounded_send(event).is_ok())
+    }
+
+    fn unbounded_send(
+        &self,
+        event: SubscriptionEvent,
+    ) -> Result<(), futures_channel::mpsc::TrySendError<SubscriptionEvent>> {
+        if matches!(&event, SubscriptionEvent::Closed)
+            || matches!(&event, SubscriptionEvent::Rejected { reason }
+                if !matches!(reason, SubscribeRejectReason::ShapeRegistrationPendingCatalogueAdmission))
+        {
+            self.publication.borrow_mut().deferred = None;
+        }
+        self.sender.unbounded_send(event)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -4472,6 +4663,8 @@ pub enum SubscriptionEvent {
         /// Typed structural edits to already hydrated terminal rows.
         terminal_operations: Vec<groove::ivm::TerminalOperation>,
         /// Whether the result is complete at the requested read tier.
+        /// Public Edge/Global streams emit only settled results. Local streams
+        /// can publish materialized local rows before remote coverage settles.
         settled: bool,
         /// Read tier used to materialize the rows.
         tier: DurabilityTier,
@@ -4494,7 +4687,12 @@ enum SubscriptionFinalization {
     Failed { code: ErrorCode, message: String },
 }
 
-/// Stream of materialized subscription events.
+/// Stream of application-ready subscription events.
+///
+/// Local results publish as soon as required cells are materialized. Edge and
+/// Global results also wait for settlement at the requested tier. Withheld
+/// changes are coalesced relative to the last emitted result, so consumers do
+/// not maintain provisional snapshots or replay hidden terminal history.
 pub struct SubscriptionStream {
     receiver: UnboundedReceiver<SubscriptionEvent>,
     _state: Rc<RefCell<SubscriptionState>>,
@@ -4544,6 +4742,12 @@ impl SubscriptionStream {
             // callers cannot observe an old buffered delta while finalization is
             // suspended behind storage or the node mutex.
             self.terminated = true;
+            self._state
+                .borrow()
+                .sender
+                .publication
+                .borrow_mut()
+                .deferred = None;
             self.receiver.close();
             let (sender, receiver) = oneshot::channel();
             let drain = cleanup(Some(sender));
@@ -4698,6 +4902,22 @@ impl Drop for SubscriptionStream {
     }
 }
 
+/// Materialized result of a serialized host read.
+#[doc(hidden)]
+pub enum SerializedReadResult {
+    Rows(Vec<CurrentRow>),
+    Relation(RelationSnapshot),
+}
+
+/// Authorization route used when a host opens a serialized subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SerializedSubscriptionAuthorization {
+    ClientLocal,
+    TrustedServing(AuthorSubject),
+    TrustedClient(AuthorSubject),
+}
+
 /// Validated and bound query plan used by all `Db` reads and subscriptions.
 #[derive(Clone, Debug)]
 pub struct PreparedQuery {
@@ -4837,7 +5057,7 @@ pub(in crate::db) fn demote_authority_receipt_subscriptions(
                         .upstream_subscription_handles
                         .iter()
                         .any(|handle| publishing_subscriptions.contains(&handle.subscription));
-                    if !frame_will_publish {
+                    if !frame_will_publish && state_ref.read_tier < DurabilityTier::Edge {
                         let event = subscription_delta_event(
                             state_ref.read_tier,
                             false,

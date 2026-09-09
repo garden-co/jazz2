@@ -72,7 +72,10 @@ fn db_facade_subscription_refresh_preserves_read_tier() {
     ))
     .unwrap();
 
-    assert!(opened_rows(doctest_support::block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(
+        subscription.try_next_event().is_none(),
+        "Global waits for authority coverage even when the local result is empty"
+    );
 
     db.insert(
         "todos",
@@ -82,6 +85,10 @@ fn db_facade_subscription_refresh_preserves_read_tier() {
     .unwrap();
 
     assert_eq!(prepared_read(&db, &query).len(), 1);
+    assert!(
+        subscription.try_next_event().is_none(),
+        "a local write does not settle a Global subscription"
+    );
 }
 
 #[test]

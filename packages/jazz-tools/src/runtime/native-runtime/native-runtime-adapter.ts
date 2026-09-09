@@ -14,11 +14,7 @@ import type {
   WasmSchema,
 } from "../../drivers/types.js";
 import { serializeRuntimeSchema } from "../../drivers/schema-wire.js";
-import {
-  encodeRelationQueryPostcard,
-  parseRelationQueryJsonLossless,
-  type RelExpr,
-} from "../../ir.js";
+import { parseRelationQueryJsonLossless } from "../../ir.js";
 import type {
   TxId,
   InsertResult,
@@ -121,8 +117,13 @@ type ReadAuthorizationHost = "client-local" | "trusted-serving";
  */
 type NativeReadContext =
   | { readonly kind: "client-local" }
-  | { readonly kind: "session-authority"; readonly identity: Uint8Array }
+  | {
+      readonly kind: "session-authority";
+      readonly identity: Uint8Array;
+      readonly claims?: Record<string, unknown>;
+    }
   | { readonly kind: "backend-authority" };
+type NativeQueryInput = Uint8Array;
 type CoreTickWake = "immediate" | "deferred" | "after-current-turn" | `after:${number}`;
 
 type NativeDbConstructor = {
@@ -220,26 +221,22 @@ type NativeDb = {
   commitTransaction(openTransactionId: string, kind?: TransactionKind): Write;
   rollbackTransaction(openTransactionId: string): void;
   all(
-    query: PreparedQuery,
+    query: Uint8Array,
     opts: unknown,
     openTransactionId?: OpenTransactionId,
     author?: Uint8Array,
+    claims?: Record<string, unknown>,
   ): NativeReadResult | Promise<NativeReadResult>;
   admitLocalFirstSession?(token: string, appId: string, claimedAuthor: string): void;
   setSessionClaims?(claims: Record<string, unknown> | undefined | null): void | Promise<void>;
   setIdentityClaims?(author: Uint8Array, claims: Record<string, unknown> | undefined | null): void;
   foregroundTxTimeHighWater?(): bigint;
   seedForegroundTxTimeHighWater?(highWater: bigint): void;
-  prepareQuery(
-    query: Uint8Array,
-    kind: "query" | "relation",
-    author?: Uint8Array,
-    claims?: Record<string, unknown>,
-  ): PreparedQuery | PendingNativeOperation<PreparedQuery>;
   subscribe?(
-    query: PreparedQuery,
+    query: Uint8Array,
     opts: unknown,
     author?: Uint8Array,
+    claims?: Record<string, unknown>,
   ):
     | ReadableStream<unknown>
     | Subscription
@@ -388,8 +385,6 @@ type NativePermissionAdviceResult =
   | string
   | PendingNativePermissionAdvice;
 
-type PreparedQuery = object;
-
 type Subscription = {
   readAll(): unknown[] | PendingNativeSubscriptionBatch;
   drain?(): unknown[] | PendingNativeSubscriptionBatch;
@@ -515,24 +510,10 @@ type SubscriptionState = {
   openingAbort?: AbortController;
   terminalError?: Error;
   terminalErrorDelivered?: boolean;
-  sources: SubscriptionSourceState[];
-  queryJson: string;
-  query: PreparedQuery | null;
-  identity?: Uint8Array;
-  rows: RowState[];
-  rowIndexByKey: Map<string, number>;
-  visibleRows: RowState[];
+  source?: SubscriptionSource;
+  reading: boolean;
   outputColumns: SubscriptionOutputColumns | null;
-  session: RuntimeSession | null;
-  opts: unknown;
-  opened: boolean;
-  visibleOpened: boolean;
-  deferredVisiblePublication: boolean;
-  deferredVisibleReset: boolean;
-  deferredTerminalOperations: RuntimeTerminalOperation[];
-  deferredPlaceholderChunks: number;
-  deferredPlaceholderRows: number;
-  deferredPlaceholderBytes: number;
+  tier: string;
   callback?: (result: RuntimeSubscriptionDelta | Error) => void;
   cancelled: boolean;
 };
@@ -542,9 +523,17 @@ type SubscriptionOutputColumns = {
   rootColumns: readonly ColumnDescriptor[];
 };
 
-type SubscriptionSourceState = {
-  source: ReadableStreamDefaultReader<unknown> | Subscription;
-  reading: boolean;
+type SubscriptionSourceRead =
+  | { type: "batch"; events: unknown[] }
+  | { type: "pending"; retryAfterMs: number }
+  | { type: "closed" };
+
+type SubscriptionSource = {
+  pull(
+    ready: (read: SubscriptionSourceRead) => void,
+    failed: (error: unknown) => void,
+  ): SubscriptionSourceRead | undefined;
+  close(): void;
 };
 
 export type RowState = {
@@ -552,8 +541,6 @@ export type RowState = {
   id: string;
   values: Value[];
   valuesByColumn?: Map<string, Value>;
-  resultKey?: string;
-  resultKeyBytes?: Uint8Array;
 };
 
 type NativeRowFieldPlan = {
@@ -567,9 +554,6 @@ type NativeRowFieldPlan = {
 const textDecoder = new Utf8Decoder({ fatal: true });
 const byteHex = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, "0"));
 const nativeRowFieldPlanCache = new WeakMap<WasmSchema, Map<string, NativeRowFieldPlan[]>>();
-const MAX_DEFERRED_PLACEHOLDER_CHUNKS = 16;
-const MAX_DEFERRED_PLACEHOLDER_ROWS = 4_096;
-const MAX_DEFERRED_PLACEHOLDER_BYTES = 4 * 1024 * 1024;
 
 function openPersistentDb(
   Runtime: NativeDbConstructor,
@@ -654,7 +638,6 @@ export class NativeRuntimeAdapter implements Runtime {
   private readonly scopeIsolatedRelay: boolean;
   private readonly schemaHash: string;
   private readonly trustedBackend: boolean;
-  private readonly preparedQueries = new Map<string, PreparedQuery>();
   private readonly transactionOwner: TransactionOwnerState;
   private readonly pendingTxs: Map<string, PendingTx>;
   private readonly completedTxs: Map<string, CompletedTx>;
@@ -1164,15 +1147,8 @@ export class NativeRuntimeAdapter implements Runtime {
     for (const cancel of this.pendingNativeAdmissionCancels) cancel();
     for (const subscription of this.subscriptions.values()) {
       subscription.openingAbort?.abort();
-      for (const source of subscription.sources) {
-        closeSubscriptionSource(source.source);
-      }
+      if (subscription.source) closeSubscriptionSource(subscription.source);
     }
-    // Prepared plans and coverage receipts are valid only while this runtime
-    // is live. Release them before closing the native owner so long-lived JS
-    // Db wrappers cannot retain stale native graph/storage state through a
-    // cache after their context has shut down.
-    this.preparedQueries.clear();
     if (this !== this.ownerRuntime) {
       this.subscriptions.clear();
       // Query and subscription futures may still be unwinding through this
@@ -1862,15 +1838,7 @@ export class NativeRuntimeAdapter implements Runtime {
     const session = readSession(sessionJson);
     assertNoUnsupportedPermissionIntrospection(queryJson);
     const coreQueryJson = addNestedOuterColumns(queryJson);
-    const usesNativeRelationApi = queryUsesNativeRelationApi(coreQueryJson);
     const pendingTx = pendingTxFromOptions(optionsJson, this.pendingTxs);
-    const requestSession = pendingTx?.identity ? (pendingTx.requestSession ?? session) : session;
-    // Relation IR is normalized by prepareQuery into the same native handle
-    // as ordinary queries. Transaction overlays for this syntax remain
-    // unsupported until its semantics are defined.
-    if (pendingTx && usesNativeRelationApi) {
-      throw new Error("Native runtime does not support relation reads inside a transaction");
-    }
     // Browser runtimes still materialize row bodies from their in-memory
     // cache, but an Edge/Global read must keep its requested tier while doing
     // so. The settled membership from the worker is the authorization
@@ -1878,7 +1846,8 @@ export class NativeRuntimeAdapter implements Runtime {
     // fresh remote receipt had just removed.
     const opts = readOptions(tier, queryIncludesDeleted(coreQueryJson), optionsJson);
     const readContext = this.nativeReadContext(session, pendingTx);
-    const query = await this.prepareQueryForRead(coreQueryJson, requestSession);
+    const query = nativeQueryInput(coreQueryJson, this.schema);
+    await this.ensureClientSessionClaims(session);
     await this.waitForStrictRemoteQueryTransport(tier);
     await this.processPendingPeerActivityBeforeRead();
     if (this.closed) return [];
@@ -1886,7 +1855,7 @@ export class NativeRuntimeAdapter implements Runtime {
       this.attachLocalReadCoverageInBackground(tier, optionsJson, query, session);
     }
     this.emitQueryCoverageTrace("attach");
-    if (usesNativeRelationApi || queryHasArraySubqueries(coreQueryJson)) {
+    if (queryHasArraySubqueries(coreQueryJson)) {
       if (pendingTx) {
         const payload = await this.readRowsForContextAsync(query, opts, readContext, pendingTx.id);
         this.emitQueryCoverageTrace("covered");
@@ -1901,9 +1870,7 @@ export class NativeRuntimeAdapter implements Runtime {
       return rowsFromRelationSnapshot(
         readRelationSnapshot(payload),
         this.schema,
-        usesNativeRelationApi
-          ? undefined
-          : subscriptionOutputColumns(coreQueryJson, this.schema).rootColumns,
+        subscriptionOutputColumns(coreQueryJson, this.schema).rootColumns,
       );
     }
     const projectedColumns = subscriptionOutputColumns(coreQueryJson, this.schema).rootColumns;
@@ -1925,37 +1892,19 @@ export class NativeRuntimeAdapter implements Runtime {
     const session = readSession(sessionJson);
     const readContext = this.nativeReadContext(session);
     assertNoUnsupportedPermissionIntrospection(queryJson);
-    const usesNativeRelationApi = queryUsesNativeRelationApi(queryJson);
     const handle = this.nextSubscriptionId++;
     const opts = readOptions(tier, false, optionsJson);
-    const identity = session?.identity;
     this.subscriptions.set(handle, {
-      sources: [],
       openingAbort: new AbortController(),
-      queryJson,
-      query: null,
-      identity,
-      rows: [],
-      rowIndexByKey: new Map(),
-      visibleRows: [],
-      outputColumns: usesNativeRelationApi
-        ? null
-        : subscriptionOutputColumns(queryJson, this.schema),
-      session,
-      opts,
-      opened: false,
-      visibleOpened: false,
-      deferredVisiblePublication: false,
-      deferredVisibleReset: false,
-      deferredTerminalOperations: [],
-      deferredPlaceholderChunks: 0,
-      deferredPlaceholderRows: 0,
-      deferredPlaceholderBytes: 0,
+      reading: false,
+      outputColumns: subscriptionOutputColumns(queryJson, this.schema),
+      tier: tier ?? "local",
       cancelled: false,
     });
     const subscription = this.subscriptions.get(handle)!;
+    const query = nativeQueryInput(queryJson, this.schema);
     const install = (native: ReadableStream<unknown> | Subscription) => {
-      subscription.sources = [{ source: subscriptionSource(native), reading: false }];
+      subscription.source = subscriptionSource(native);
       if (subscription.cancelled || this.closed) {
         closeSubscriptionSourceState(subscription);
         return;
@@ -1969,17 +1918,16 @@ export class NativeRuntimeAdapter implements Runtime {
           error instanceof Error ? error : new Error(String(error)),
         );
     };
-    const open = (query: PreparedQuery) => {
+    const open = () => {
       if (subscription.cancelled || this.closed) throw new Error("native operation was cancelled");
-      subscription.query = query;
       const native = this.subscribeForContext(query, opts, readContext);
       return isPendingNativeOperation<ReadableStream<unknown> | Subscription>(native)
         ? this.awaitNativeOperation(native, subscription.openingAbort!.signal)
         : native;
     };
     try {
-      const query = this.prepareQueryForRead(queryJson, session, subscription.openingAbort!.signal);
-      const opening = query instanceof Promise ? query.then(open) : open(query);
+      const claims = this.ensureClientSessionClaims(session);
+      const opening = claims instanceof Promise ? claims.then(open) : open();
       if (opening instanceof Promise) void opening.then(install).catch(fail);
       else install(opening);
     } catch (error) {
@@ -1996,19 +1944,11 @@ export class NativeRuntimeAdapter implements Runtime {
   executeSubscription(handle: number, onUpdate: Function): void {
     const subscription = this.subscriptions.get(handle);
     if (!subscription) return;
+    if (subscription.callback) throw new Error("Subscription has already been activated");
     subscription.callback = onUpdate as (result: RuntimeSubscriptionDelta | Error) => void;
     if (subscription.terminalError) {
       this.deliverSubscriptionFailure(subscription);
       return;
-    }
-    if (subscription.visibleOpened) {
-      subscription.callback(
-        runtimeResetDeltaFromRows(
-          subscription.visibleRows,
-          this.schema,
-          subscription.outputColumns,
-        ),
-      );
     }
     this.startSubscriptionReader(handle, subscription);
   }
@@ -2018,7 +1958,6 @@ export class NativeRuntimeAdapter implements Runtime {
     if (!subscription) return;
     subscription.cancelled = true;
     subscription.openingAbort?.abort();
-    clearDeferredPlaceholderBuffer(subscription);
     closeSubscriptionSourceState(subscription);
     this.subscriptions.delete(handle);
   }
@@ -2397,21 +2336,9 @@ export class NativeRuntimeAdapter implements Runtime {
     }
   }
 
-  private resultForRow(
-    table: string,
-    rowId: Uint8Array,
-    receipt:
-      | { kind: "committed"; txId: TxId }
-      | { kind: "staged"; openTransactionId: OpenTransactionId },
-    identity?: Uint8Array,
-  ): InsertResult {
-    const row = this.readRow(table, rowId, identity);
-    return { id: formatUuid(rowId), values: row?.values ?? [], ...receipt };
-  }
-
   private readRow(table: string, rowId: Uint8Array, identity?: Uint8Array): RowState | undefined {
     if (!identity) return this.readRowForWriteMerge(table, rowId);
-    const query = this.prepareQuery(JSON.stringify({ table }));
+    const query = nativeQueryInput(JSON.stringify({ table }), this.schema);
     const rows = this.readRowsForContext(
       query,
       readOptions(),
@@ -2433,7 +2360,7 @@ export class NativeRuntimeAdapter implements Runtime {
       );
       return rows[0];
     }
-    const query = this.prepareQuery(JSON.stringify({ table }));
+    const query = nativeQueryInput(JSON.stringify({ table }), this.schema);
     const rows = this.db.all(query, {
       ...(readOptions() as Record<string, unknown>),
       sync: true,
@@ -2494,7 +2421,7 @@ export class NativeRuntimeAdapter implements Runtime {
   }
 
   private async readPlainRows(
-    query: PreparedQuery,
+    query: NativeQueryInput,
     opts: unknown,
     session: RuntimeSession | undefined,
     pendingTx: PendingTx | undefined,
@@ -2509,7 +2436,7 @@ export class NativeRuntimeAdapter implements Runtime {
    * point, with a request session supplying its subject when present.
    */
   private readRowsForContext(
-    query: PreparedQuery,
+    query: NativeQueryInput,
     opts: unknown,
     context: NativeReadContext,
   ): Uint8Array {
@@ -2518,6 +2445,7 @@ export class NativeRuntimeAdapter implements Runtime {
       { ...(opts as Record<string, unknown>), sync: true },
       undefined,
       this.nativeReadAuthor(context),
+      this.nativeReadClaims(context),
     );
     if (typeof (result as Promise<unknown>).then === "function") {
       throw new Error("native read is asynchronous; use the asynchronous read boundary");
@@ -2529,7 +2457,7 @@ export class NativeRuntimeAdapter implements Runtime {
   }
 
   private async readRowsForContextAsync(
-    query: PreparedQuery,
+    query: NativeQueryInput,
     opts: unknown,
     context: NativeReadContext,
     openTransactionId?: OpenTransactionId,
@@ -2541,17 +2469,21 @@ export class NativeRuntimeAdapter implements Runtime {
   }
 
   private startRowsForContext(
-    query: PreparedQuery,
+    query: NativeQueryInput,
     opts: unknown,
     context: NativeReadContext,
     openTransactionId?: OpenTransactionId,
   ): NativeReadResult | Promise<NativeReadResult> {
     const author = this.nativeReadAuthor(context);
-    return this.db.all(query, opts, openTransactionId, author);
+    return this.db.all(query, opts, openTransactionId, author, this.nativeReadClaims(context));
   }
 
   private nativeReadAuthor(context: NativeReadContext): Uint8Array | undefined {
     return context.kind === "session-authority" ? context.identity : undefined;
+  }
+
+  private nativeReadClaims(context: NativeReadContext): Record<string, unknown> | undefined {
+    return context.kind === "session-authority" ? context.claims : undefined;
   }
 
   /**
@@ -2572,13 +2504,14 @@ export class NativeRuntimeAdapter implements Runtime {
       return {
         kind: "session-authority",
         identity: pendingTx?.identity ?? session?.identity ?? this.peerIdentity,
+        claims: pendingTx?.requestSession?.claims ?? session?.claims,
       };
     }
     return { kind: "client-local" };
   }
 
   private subscribeForContext(
-    query: PreparedQuery,
+    query: NativeQueryInput,
     opts: unknown,
     context: NativeReadContext,
   ):
@@ -2587,7 +2520,7 @@ export class NativeRuntimeAdapter implements Runtime {
     | PendingNativeOperation<ReadableStream<unknown> | Subscription> {
     if (!this.db.subscribe) throw new Error("Native runtime does not support subscriptions");
     const author = context.kind === "session-authority" ? context.identity : undefined;
-    return this.db.subscribe(query, opts, author);
+    return this.db.subscribe(query, opts, author, this.nativeReadClaims(context));
   }
 
   /** Drive the binding-owned coverage and hydration operation while the
@@ -2660,13 +2593,6 @@ export class NativeRuntimeAdapter implements Runtime {
       return write.deleted ? undefined : write.row;
     }
     return undefined;
-  }
-
-  private warnedOnce = new Set<string>();
-  private warnOnce(key: string, message: string): void {
-    if (this.warnedOnce.has(key)) return;
-    this.warnedOnce.add(key);
-    console.warn(`[jazz native-runtime] ${message}`);
   }
 
   private awaitNativeOperation<T>(
@@ -2742,79 +2668,14 @@ export class NativeRuntimeAdapter implements Runtime {
     this.clientSessionClaimsKey = key;
   }
 
-  private prepareQueryForRead(
-    queryJson: string,
-    session: RuntimeSession | null,
-    signal?: AbortSignal,
-  ): PreparedQuery | Promise<PreparedQuery> {
-    if (session && !session.backendAuthority && this.readAuthorizationHost !== "trusted-serving") {
-      const key = canonicalJson(session.claims);
-      if (key !== this.clientSessionClaimsKey) {
-        // Claim installation mutates native state. Wait for any storage-backed
-        // tick to release it, and avoid serializing unchanged claims per read.
-        const prepare = () => {
-          const installed = this.installClientSessionClaims(session.claims);
-          if (installed instanceof Promise)
-            return installed.then(() =>
-              this.prepareQueryForReadWithClaims(queryJson, session, signal),
-            );
-          return this.prepareQueryForReadWithClaims(queryJson, session, signal);
-        };
-        return this.ownerRuntime.coreOperation ? this.runWhenCoreIdle(prepare) : prepare();
-      }
-    }
-    return this.prepareQueryForReadWithClaims(queryJson, session, signal);
-  }
-
-  private prepareQueryForReadWithClaims(
-    queryJson: string,
-    session: RuntimeSession | null,
-    signal?: AbortSignal,
-  ): PreparedQuery | Promise<PreparedQuery> {
-    const contextual =
-      session && !session.backendAuthority && this.readAuthorizationHost === "trusted-serving";
-    const kind = queryUsesNativeRelationApi(queryJson) ? "relation" : "query";
-    const queryBytes =
-      kind === "relation" ? relationQueryBytes(queryJson) : encodeQueryJson(queryJson, this.schema);
-    const key = `${kind}:${bytesKey(queryBytes)}`;
-    const cached = contextual ? undefined : this.preparedQueries.get(key);
-    if (cached) return cached;
-    const started = this.db.prepareQuery(
-      queryBytes,
-      kind,
-      contextual ? session.identity : undefined,
-      contextual ? session.claims : undefined,
-    );
-    const remember = (query: PreparedQuery) => {
-      if (!contextual) this.preparedQueries.set(key, query);
-      return query;
-    };
-    const query = isPendingNativeOperation<PreparedQuery>(started)
-      ? this.awaitNativeOperation(started, signal)
-      : started;
-    return query instanceof Promise ? query.then(remember) : remember(query);
-  }
-
-  private prepareQuery(queryJson: string): PreparedQuery {
-    const kind = queryUsesNativeRelationApi(queryJson) ? "relation" : "query";
-    const queryBytes =
-      kind === "relation" ? relationQueryBytes(queryJson) : encodeQueryJson(queryJson, this.schema);
-    const key = `${kind}:${bytesKey(queryBytes)}`;
-    let query = this.preparedQueries.get(key);
-    if (!query) {
-      try {
-        const started = this.db.prepareQuery(queryBytes, kind);
-        if (isPendingNativeOperation<PreparedQuery>(started)) {
-          started.cancel();
-          throw new Error("native query preparation requires the asynchronous read boundary");
-        }
-        query = started;
-      } catch (error) {
-        throw new Error(`Core prepareQuery failed for ${queryJson}: ${errorMessage(error)}`);
-      }
-      this.preparedQueries.set(key, query);
-    }
-    return query;
+  private ensureClientSessionClaims(session: RuntimeSession | null): void | Promise<void> {
+    if (!session || session.backendAuthority || this.readAuthorizationHost === "trusted-serving")
+      return;
+    if (canonicalJson(session.claims) === this.clientSessionClaimsKey) return;
+    // Installing correlation claims mutates native state; wait for any active
+    // core operation without reintroducing query preparation in TypeScript.
+    const install = () => this.installClientSessionClaims(session.claims);
+    return this.ownerRuntime.coreOperation ? this.runWhenCoreIdle(install) : install();
   }
   /**
    * A strict remote query cannot materialize its local snapshot before an
@@ -2879,7 +2740,7 @@ export class NativeRuntimeAdapter implements Runtime {
   private attachLocalReadCoverageInBackground(
     tier: string | null | undefined,
     optionsJson: string | null | undefined,
-    query: PreparedQuery,
+    query: NativeQueryInput,
     session: RuntimeSession | null,
   ): void {
     if (tier != null && tier !== "local") return;
@@ -3181,32 +3042,50 @@ export class NativeRuntimeAdapter implements Runtime {
   }
 
   private startSubscriptionReader(handle: number, subscription: SubscriptionState): void {
-    if (subscription.cancelled) return;
-    for (const source of subscription.sources) {
-      if (!isReadableSubscriptionReader(source.source)) {
-        if (source.reading) continue;
-        source.reading = true;
-        void this.drainNativeSubscription(handle, subscription, source);
-        continue;
-      }
-      if (source.reading) continue;
-      source.reading = true;
-      void this.readSubscription(handle, subscription, source);
-    }
+    const source = subscription.source;
+    if (subscription.cancelled || subscription.reading || !subscription.callback || !source) return;
+    subscription.reading = true;
+    this.readSubscription(handle, subscription, source);
   }
 
-  private async readSubscription(
+  private readSubscription(
     handle: number,
     subscription: SubscriptionState,
-    source: SubscriptionSourceState,
-  ): Promise<void> {
-    if (!isReadableSubscriptionReader(source.source)) return;
-    try {
-      while (!subscription.cancelled && this.subscriptions.get(handle) === subscription) {
-        const next = await source.source.read();
-        if (next.done || subscription.cancelled) return;
+    source: SubscriptionSource,
+  ): void {
+    const isActive = () =>
+      !subscription.cancelled && this.subscriptions.get(handle) === subscription;
+    const finish = () => {
+      subscription.reading = false;
+    };
+    const fail = (error: unknown) => {
+      if (!this.closed && isActive()) {
+        this.failSubscription(
+          subscription,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+      finish();
+    };
+    const consume = (next: SubscriptionSourceRead): boolean => {
+      if (next.type === "closed" || !isActive()) {
+        finish();
+        return false;
+      }
+      if (next.type === "pending") {
+        void this.pumpServerTransport()
+          .then(() => sleep(Math.max(0, next.retryAfterMs)))
+          .then(advance)
+          .catch(fail);
+        return false;
+      }
+      for (const event of next.events) {
+        if (!isActive()) {
+          finish();
+          return false;
+        }
         try {
-          this.applySubscriptionChunk(subscription, next.value);
+          this.applySubscriptionChunk(subscription, event);
         } catch (error) {
           this.failSubscription(
             subscription,
@@ -3214,244 +3093,56 @@ export class NativeRuntimeAdapter implements Runtime {
           );
         }
       }
-    } catch (error) {
-      if (
-        !this.closed &&
-        !subscription.cancelled &&
-        this.subscriptions.get(handle) === subscription
-      ) {
-        this.failSubscription(
-          subscription,
-          error instanceof Error ? error : new Error(String(error)),
-        );
+      // Native pull sources use an empty batch to yield until the next core
+      // wake. Web streams remain suspended inside their next `read()`.
+      if (next.events.length === 0 || !isActive()) {
+        finish();
+        return false;
       }
-    } finally {
-      source.reading = false;
-    }
-  }
-
-  private async drainNativeSubscription(
-    handle: number,
-    subscription: SubscriptionState,
-    source: SubscriptionSourceState,
-  ): Promise<void> {
-    if (isReadableSubscriptionReader(source.source)) return;
-    try {
-      while (!subscription.cancelled && this.subscriptions.get(handle) === subscription) {
-        const batch = source.source.readAll();
-        if (!Array.isArray(batch)) {
-          await this.pumpServerTransport();
-          const retryAfterMs = batch.retryAfterMs?.() ?? 0;
-          await sleep(Math.max(0, retryAfterMs));
-          continue;
+      return true;
+    };
+    const advance = () => {
+      while (isActive()) {
+        let next: SubscriptionSourceRead | undefined;
+        try {
+          next = source.pull((resolved) => {
+            if (consume(resolved)) advance();
+          }, fail);
+        } catch (error) {
+          fail(error);
+          return;
         }
-        for (const event of batch) {
-          if (subscription.cancelled || this.subscriptions.get(handle) !== subscription) return;
-          try {
-            this.applySubscriptionChunk(subscription, event);
-          } catch (error) {
-            this.failSubscription(
-              subscription,
-              error instanceof Error ? error : new Error(String(error)),
-            );
-          }
-        }
-        if (batch.length === 0) return;
+        if (next === undefined) return;
+        if (!consume(next)) return;
       }
-    } catch (error) {
-      if (
-        !this.closed &&
-        !subscription.cancelled &&
-        this.subscriptions.get(handle) === subscription
-      ) {
-        this.failSubscription(
-          subscription,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    } finally {
-      source.reading = false;
-    }
+      finish();
+    };
+    advance();
   }
 
   private applySubscriptionChunk(subscription: SubscriptionState, value: unknown): void {
     const chunk = normalizeSubscriptionChunk(value);
     if (chunk.type === "closed") {
-      clearDeferredPlaceholderBuffer(subscription);
       closeSubscriptionSourceState(subscription);
       subscription.cancelled = true;
       return;
     }
     if (chunk.type === "rejected") {
-      if (chunk.reason.type === "ShapeRegistrationPendingCatalogueAdmission") {
-        return;
-      }
+      if (chunk.reason.type === "ShapeRegistrationPendingCatalogueAdmission") return;
       this.failSubscription(subscription, subscriptionRejectionError(chunk.reason));
       return;
     }
-    if (chunk.type === "delta" && chunk.publishable === false) return;
-    if (chunk.type === "snapshot") {
-      const previousRows = subscription.rows;
-      const wasOpened = subscription.opened;
-      subscription.rows = rowsFromRelationSnapshot(
-        chunk.snapshot,
-        this.schema,
-        subscription.outputColumns?.rootColumns,
-        "full-record",
-      );
-      subscription.rowIndexByKey = indexRowsByKey(subscription.rows);
-      subscription.opened = true;
-      this.publishSubscriptionRows(
-        subscription,
-        wasOpened
-          ? runtimeDeltaFromRows(
-              subscription.rows,
-              previousRows,
-              this.schema,
-              subscription.outputColumns,
-            )
-          : runtimeResetDeltaFromRows(subscription.rows, this.schema, subscription.outputColumns),
-        chunk.settled,
-        !wasOpened,
-      );
-    } else {
-      if (chunk.reset) {
-        subscription.rows = [];
-        subscription.rowIndexByKey = new Map();
-        clearDeferredPlaceholderBuffer(subscription);
-      }
-      const applied = applySubscriptionDeltaWithRootDelta(
-        subscription.rows,
-        chunk.delta,
-        this.schema,
-        chunk.reset === true,
-        subscription.outputColumns,
-      );
-      subscription.rows = applied.rows;
-      subscription.rowIndexByKey = applied.rowIndexByKey;
-      subscription.opened = true;
-      const terminalOperations = decodeRuntimeTerminalOperations(
-        chunk.terminalOperations,
-        subscription.outputColumns?.rootColumns,
-      );
-      const unresolvedPlaceholder = unresolvedSubscriptionPlaceholder(
-        subscription.rows,
-        this.schema,
-        subscription.outputColumns,
-      );
-      if (unresolvedPlaceholder) {
-        if (chunk.settled === true) {
-          throw new Error(
-            "settled relation subscription chunk retained unresolved placeholder rows " +
-              `(${unresolvedPlaceholder.table}.${unresolvedPlaceholder.column} on ${unresolvedPlaceholder.id})`,
-          );
-        }
-        this.deferSubscriptionRows(
-          subscription,
-          terminalOperations,
-          chunk.terminalOperations,
-          chunk.reset === true,
-          chunk.delta,
-        );
-        return;
-      }
-      applied.rootDelta.terminalOperations = terminalOperations;
-      this.publishSubscriptionRows(
-        subscription,
-        applied.rootDelta,
-        chunk.settled,
-        chunk.reset === true,
-      );
-    }
-  }
-
-  private publishSubscriptionRows(
-    subscription: SubscriptionState,
-    rootDelta: RuntimeSubscriptionDelta,
-    settled: boolean | undefined,
-    reset: boolean,
-  ): void {
-    if (this.subscriptionCallbacksAreSettledGated(subscription) && settled === false) {
-      subscription.deferredVisiblePublication = true;
-      subscription.deferredVisibleReset ||= reset;
-      subscription.deferredTerminalOperations.push(...(rootDelta.terminalOperations ?? []));
-      return;
-    }
-
-    let visibleDelta = rootDelta;
-    if (
-      subscription.deferredVisiblePublication ||
-      subscription.deferredVisibleReset ||
-      !subscription.visibleOpened
-    ) {
-      const publishReset = subscription.deferredVisibleReset || !subscription.visibleOpened;
-      if (publishReset) {
-        visibleDelta = runtimeResetDeltaFromRows(
-          subscription.rows,
-          this.schema,
-          subscription.outputColumns,
-        );
-      } else {
-        visibleDelta = runtimeDeltaFromRows(
-          subscription.rows,
-          subscription.visibleRows,
-          this.schema,
-          subscription.outputColumns,
-        );
-      }
-    }
-
-    // A canonical delta rebuilt from `subscription.rows` already contains the
-    // full present-state terminal values. Replaying producer operations that
-    // led to that state on top of it can address occurrence lifecycles that no
-    // longer exist (for example, a deferred Move after a synthesized reset).
-    // Producer terminal history belongs only to a forwarded producer delta.
-    if (visibleDelta === rootDelta) {
-      const terminalOperations = [
-        ...subscription.deferredTerminalOperations,
-        ...(rootDelta.terminalOperations ?? []),
-      ];
-      if (terminalOperations.length > 0) {
-        visibleDelta.terminalOperations = terminalOperations;
-      }
-    }
-
-    subscription.callback?.(visibleDelta);
-    subscription.visibleRows = [...subscription.rows];
-    subscription.visibleOpened = true;
-    clearDeferredPlaceholderBuffer(subscription);
-  }
-
-  private subscriptionCallbacksAreSettledGated(subscription: SubscriptionState): boolean {
-    const tier = (subscription.opts as { tier?: unknown }).tier;
-    return tier === "global" || (this.nonDurableClient && tier === "edge");
-  }
-
-  private deferSubscriptionRows(
-    subscription: SubscriptionState,
-    terminalOperations: RuntimeTerminalOperation[] | undefined,
-    nativeTerminalOperations: NativeTerminalOperation[] | undefined,
-    reset: boolean,
-    delta: NativeSubscriptionDelta,
-  ): void {
-    subscription.deferredVisiblePublication = true;
-    subscription.deferredVisibleReset ||= reset;
-    subscription.deferredTerminalOperations.push(...(terminalOperations ?? []));
-    subscription.deferredPlaceholderChunks = reset ? 1 : subscription.deferredPlaceholderChunks + 1;
-    subscription.deferredPlaceholderRows = subscription.rows.length;
-    subscription.deferredPlaceholderBytes = reset
-      ? subscriptionDeltaPayloadBytes(delta, nativeTerminalOperations)
-      : subscription.deferredPlaceholderBytes +
-        subscriptionDeltaPayloadBytes(delta, nativeTerminalOperations);
-    if (
-      subscription.deferredPlaceholderChunks > MAX_DEFERRED_PLACEHOLDER_CHUNKS ||
-      subscription.deferredPlaceholderRows > MAX_DEFERRED_PLACEHOLDER_ROWS ||
-      subscription.deferredPlaceholderBytes > MAX_DEFERRED_PLACEHOLDER_BYTES
-    ) {
-      throw new Error(
-        "relation subscription buffered unresolved placeholder rows beyond bounded limits",
-      );
-    }
+    const delta = decodeSubscriptionDelta(
+      chunk.delta,
+      this.schema,
+      chunk.reset === true,
+      subscription.outputColumns,
+    );
+    delta.terminalOperations = decodeRuntimeTerminalOperations(
+      chunk.terminalOperations,
+      subscription.outputColumns?.rootColumns,
+    );
+    subscription.callback?.(delta);
   }
 
   private scheduleServerPump(): void {
@@ -3809,8 +3500,7 @@ export class NativeRuntimeAdapter implements Runtime {
   private failRemoteSubscriptions(error: Error): void {
     for (const subscription of this.subscriptions.values()) {
       if (subscription.cancelled) continue;
-      const tier = (subscription.opts as { tier?: unknown }).tier ?? "local";
-      if (tier !== "edge" && tier !== "global") continue;
+      if (subscription.tier !== "edge" && subscription.tier !== "global") continue;
       this.failSubscription(subscription, error);
     }
   }
@@ -3820,10 +3510,9 @@ export class NativeRuntimeAdapter implements Runtime {
     subscription.cancelled = true;
     subscription.openingAbort?.abort();
     subscription.terminalError = error;
-    clearDeferredPlaceholderBuffer(subscription);
-    for (const source of subscription.sources) {
+    if (subscription.source) {
       try {
-        closeSubscriptionSource(source.source);
+        closeSubscriptionSource(subscription.source);
       } catch (cleanupError) {
         // Resource retirement must not replace the causal subscription error
         // or prevent its once-only delivery to the application.
@@ -3943,18 +3632,7 @@ export class NativeRuntimeAdapter implements Runtime {
 }
 
 function closeSubscriptionSourceState(subscription: SubscriptionState): void {
-  for (const source of subscription.sources) {
-    closeSubscriptionSource(source.source);
-  }
-}
-
-function clearDeferredPlaceholderBuffer(subscription: SubscriptionState): void {
-  subscription.deferredVisiblePublication = false;
-  subscription.deferredVisibleReset = false;
-  subscription.deferredTerminalOperations = [];
-  subscription.deferredPlaceholderChunks = 0;
-  subscription.deferredPlaceholderRows = 0;
-  subscription.deferredPlaceholderBytes = 0;
+  if (subscription.source) closeSubscriptionSource(subscription.source);
 }
 
 function normalizeTransportFrames(frames: unknown[]): Uint8Array[] {
@@ -4338,14 +4016,8 @@ function sessionClaims(
   };
 }
 
-function closeSubscriptionSource(source: SubscriptionSourceState["source"]): void {
-  if ("close" in source && typeof source.close === "function") {
-    source.close();
-    return;
-  }
-  if ("cancel" in source && typeof source.cancel === "function") {
-    void source.cancel().catch(() => {});
-  }
+function closeSubscriptionSource(source: SubscriptionSource): void {
+  source.close();
 }
 
 function readSupportedReadOptions(optionsJson: string): void {
@@ -4375,35 +4047,8 @@ function queryHasArraySubqueries(queryJson: string): boolean {
   }
 }
 
-function queryUsesNativeRelationApi(queryJson: string): boolean {
-  try {
-    const relationIr = (JSON.parse(queryJson) as { relation_ir?: unknown }).relation_ir;
-    return relationIrContainsNativeOperator(relationIr);
-  } catch {
-    return false;
-  }
-}
-
-function relationQueryBytes(queryJson: string): Uint8Array {
-  let relation_ir: unknown;
-  try {
-    relation_ir = (parseRelationQueryJsonLossless(queryJson) as { relation_ir?: unknown })
-      .relation_ir;
-  } catch {
-    throw new Error("Relation query is not valid runtime query JSON");
-  }
-  if (!relation_ir || typeof relation_ir !== "object") {
-    throw new Error("Relation query is missing relation_ir");
-  }
-  return encodeRelationQueryPostcard(relation_ir as RelExpr);
-}
-
-function relationIrContainsNativeOperator(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  if (Array.isArray(value)) return value.some(relationIrContainsNativeOperator);
-  const record = value as Record<string, unknown>;
-  if ("Join" in record || "Gather" in record || "Union" in record) return true;
-  return Object.values(record).some(relationIrContainsNativeOperator);
+function nativeQueryInput(queryJson: string, schema: WasmSchema): NativeQueryInput {
+  return encodeQueryJson(queryJson, schema);
 }
 
 function assertNoUnsupportedPermissionIntrospection(queryJson: string): void {
@@ -4877,180 +4522,39 @@ function encodeQueryJson(queryJson: string, schema: WasmSchema): Uint8Array {
   if (typeof parsed.table !== "string") {
     throw new Error("Native runtime only supports table queries in this slice");
   }
-  // UNION ALL is retained relation IR. It cannot be flattened into the legacy
-  // predicate envelope because duplicate arm occurrences and global windows
-  // are semantic. Carry the relation tree in Query.relation instead.
-  if (relationOperator(parsed.relation_ir) === "Union") {
-    return queryWithPredicates(parsed.table, [], { relation: parsed.relation_ir });
+  const table = parsed.table;
+  if (parsed.relation_ir != null) {
+    const lossless = parseRelationQueryJsonLossless(queryJson) as { relation_ir?: unknown };
+    if (!lossless.relation_ir || typeof lossless.relation_ir !== "object") {
+      throw new Error("Relation query is missing relation_ir");
+    }
+    // Every relational query crosses the native boundary in Query.relation.
+    // Rust normalizes non-union relations into the ordinary Query shape and
+    // retains unions only where occurrence identity requires it.
+    return queryWithPredicates(table, [], {
+      relation: lossless.relation_ir,
+      select: readSelectColumns(parsed.select_columns ?? parsed.select),
+      arraySubqueries: readQueryArraySubqueries(parsed.array_subqueries, table, schema),
+    });
   }
-  const encoded = encodeSimpleRelationQuery(parsed.table, parsed, schema);
-  return queryWithPredicates(parsed.table, encoded.predicates, {
-    limit: readLimitIfPresent(parsed.limit ?? encoded.limit),
-    offset: readOffset(parsed.offset ?? encoded.offset),
-    orderBy: encoded.orderBy.concat(readRootOrderBy(parsed.order_by ?? parsed.orderBy)),
-    select: readSelectColumns(parsed.select_columns ?? parsed.select ?? encoded.select),
-    arraySubqueries: readQueryArraySubqueries(parsed.array_subqueries, parsed.table, schema),
-  });
+  const predicates = readFlatConditions(parsed.conditions);
+  if (!predicates) throw unsupportedQueryEncodingError();
+  return queryWithPredicates(
+    table,
+    predicates.map((filter) => coerceQueryPredicate(table, filter, schema)),
+    {
+      limit: readLimitIfPresent(parsed.limit),
+      offset: readOffset(parsed.offset),
+      orderBy: readRootOrderBy(parsed.order_by ?? parsed.orderBy),
+      select: readSelectColumns(parsed.select_columns ?? parsed.select),
+      arraySubqueries: readQueryArraySubqueries(parsed.array_subqueries, table, schema),
+    },
+  );
 }
 
 function unsupportedQueryEncodingError(context?: string): Error {
   const suffix = context ? ` (${context})` : "";
   return new Error(`Native runtime cannot encode this query shape${suffix}.`);
-}
-
-function unsupportedRelationQueryError(operator?: string): Error {
-  const detail = operator
-    ? ` Relation IR operator "${operator}" requires a relation-tree lowerer or native relation query API; the TS native runtime can currently lower only TableScan plus Filter/Project/OrderBy/Offset/Limit into flat native predicates.`
-    : " The TS native runtime can currently lower only TableScan plus Filter/Project/OrderBy/Offset/Limit into flat native predicates.";
-  return new Error(`Native runtime cannot lower this relation IR.${detail}`);
-}
-
-function encodeSimpleRelationQuery(
-  table: string,
-  query: {
-    conditions?: unknown;
-    relation_ir?: unknown;
-    limit?: unknown;
-    offset?: unknown;
-  },
-  schema: WasmSchema,
-): {
-  predicates: QueryPredicate[];
-  limit?: number;
-  offset: number;
-  orderBy: QueryOrder[];
-  select?: string[];
-} {
-  const unwrapped = unwrapSimpleQuery(table, query);
-  if (!unwrapped) throw unsupportedRelationQueryError(relationOperator(query.relation_ir));
-  const rootPredicates = readFlatConditions(query.conditions);
-  if (!rootPredicates) throw unsupportedQueryEncodingError();
-  return {
-    limit: unwrapped.limit,
-    offset: unwrapped.offset,
-    orderBy: unwrapped.orderBy,
-    select: unwrapped.select,
-    predicates: unwrapped.predicates
-      .concat(rootPredicates)
-      .map((filter) => coerceQueryPredicate(table, filter, schema)),
-  };
-}
-
-function relationOperator(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  for (const operator of ["Join", "Project", "Gather", "Union"]) {
-    if (operator in record) return operator;
-  }
-  for (const operator of ["Limit", "Offset", "OrderBy", "Filter"]) {
-    const child = record[operator];
-    if (child && typeof child === "object") {
-      const input = (child as { input?: unknown }).input;
-      const nested = relationOperator(input);
-      if (nested) return nested;
-    }
-  }
-  return undefined;
-}
-
-function unwrapSimpleQuery(
-  table: string,
-  query: {
-    relation_ir?: unknown;
-  },
-): {
-  predicates: QueryPredicate[];
-  limit?: number;
-  offset: number;
-  orderBy: QueryOrder[];
-  select?: string[];
-} | null {
-  if (query.relation_ir == null) return { predicates: [], offset: 0, orderBy: [] };
-  return unwrapSimpleRelation(table, query.relation_ir);
-}
-
-function unwrapSimpleRelation(
-  table: string,
-  relationIr: unknown,
-): {
-  predicates: QueryPredicate[];
-  limit?: number;
-  offset: number;
-  orderBy: QueryOrder[];
-  select?: string[];
-} | null {
-  if (relationIr == null) return { predicates: [], offset: 0, orderBy: [] };
-  if (typeof relationIr !== "object") return null;
-  const relation = relationIr as Record<string, unknown>;
-  const tableScan = relation.TableScan;
-  if (
-    tableScan &&
-    typeof tableScan === "object" &&
-    (tableScan as { table?: unknown }).table === table
-  ) {
-    return { predicates: [], offset: 0, orderBy: [] };
-  }
-  const limit = relation.Limit;
-  if (limit && typeof limit === "object") {
-    const limitRecord = limit as { input?: unknown; limit?: unknown };
-    const input = unwrapSimpleRelation(table, limitRecord.input);
-    if (!input) return null;
-    return { ...input, limit: readLimit(limitRecord.limit) };
-  }
-  const offset = relation.Offset;
-  if (offset && typeof offset === "object") {
-    const offsetRecord = offset as { input?: unknown; offset?: unknown };
-    const input = unwrapSimpleRelation(table, offsetRecord.input);
-    if (!input) return null;
-    return { ...input, offset: readOffset(offsetRecord.offset) };
-  }
-  const orderBy = relation.OrderBy;
-  if (orderBy && typeof orderBy === "object") {
-    const orderByRecord = orderBy as { input?: unknown; terms?: unknown };
-    const input = unwrapSimpleRelation(table, orderByRecord.input);
-    const terms = readOrderByTerms(orderByRecord.terms);
-    if (!input || !terms) return null;
-    return { ...input, orderBy: input.orderBy.concat(terms) };
-  }
-  const project = relation.Project;
-  if (project && typeof project === "object") {
-    const projectRecord = project as { input?: unknown; columns?: unknown };
-    const input = unwrapSimpleRelation(table, projectRecord.input);
-    const columns = readProjectColumns(projectRecord.columns);
-    if (!input || !columns) return null;
-    return { ...input, select: columns };
-  }
-  const filter = relation.Filter;
-  if (!filter || typeof filter !== "object") return null;
-  const filterRecord = filter as { input?: unknown; predicate?: unknown };
-  const input = unwrapSimpleRelation(table, filterRecord.input);
-  if (!input) return null;
-  const predicates = predicateToFilters(filterRecord.predicate);
-  return predicates ? { ...input, predicates: input.predicates.concat(predicates) } : null;
-}
-
-function readProjectColumns(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const columns: string[] = [];
-  for (const entry of value) {
-    if (!entry || typeof entry !== "object") return null;
-    const record = entry as { alias?: unknown; expr?: unknown; source?: unknown };
-    const expr = record.expr ?? record.source;
-    if (!expr || typeof expr !== "object") return null;
-    const column = readColumnProjectExpr(expr);
-    if (!column) return null;
-    if (record.alias != null && record.alias !== column) return null;
-    columns.push(column);
-  }
-  return columns;
-}
-
-function readColumnProjectExpr(value: unknown): string | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as { Column?: unknown; column?: unknown };
-  if (record.Column != null) return readColumnRef(record.Column);
-  if (record.column != null) return readColumnRef(record);
-  return null;
 }
 
 function coerceQueryPredicate(
@@ -5384,19 +4888,6 @@ function readArraySubqueryRequirement(value: unknown): QueryArraySubquery["requi
 function stripParentQualifier(column: string, parentTable: string): string {
   const prefix = `${parentTable}.`;
   return column.startsWith(prefix) ? column.slice(prefix.length) : column;
-}
-
-function readOrderByTerms(value: unknown): QueryOrder[] | null {
-  if (!Array.isArray(value)) return null;
-  const terms: QueryOrder[] = [];
-  for (const term of value) {
-    if (!term || typeof term !== "object") return null;
-    const record = term as { column?: unknown; direction?: unknown };
-    const column = readColumnRef(record.column);
-    if (!column || (record.direction !== "Asc" && record.direction !== "Desc")) return null;
-    terms.push({ column, direction: record.direction });
-  }
-  return terms;
 }
 
 function coerceQueryLiteral(
@@ -6033,129 +5524,44 @@ function withValuesByColumn(row: RowState, valuesByColumn: Map<string, Value>): 
   return row;
 }
 
-export function applySubscriptionDeltaWithRootDelta(
-  currentRows: RowState[],
+export function decodeSubscriptionDelta(
   delta: NativeSubscriptionDelta,
   schema: WasmSchema,
   reset = false,
   outputColumns: SubscriptionOutputColumns | null = null,
-): {
-  rows: RowState[];
-  rowIndexByKey: Map<string, number>;
-  rootDelta: RuntimeSubscriptionDelta;
-} {
-  const { addedRows, updatedRows, removedEntries, rows, rowIndexByKey } =
-    applySubscriptionDeltaToState(currentRows, delta, schema, reset, outputColumns);
-  const rootIndexByKey = new Map<string, number>();
-  addedRows.forEach((row, index) =>
-    rootIndexByKey.set(rowStateKey(row), delta.addedIndices[index]!),
-  );
-  updatedRows.forEach((row, index) =>
-    rootIndexByKey.set(rowStateKey(row), delta.updatedIndices[index]!),
-  );
-  return {
-    rows,
-    rowIndexByKey,
-    rootDelta: {
-      ...runtimeDeltaFromChanges(
-        subscriptionOutputRows(addedRows, outputColumns),
-        subscriptionOutputRows(updatedRows, outputColumns),
-        subscriptionOutputRemovals(removedEntries, outputColumns),
-        rootIndexByKey,
-        schema,
-        outputColumns,
-      ),
-      ...(reset ? { reset: true } : {}),
-    },
+): RuntimeSubscriptionDelta {
+  const decodeRows = (batches: NativeRowBatch[], keys: Uint8Array[], indices: number[]) => {
+    const rows = rowsFromSubscriptionBatches(batches, schema, outputColumns, "full-record");
+    if (rows.length !== keys.length)
+      throw new Error("subscription occurrence sidecar length mismatch");
+    return rows.flatMap((row, index) =>
+      outputColumns && row.table !== outputColumns.rootTable
+        ? []
+        : [
+            {
+              sourceId: row.id,
+              occurrenceKey: keys[index]!,
+              index: indices[index]!,
+              row: runtimeSubscriptionRow(row, schema, outputColumns),
+            },
+          ],
+    );
   };
-}
-
-function subscriptionOutputRows(
-  rows: RowState[],
-  outputColumns: SubscriptionOutputColumns | null,
-): RowState[] {
-  return outputColumns ? rows.filter((row) => row.table === outputColumns.rootTable) : rows;
-}
-
-function subscriptionOutputRemovals(
-  removed: Array<{ table: string; id: string; index: number; resultKeyBytes?: Uint8Array }>,
-  outputColumns: SubscriptionOutputColumns | null,
-): Array<{ id: string; index: number; resultKeyBytes?: Uint8Array }> {
-  return outputColumns ? removed.filter((row) => row.table === outputColumns.rootTable) : removed;
-}
-
-function applySubscriptionDeltaToState(
-  currentRows: RowState[],
-  delta: NativeSubscriptionDelta,
-  schema: WasmSchema,
-  reset = false,
-  outputColumns: SubscriptionOutputColumns | null = null,
-): {
-  addedRows: RowState[];
-  updatedRows: RowState[];
-  removedEntries: Array<{ table: string; id: string; index: number; resultKeyBytes?: Uint8Array }>;
-  rows: RowState[];
-  rowIndexByKey: Map<string, number>;
-} {
-  const rowsByKey = reset
-    ? new Map<string, RowState>()
-    : new Map(currentRows.map((row) => [rowStateKey(row), row]));
-  const removedEntries: Array<{
-    table: string;
-    id: string;
-    index: number;
-    resultKeyBytes?: Uint8Array;
-  }> = [];
-
-  const addedRows = rowsFromSubscriptionBatches(delta.added, schema, outputColumns, "full-record");
-  const updatedRows = rowsFromSubscriptionBatches(
-    delta.updated,
-    schema,
-    outputColumns,
-    "full-record",
-  );
-  attachOccurrenceKeys(addedRows, delta.addedOccurrenceKeys);
-  attachOccurrenceKeys(updatedRows, delta.updatedOccurrenceKeys);
-
-  for (const [removedIndex, removed] of delta.removed.entries()) {
-    const id = formatUuid(removed.rowId);
-    const resultKeyBytes = delta.removedOccurrenceKeys[removedIndex];
-    const key = resultKeyBytes
-      ? occurrenceStateKey(resultKeyBytes, removed.table, id)
-      : rowKey(removed.table, id);
-    removedEntries.push({
-      table: removed.table,
-      id,
-      index: delta.removedIndices[removedIndex]!,
-      resultKeyBytes,
-    });
-    rowsByKey.delete(key);
-  }
-
-  const changedRows = addedRows.concat(updatedRows);
-  for (const row of changedRows) {
-    rowsByKey.set(rowStateKey(row), row);
-  }
-
-  const changedKeys = new Set(changedRows.map((row) => rowStateKey(row)));
-  const rows = (reset ? [] : currentRows).filter((row) => {
-    const key = rowStateKey(row);
-    return rowsByKey.has(key) && !changedKeys.has(key);
-  });
-  const placements = [
-    ...addedRows.map((row, index) => ({ row, index: delta.addedIndices[index]! })),
-    ...updatedRows.map((row, index) => ({ row, index: delta.updatedIndices[index]! })),
-  ].sort((left, right) => left.index - right.index);
-  for (const placement of placements) {
-    rows.splice(Math.max(0, Math.min(placement.index, rows.length)), 0, placement.row);
-  }
-  const rowIndexByKey = indexRowsByKey(rows);
   return {
-    addedRows,
-    updatedRows,
-    removedEntries,
-    rows,
-    rowIndexByKey,
+    added: decodeRows(delta.added, delta.addedOccurrenceKeys, delta.addedIndices),
+    updated: decodeRows(delta.updated, delta.updatedOccurrenceKeys, delta.updatedIndices),
+    removed: delta.removed.flatMap((row, index) =>
+      outputColumns && row.table !== outputColumns.rootTable
+        ? []
+        : [
+            {
+              sourceId: formatUuid(row.rowId),
+              occurrenceKey: delta.removedOccurrenceKeys[index]!,
+              index: delta.removedIndices[index]!,
+            },
+          ],
+    ),
+    ...(reset ? { reset: true } : {}),
   };
 }
 
@@ -6173,48 +5579,6 @@ function rowsFromSubscriptionBatches(
       nestedRowCarrier,
     ),
   );
-}
-
-function indexRowsByKey(rows: RowState[]): Map<string, number> {
-  const index = new Map<string, number>();
-  rows.forEach((row, rowIndex) => {
-    index.set(rowStateKey(row), rowIndex);
-  });
-  return index;
-}
-
-function attachOccurrenceKeys(rows: RowState[], keys: Uint8Array[]): void {
-  if (rows.length !== keys.length)
-    throw new Error("subscription occurrence sidecar length mismatch");
-  rows.forEach((row, index) => {
-    const bytes = keys[index]!;
-    row.resultKeyBytes = bytes;
-    row.resultKey = publicResultKey(bytes);
-  });
-}
-
-function occurrenceStateKey(bytes: Uint8Array, table?: string, sourceId?: string): string {
-  if (isOrdinaryResultKey(bytes) && table && sourceId) return rowKey(table, sourceId);
-  return `result\0${Array.from(bytes, (byte) => byteHex[byte]).join("")}`;
-}
-
-function publicResultKey(bytes: Uint8Array): string {
-  if (isOrdinaryResultKey(bytes)) return formatUuid(bytes.subarray(1, 17));
-  return `result:${Array.from(bytes, (byte) => byteHex[byte]).join("")}`;
-}
-
-function isOrdinaryResultKey(bytes: Uint8Array): boolean {
-  return bytes.length === 25 && bytes[0] === 1 && bytes.subarray(17).every((byte) => byte === 0);
-}
-
-function rowStateKey(row: RowState): string {
-  return row.resultKeyBytes
-    ? occurrenceStateKey(row.resultKeyBytes, row.table, row.id)
-    : rowKey(row.table, row.id);
-}
-
-function rowKey(table: string, id: string): string {
-  return `${table}\0${id}`;
 }
 
 function decodePlannedField(
@@ -6493,14 +5857,11 @@ function decodeArrayBytes(
 }
 
 function normalizeSubscriptionChunk(chunk: unknown):
-  | { type: "snapshot"; snapshot: NativeRelationSubscriptionSnapshot; settled?: boolean }
   | {
       type: "delta";
       reset?: boolean;
       delta: NativeSubscriptionDelta;
       terminalOperations?: NativeTerminalOperation[];
-      settled?: boolean;
-      publishable?: boolean;
     }
   | {
       type: "rejected";
@@ -6514,23 +5875,13 @@ function normalizeSubscriptionChunk(chunk: unknown):
   if (!chunk || typeof chunk !== "object") throw new Error("expected subscription chunk");
   const record = chunk as {
     type?: unknown;
-    rows?: unknown;
     delta?: unknown;
     reason?: unknown;
     reset?: unknown;
-    settled?: unknown;
-    publishable?: unknown;
     terminalOperations?: unknown;
   };
   if (record.type === "closed" || record.type === "Closed") {
     return { type: "closed" };
-  }
-  if (record.type === "snapshot" || record.type === "Snapshot") {
-    return {
-      type: "snapshot",
-      snapshot: readRelationSnapshot(assertBytes(record.rows, "subscription rows")),
-      settled: typeof record.settled === "boolean" ? record.settled : undefined,
-    };
   }
   if (record.type === "delta" || record.type === "Delta") {
     return {
@@ -6542,8 +5893,6 @@ function normalizeSubscriptionChunk(chunk: unknown):
       terminalOperations: Array.isArray(record.terminalOperations)
         ? (record.terminalOperations as NativeTerminalOperation[])
         : undefined,
-      settled: typeof record.settled === "boolean" ? record.settled : undefined,
-      publishable: typeof record.publishable === "boolean" ? record.publishable : undefined,
     };
   }
   if (record.type === "rejected" || record.type === "Rejected") {
@@ -6606,140 +5955,37 @@ function subscriptionRejectionError(
 
 function subscriptionSource(
   subscription: ReadableStream<unknown> | Subscription,
-): ReadableStreamDefaultReader<unknown> | Subscription {
+): SubscriptionSource {
   const maybeReadable = subscription as Partial<ReadableStream<unknown>>;
   if (typeof maybeReadable.getReader === "function") {
-    return maybeReadable.getReader();
+    const reader = maybeReadable.getReader();
+    return {
+      pull(ready, failed) {
+        void reader
+          .read()
+          .then(
+            (next) =>
+              ready(next.done ? { type: "closed" } : { type: "batch", events: [next.value] }),
+            failed,
+          );
+        return undefined;
+      },
+      close() {
+        void reader.cancel().catch(() => {});
+      },
+    };
   }
-  return subscription as Subscription;
-}
-
-function isReadableSubscriptionReader(
-  source: ReadableStreamDefaultReader<unknown> | Subscription,
-): source is ReadableStreamDefaultReader<unknown> {
-  return "read" in source && typeof source.read === "function";
-}
-
-function runtimeDeltaFromRows(
-  rows: RowState[],
-  previousRows: RowState[] = [],
-  schema?: WasmSchema,
-  outputColumns: SubscriptionOutputColumns | null = null,
-): RuntimeSubscriptionDelta {
-  const previousByKey = new Map(
-    previousRows.map((row, index) => [rowStateKey(row), { row, index }]),
-  );
-  const nextKeys = new Set<string>();
-  const added: RowState[] = [];
-  const updated: RowState[] = [];
-  const removed: Array<{ id: string; index: number; resultKeyBytes?: Uint8Array }> = [];
-  const rowIndexByKey = indexRowsByKey(rows);
-
-  rows.forEach((row, index) => {
-    const key = rowStateKey(row);
-    nextKeys.add(key);
-    const previous = previousByKey.get(key);
-    if (!previous) {
-      added.push(row);
-      return;
-    }
-    if (previous.index !== index || !rowValuesEqual(previous.row.values, row.values)) {
-      updated.push(row);
-    }
-  });
-
-  previousRows.forEach((row, index) => {
-    if (!nextKeys.has(rowStateKey(row))) {
-      removed.push({ id: row.id, index, resultKeyBytes: row.resultKeyBytes });
-    }
-  });
-
-  return runtimeDeltaFromChanges(added, updated, removed, rowIndexByKey, schema, outputColumns);
-}
-
-function runtimeResetDeltaFromRows(
-  rows: RowState[],
-  schema: WasmSchema,
-  outputColumns: SubscriptionOutputColumns | null = null,
-): RuntimeSubscriptionDelta {
+  const native = subscription as Subscription;
   return {
-    ...runtimeDeltaFromChanges(rows, [], [], indexRowsByKey(rows), schema, outputColumns),
-    reset: true,
-  };
-}
-
-function subscriptionDeltaPayloadBytes(
-  delta: NativeSubscriptionDelta,
-  terminalOperations?: NativeTerminalOperation[],
-): number {
-  const rowBytes = delta.added
-    .concat(delta.updated)
-    .reduce(
-      (sum, batch) =>
-        sum +
-        batch.rows.reduce((rowSum, row) => rowSum + row.raw.byteLength + row.rowId.byteLength, 0),
-      0,
-    );
-  const occurrenceBytes = delta.addedOccurrenceKeys
-    .concat(delta.updatedOccurrenceKeys, delta.removedOccurrenceKeys)
-    .reduce((sum, key) => sum + key.byteLength, 0);
-  const terminalBytes =
-    terminalOperations?.reduce(
-      (sum, operation) => sum + nativeTerminalOperationBytes(operation),
-      0,
-    ) ?? 0;
-  return rowBytes + occurrenceBytes + terminalBytes;
-}
-
-function nativeTerminalOperationBytes(operation: NativeTerminalOperation): number {
-  const rootKeyBytes = operation.root_key.length;
-  const pathBytes = operation.path.reduce((sum, segment) => {
-    if ("Collection" in segment) {
-      return sum + utf8ByteLength(segment.Collection);
-    }
-    return sum + segment.Key.length;
-  }, 0);
-  const editBytes =
-    "Insert" in operation.edit
-      ? operation.edit.Insert.key.length + operation.edit.Insert.value.length
-      : "Update" in operation.edit
-        ? operation.edit.Update.key.length + operation.edit.Update.value.length
-        : "Remove" in operation.edit
-          ? operation.edit.Remove.key.length
-          : operation.edit.Move.key.length;
-  return rootKeyBytes + pathBytes + editBytes;
-}
-
-function utf8ByteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function runtimeDeltaFromChanges(
-  added: RowState[],
-  updated: RowState[],
-  removed: Array<{ id: string; index: number; resultKeyBytes?: Uint8Array }>,
-  rowIndexByKey: Map<string, number>,
-  schema?: WasmSchema,
-  outputColumns: SubscriptionOutputColumns | null = null,
-): RuntimeSubscriptionDelta {
-  return {
-    added: added.map((row) => ({
-      sourceId: row.id,
-      occurrenceKey: row.resultKeyBytes ?? ordinaryResultKey(row.id),
-      index: rowIndexByKey.get(rowStateKey(row)) ?? 0,
-      row: runtimeSubscriptionRow(row, schema, outputColumns),
-    })),
-    updated: updated.map((row) => ({
-      sourceId: row.id,
-      occurrenceKey: row.resultKeyBytes ?? ordinaryResultKey(row.id),
-      index: rowIndexByKey.get(rowStateKey(row)) ?? 0,
-      row: runtimeSubscriptionRow(row, schema, outputColumns),
-    })),
-    removed: removed.map((row) => ({
-      sourceId: row.id,
-      occurrenceKey: row.resultKeyBytes ?? ordinaryResultKey(row.id),
-      index: row.index,
-    })),
+    pull() {
+      const batch = native.readAll();
+      return Array.isArray(batch)
+        ? { type: "batch", events: batch }
+        : { type: "pending", retryAfterMs: batch.retryAfterMs?.() ?? 0 };
+    },
+    close() {
+      native.close?.();
+    },
   };
 }
 
@@ -6830,71 +6076,6 @@ function valuesForNativeFrame(row: RowState, columns: readonly ColumnDescriptor[
   return values;
 }
 
-function unresolvedSubscriptionPlaceholder(
-  rows: RowState[],
-  schema: WasmSchema,
-  outputColumns: SubscriptionOutputColumns | null,
-): { table: string; id: string; column: string } | undefined {
-  for (const row of rows) {
-    const columns =
-      outputColumns && row.table === outputColumns.rootTable
-        ? outputColumns.rootColumns
-        : schema[row.table]?.columns;
-    if (!columns) continue;
-    const logicalColumns = logicalStorageColumns(columns);
-    const values = valuesForNativeFrame(row, logicalColumns);
-    const missing = logicalColumns.find(
-      (column, index) =>
-        values[index]?.type === "Null" &&
-        column.nullable === false &&
-        column.column_type.type !== "Array",
-    );
-    if (missing) return { table: row.table, id: row.id, column: missing.name };
-  }
-  return undefined;
-}
-
-function ordinaryResultKey(id: string): Uint8Array {
-  return Uint8Array.from([1, ...parseUuid(id), 0, 0, 0, 0, 0, 0, 0, 0]);
-}
-
-function rowValuesEqual(left: Value[], right: Value[]): boolean {
-  if (left.length !== right.length) return false;
-  return left.every((value, index) => valueEqual(value, right[index]));
-}
-
-function valueEqual(left: Value, right: Value | undefined): boolean {
-  if (!right || left.type !== right.type) return false;
-  switch (left.type) {
-    case "Bytea":
-      return right.type === "Bytea" && bytesEqual(left.value, right.value);
-    case "Array":
-      return right.type === "Array" && rowValuesEqual(left.value, right.value);
-    case "Enum":
-      return (
-        right.type === "Enum" &&
-        left.value.case === right.value.case &&
-        rowValuesEqual(left.value.values, right.value.values)
-      );
-    case "Null":
-      return right.type === "Null";
-    case "Boolean":
-    case "Text":
-    case "Uuid":
-    case "Integer":
-    case "BigInt":
-    case "Double":
-    case "Timestamp":
-      return "value" in right && left.value === right.value;
-    case "Row":
-      return (
-        right.type === "Row" &&
-        left.value.id === right.value.id &&
-        rowValuesEqual(left.value.values, right.value.values)
-      );
-  }
-}
-
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
   if (left.length !== right.length) return false;
   return left.every((byte, index) => byte === right[index]);
@@ -6942,10 +6123,6 @@ function readU32Le(bytes: Uint8Array, offset: number): number {
     (bytes[offset + 2]! << 16) |
     (bytes[offset + 3]! << 24)
   );
-}
-
-function bytesKey(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
 }
 
 /** Deterministic cache-key encoding for JSON-derived session claims. */

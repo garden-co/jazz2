@@ -153,11 +153,9 @@ async function withWatchdog<T>(promise: Promise<T>, label: string, timeoutMs = 3
 }
 
 describe.skipIf(!hasJazzWasmBuild())("WASM streaming mutations", () => {
-  it("keeps real WASM query admission pending while storage owns the node", async () => {
+  it("keeps real WASM reads pending while storage owns the node", async () => {
     const { db, runtime, pageStore, author } = await createBrowserWasmFixture();
-    const prepared = db.prepareQuery(queryFromTable("todos"), "query") as Parameters<
-      typeof db.subscribe
-    >[0];
+    const query = queryFromTable("todos");
     const opts = { tier: "local", propagation: "local_only" };
     const commitGate = pageStore.armCommitGate();
     const upload = db.beginStreamingMutation(
@@ -174,18 +172,12 @@ describe.skipIf(!hasJazzWasmBuild())("WASM streaming mutations", () => {
     let cancelSubscription: number | undefined;
     try {
       await withWatchdog(commitGate.started, "push holds the real WASM owner");
-      const preparation = db.prepareQuery(queryFromTable("todos"), "query") as {
-        poll(): unknown | undefined;
-        cancel(): void;
-      };
-      const subscription = db.subscribe(prepared, opts) as {
+      const subscription = db.subscribe(query, opts) as {
         poll(): unknown | undefined;
         cancel(): void;
       };
       // wasm-bindgen encodes both Option::None return types as undefined.
-      expect(preparation.poll()).toBeUndefined();
       expect(subscription.poll()).toBeUndefined();
-      preparation.cancel();
       subscription.cancel();
 
       let cancelledCallbacks = 0;
@@ -196,7 +188,7 @@ describe.skipIf(!hasJazzWasmBuild())("WASM streaming mutations", () => {
       runtime.unsubscribe(cancelled);
 
       let finished = false;
-      const query = runtime.query(JSON.stringify({ table: "todos" })).then(
+      const pendingQuery = runtime.query(JSON.stringify({ table: "todos" })).then(
         (rows) => {
           finished = true;
           return { rows };
@@ -223,7 +215,9 @@ describe.skipIf(!hasJazzWasmBuild())("WASM streaming mutations", () => {
       expect(finished).toBe(false);
       commitGate.release();
       await push;
-      await expect(withWatchdog(query, "woken concurrent query")).resolves.toEqual({ rows: [] });
+      await expect(withWatchdog(pendingQuery, "woken concurrent query")).resolves.toEqual({
+        rows: [],
+      });
       await withWatchdog(opening.promise, "woken concurrent subscription");
       expect(openingError).toBeUndefined();
       expect(cancelledCallbacks).toBe(0);

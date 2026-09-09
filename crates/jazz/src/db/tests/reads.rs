@@ -184,7 +184,7 @@ fn maintained_local_index_snapshot_is_complete() {
     assert!(metrics.source_index_probes >= 1);
 }
 
-/// A Global subscription starts empty until its authority has settled the
+/// A Global subscription withholds its opening until its authority has settled the
 /// indexed source, then installs the same complete indexed snapshot that its
 /// Local counterpart would observe. This exercises the asynchronous delivery
 /// boundary that previously made the direct maintained index experiment lose
@@ -222,7 +222,7 @@ fn maintained_global_index_snapshot_waits_for_settled_source() {
     server.node().borrow_mut().reset_query_engine_read_metrics();
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
     assert!(
-        opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty(),
+        subscription.try_next_event().is_none(),
         "Global must not claim a snapshot before the authority settles it"
     );
 
@@ -230,7 +230,7 @@ fn maintained_global_index_snapshot_waits_for_settled_source() {
     server.tick().unwrap();
     client.tick().unwrap();
 
-    let snapshot = snapshot_from_event(block_on(subscription.next_raw()).unwrap());
+    let snapshot = snapshot_from_event(next_settled_opening(&mut subscription));
     assert_eq!(row_ids(&snapshot.rows), vec![matching]);
     assert!(
         server

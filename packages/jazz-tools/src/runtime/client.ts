@@ -225,6 +225,7 @@ export interface Runtime {
     tier?: string | null,
     options_json?: string | null,
   ): number;
+  /** Install the subscription's callback and start delivery. May only be called once per handle. */
   executeSubscription(
     handle: number,
     onUpdate: (result: RuntimeSubscriptionDelta | Error) => void,

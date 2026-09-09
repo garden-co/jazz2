@@ -122,22 +122,21 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
     encode(command) {
       if (command === "probe") return Uint8Array.of(0);
       if (command === "tick") return Uint8Array.of(1);
-      if (command === "close") return Uint8Array.of(7);
+      if (command === "close") return Uint8Array.of(6);
       const tags = {
-        prepareQuery: 2,
-        all: 3,
-        subscribe: 4,
-        drainSubscription: 5,
-        unsubscribe: 6,
-        poll: 8,
-        cancel: 9,
-        beginTransaction: 10,
-        insert: 11,
-        update: 12,
-        upsert: 13,
-        delete: 14,
-        commitTransaction: 15,
-        rollbackTransaction: 16,
+        all: 2,
+        subscribe: 3,
+        drainSubscription: 4,
+        unsubscribe: 5,
+        poll: 7,
+        cancel: 8,
+        beginTransaction: 9,
+        insert: 10,
+        update: 11,
+        upsert: 12,
+        delete: 13,
+        commitTransaction: 14,
+        rollbackTransaction: 15,
       } as const;
       if (command.type === "poll" || command.type === "cancel")
         return Uint8Array.of(tags[command.type], command.operation);
@@ -146,12 +145,10 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
     decode(bytes) {
       switch (bytes[0]) {
         case 2:
-          return { type: "preparedQuery", query: bytes[1]! };
-        case 3:
           return { type: "rows", rows: bytes.subarray(2) };
-        case 4:
+        case 3:
           return { type: "subscribed", subscription: 1 };
-        case 5:
+        case 4:
           return {
             type: "subscriptionEvents",
             events:
@@ -171,19 +168,19 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
                       ]
                     : [],
           };
-        case 6:
+        case 5:
           return { type: "unsubscribed", closed: true };
         case 9:
           return { type: "cancelled", cancelled: true };
-        case 7:
+        case 6:
           return { type: "closed", closed: bytes[1] === 1 };
-        case 11:
+        case 10:
           return { type: "transactionOpened", transaction: bytes[1]! };
-        case 13:
+        case 12:
           return { type: "mutationStaged" };
-        case 14:
+        case 13:
           return { type: "transactionCommitted", txId: bytes.subarray(1) };
-        case 15:
+        case 7:
           return { type: "pending", operation: bytes[1]! };
         default:
           throw new Error(`unexpected mock response ${bytes[0]}`);
@@ -194,7 +191,7 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
   let bWasWritten = false;
   const rows = (containsA: boolean, containsB: boolean) =>
     Uint8Array.of(
-      3,
+      2,
       0,
       ...(containsA ? utf8("scope-a-private-row") : []),
       ...(containsB ? utf8("scope-b-private-row") : []),
@@ -217,36 +214,16 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
       return {
         execute(command: Uint8Array) {
           switch (command[0]) {
-            case 10:
-              return Uint8Array.of(11, 1); // TransactionOpened { 1 }
-            case 13:
+            case 9:
+              return Uint8Array.of(10, 1); // TransactionOpened { 1 }
+            case 12:
               if (writerMustProgress) stagedWrite = true;
               else if (isA) aWasWritten = true;
               else bWasWritten = true;
-              return Uint8Array.of(13); // MutationStaged
-            case 15:
-              return Uint8Array.of(14, ...new Uint8Array(16).fill(1));
+              return Uint8Array.of(12); // MutationStaged
+            case 14:
+              return Uint8Array.of(13, ...new Uint8Array(16).fill(1));
             case 2:
-              return Uint8Array.of(2, 1); // PreparedQuery { 1 }
-            case 4:
-              subscribed = true;
-              return Uint8Array.of(4);
-            case 5:
-              return Uint8Array.of(
-                5,
-                writerTerminal === "rejected"
-                  ? 2
-                  : writerTerminal === "closed"
-                    ? 3
-                    : published
-                      ? 1
-                      : 0,
-              );
-            case 6:
-              assert.equal(subscribed, true);
-              subscribed = false;
-              return Uint8Array.of(6);
-            case 3:
               // A separate foreground has no local rows until its retained
               // subscription actually receives a relay publication.
               if (!subscribed || !published) return rows(false, false);
@@ -255,8 +232,26 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
                 return rows(false, false);
               }
               return rows(isA ? aWasWritten : bLeaksA, isA ? aLeaksB : bWasWritten);
-            case 7:
-              return Uint8Array.of(7, 1);
+            case 3:
+              subscribed = true;
+              return Uint8Array.of(3);
+            case 4:
+              return Uint8Array.of(
+                4,
+                writerTerminal === "rejected"
+                  ? 2
+                  : writerTerminal === "closed"
+                    ? 3
+                    : published
+                      ? 1
+                      : 0,
+              );
+            case 5:
+              assert.equal(subscribed, true);
+              subscribed = false;
+              return Uint8Array.of(5);
+            case 6:
+              return Uint8Array.of(6, 1);
             default:
               throw new Error(`unexpected foreground command ${command[0]}`);
           }
@@ -452,18 +447,17 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
         const role = opens === 1 ? "writer" : "reader";
         return {
           execute(command: Uint8Array) {
-            if (command[0] === 4) return Uint8Array.of(4);
+            if (command[0] === 3) return Uint8Array.of(3);
+            if (command[0] === 4) return Uint8Array.of(4, 1);
             if (command[0] === 5) return Uint8Array.of(5, 1);
-            if (command[0] === 6) return Uint8Array.of(6);
+            if (command[0] === 6) return Uint8Array.of(6, 1);
             if (role === "writer") {
-              if (command[0] === 10) return Uint8Array.of(11, 1);
-              if (command[0] === 13) return Uint8Array.of(13);
-              if (command[0] === 15) return Uint8Array.of(14, ...new Uint8Array(16).fill(1));
-              if (command[0] === 2) return Uint8Array.of(2, 1);
-              if (command[0] === 3) return rows(true, false);
+              if (command[0] === 9) return Uint8Array.of(10, 1);
+              if (command[0] === 12) return Uint8Array.of(12);
+              if (command[0] === 14) return Uint8Array.of(13, ...new Uint8Array(16).fill(1));
+              if (command[0] === 2) return rows(true, false);
             } else {
-              if (command[0] === 2) return Uint8Array.of(2, 1);
-              if (command[0] === 3) {
+              if (command[0] === 2) {
                 if (failure === "reader-read") throw new Error("planted reader read failure");
                 return rows(true, false);
               }
@@ -536,38 +530,36 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
         return {
           execute(command: Uint8Array) {
             switch (command[0]) {
-              case 2:
-                return Uint8Array.of(2, 1);
+              case 3:
+                return Uint8Array.of(3);
               case 4:
-                return Uint8Array.of(4);
-              case 5:
                 if (pendingDrain) {
                   scheduleWake();
-                  return Uint8Array.of(15, 42);
+                  return Uint8Array.of(7, 42);
                 }
-                return Uint8Array.of(5, 1);
-              case 6:
+                return Uint8Array.of(4, 1);
+              case 5:
                 cleanup.push("unsubscribe");
-                return Uint8Array.of(6);
-              case 9:
+                return Uint8Array.of(5);
+              case 8:
                 assert.equal(command[1], 42);
                 cleanup.push("cancel");
                 return Uint8Array.of(9);
-              case 3:
+              case 2:
                 metrics.all += 1;
                 if (metrics.all > 1)
                   throw new Error("scope receipt reissued all instead of polling");
                 if (settlesImmediately) return rows(true, false);
                 scheduleWake();
-                return Uint8Array.of(15, 42);
-              case 8:
+                return Uint8Array.of(7, 42);
+              case 7:
                 metrics.poll += 1;
                 assert.equal(command[1], 42);
                 if (settles && metrics.poll === 2) return rows(true, false);
                 scheduleWake();
-                return Uint8Array.of(15, 42);
-              case 7:
-                return Uint8Array.of(7, 1);
+                return Uint8Array.of(7, 42);
+              case 6:
+                return Uint8Array.of(6, 1);
               default:
                 throw new Error(`unexpected pending foreground command ${command[0]}`);
             }
@@ -742,7 +734,7 @@ test("scope-isolation receipt keeps both native-selected scope stores disjoint",
 test("two aliases in one installed JSI runtime require B to observe A's committed subscription delta", async () => {
   let insertedRowId: Uint8Array | undefined;
   let insertedCells: Uint8Array | undefined;
-  let preparedQuery: Uint8Array | undefined;
+  let subscribedQuery: Uint8Array | undefined;
   const command = {
     encode(value: unknown) {
       if (
@@ -760,11 +752,11 @@ test("two aliases in one installed JSI runtime require B to observe A's committe
         typeof value === "object" &&
         value !== null &&
         "type" in value &&
-        value.type === "prepareQuery" &&
+        value.type === "subscribe" &&
         "query" in value &&
         value.query instanceof Uint8Array
       ) {
-        preparedQuery = value.query;
+        subscribedQuery = value.query;
       }
       return new TextEncoder().encode(JSON.stringify(value));
     },
@@ -800,76 +792,74 @@ test("two aliases in one installed JSI runtime require B to observe A's committe
         execute(bytes: Uint8Array) {
           const request = command.decode(bytes) as { type?: string };
           const response =
-            request.type === "prepareQuery"
-              ? { type: "preparedQuery", query: 1 }
-              : request.type === "subscribe"
-                ? { type: "subscribed", subscription: 2 }
-                : request.type === "beginTransaction"
-                  ? { type: "transactionOpened", transaction: 3 }
-                  : request.type === "insert"
-                    ? { type: "inserted", rowId: Array.from(subscriptionRowId) }
-                    : request.type === "commitTransaction"
-                      ? (setTimeout(() => {
-                          committed = true;
-                          const bTicksBeforeWake = ticks[1];
-                          if (emitCommitWake) {
-                            if (postCommitWakeAfterBTicks === 0) schedulers[1]?.("immediate");
-                            else pendingPostCommitWake = true;
-                          }
-                          assert.equal(
-                            ticks[1],
-                            bTicksBeforeWake,
-                            "subscription wake must not re-enter foreground.tick",
-                          );
-                        }, 0),
-                        {
-                          type: "transactionCommitted",
-                          txId: new Uint8Array(16).fill(1),
-                        })
-                      : request.type === "drainSubscription"
-                        ? {
-                            type: "subscriptionEvents",
-                            events:
-                              peer === 1 && !initialResetDrained
-                                ? ((initialResetDrained = true),
-                                  [
+            request.type === "subscribe"
+              ? { type: "subscribed", subscription: 2 }
+              : request.type === "beginTransaction"
+                ? { type: "transactionOpened", transaction: 3 }
+                : request.type === "insert"
+                  ? { type: "inserted", rowId: Array.from(subscriptionRowId) }
+                  : request.type === "commitTransaction"
+                    ? (setTimeout(() => {
+                        committed = true;
+                        const bTicksBeforeWake = ticks[1];
+                        if (emitCommitWake) {
+                          if (postCommitWakeAfterBTicks === 0) schedulers[1]?.("immediate");
+                          else pendingPostCommitWake = true;
+                        }
+                        assert.equal(
+                          ticks[1],
+                          bTicksBeforeWake,
+                          "subscription wake must not re-enter foreground.tick",
+                        );
+                      }, 0),
+                      {
+                        type: "transactionCommitted",
+                        txId: new Uint8Array(16).fill(1),
+                      })
+                    : request.type === "drainSubscription"
+                      ? {
+                          type: "subscriptionEvents",
+                          events:
+                            peer === 1 && !initialResetDrained
+                              ? ((initialResetDrained = true),
+                                [
+                                  {
+                                    type: "delta",
+                                    reset: true,
+                                    settled: true,
+                                    tier: "local",
+                                    delta: [],
+                                  },
+                                ])
+                              : peer === 1 && committed
+                                ? [
                                     {
                                       type: "delta",
-                                      reset: true,
+                                      reset: false,
                                       settled: true,
                                       tier: "local",
-                                      delta: [],
+                                      delta: Array.from(
+                                        encodeSubscriptionDelta({
+                                          added: [
+                                            {
+                                              rowId: subscriptionRowId,
+                                              raw: Uint8Array.from([
+                                                2,
+                                                ...new TextEncoder().encode(
+                                                  "subscription from foreground A",
+                                                ),
+                                              ]),
+                                            },
+                                          ],
+                                        }),
+                                      ),
                                     },
-                                  ])
-                                : peer === 1 && committed
-                                  ? [
-                                      {
-                                        type: "delta",
-                                        reset: false,
-                                        settled: true,
-                                        tier: "local",
-                                        delta: Array.from(
-                                          encodeSubscriptionDelta({
-                                            added: [
-                                              {
-                                                rowId: subscriptionRowId,
-                                                raw: Uint8Array.from([
-                                                  2,
-                                                  ...new TextEncoder().encode(
-                                                    "subscription from foreground A",
-                                                  ),
-                                                ]),
-                                              },
-                                            ],
-                                          }),
-                                        ),
-                                      },
-                                    ]
-                                  : [],
-                          }
-                        : request.type === "unsubscribe"
-                          ? { type: "unsubscribed", closed: true }
-                          : { type: "closed", closed: true };
+                                  ]
+                                : [],
+                        }
+                      : request.type === "unsubscribe"
+                        ? { type: "unsubscribed", closed: true }
+                        : { type: "closed", closed: true };
           return command.encode(response);
         },
         tick() {
@@ -902,7 +892,7 @@ test("two aliases in one installed JSI runtime require B to observe A's committe
     subscriptionRowId,
     "the receipt inserts the host-run row instead of upserting a retained fixed id",
   );
-  assert.deepEqual(preparedQuery, todosQuery, "the receipt uses the Rust-generated todos query");
+  assert.deepEqual(subscribedQuery, todosQuery, "the receipt uses the Rust-generated todos query");
   assert.equal(
     insertedCells?.[9],
     insertedCells ? insertedCells.byteLength - 10 : undefined,

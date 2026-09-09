@@ -488,7 +488,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => new Uint8Array([0]),
-            prepareQuery: () => ({}),
             connectUpstream: () => new FakeTransport([]),
             tick: () => undefined,
           }),
@@ -867,7 +866,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             insert: () => write,
-            prepareQuery: () => ({}),
             subscribe: () => subscriptions.shift()!,
             onMutationError: (callback: (event: unknown) => void) => {
               nativeMutationError = callback;

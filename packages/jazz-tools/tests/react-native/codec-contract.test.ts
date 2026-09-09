@@ -43,26 +43,22 @@ const cases: [string, unknown, unknown][] = [
     { PermissionAdvice: { action: { Delete: { table: "t", row: [...txId] } } } },
   ],
   [
-    "relation prepare",
+    "relation read",
     {
-      type: "prepareQuery",
+      type: "all",
       query: Uint8Array.of(0x4a, 0x52, 0x51, 0x01, 0x00),
-      kind: "relation",
+      optionsJson,
     },
     {
-      PrepareQuery: {
+      All: {
         query: [0x4a, 0x52, 0x51, 0x01, 0x00],
-        kind: "Relation",
+        options_json: optionsJson,
+        transaction: null,
       },
     },
   ],
 
   ["probe", "probe", "Probe"],
-  [
-    "prepare",
-    { type: "prepareQuery", query: Uint8Array.of(1, 128, 2), kind: "query" },
-    { PrepareQuery: { query: [1, 128, 2], kind: "Query" } },
-  ],
   [
     "exclusive transaction",
     { type: "beginTransaction", kind: "exclusive" },
@@ -70,18 +66,23 @@ const cases: [string, unknown, unknown][] = [
   ],
   [
     "read without transaction",
-    { type: "all", query: 128, optionsJson },
-    { All: { query: 128, options_json: optionsJson, transaction: null } },
+    { type: "all", query: Uint8Array.of(128), optionsJson },
+    { All: { query: [128], options_json: optionsJson, transaction: null } },
   ],
   [
     "relation transaction",
-    { type: "all", query: 1, optionsJson, transaction: 256 },
-    { All: { query: 1, options_json: optionsJson, transaction: 256 } },
+    {
+      type: "all",
+      query: Uint8Array.of(1),
+      optionsJson,
+      transaction: 256,
+    },
+    { All: { query: [1], options_json: optionsJson, transaction: 256 } },
   ],
   [
     "subscription",
-    { type: "subscribe", query: 128, optionsJson },
-    { Subscribe: { query: 128, options_json: optionsJson } },
+    { type: "subscribe", query: Uint8Array.of(128), optionsJson },
+    { Subscribe: { query: [128], options_json: optionsJson } },
   ],
   [
     "settlement",
@@ -175,8 +176,8 @@ describe("RN Rust/TypeScript foreground codec contract", () => {
   });
 
   test("noncanonical Rust request encodings fail closed", () => {
-    expect(() => decodeCommandInRust(Uint8Array.of(33, 4))).toThrow();
-    expect(() => decodeNativeForegroundResponse(Uint8Array.of(25, 3))).toThrow();
+    expect(() => decodeCommandInRust(Uint8Array.of(32, 4))).toThrow();
+    expect(() => decodeNativeForegroundResponse(Uint8Array.of(24, 3))).toThrow();
     expect(() => decodeCommandInRust(Uint8Array.of(128, 0))).toThrow();
     expect(() => decodeCommandInRust(Uint8Array.of(255))).toThrow();
     expect(() => decodeCommandInRust(Uint8Array.of(18, 1, 0, 2))).toThrow();
@@ -193,16 +194,16 @@ describe("RN Rust/TypeScript foreground codec contract", () => {
       .entries()) {
       expect([
         ...encodeNativeForegroundCommand(command as NativeForegroundCommand).subarray(0, 2),
-      ]).toEqual([33, index]);
+      ]).toEqual([32, index]);
     }
     expect(
       rustResponseCorpus()
         .slice(0, 3)
         .map((bytes) => [...bytes]),
     ).toEqual([
-      [25, 0],
-      [25, 1],
-      [25, 2],
+      [24, 0],
+      [24, 1],
+      [24, 2],
     ]);
   });
 });

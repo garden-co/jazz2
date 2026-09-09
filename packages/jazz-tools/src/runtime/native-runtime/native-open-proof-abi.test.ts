@@ -24,7 +24,6 @@ function fakeDb() {
     commitTransaction: unused,
     rollbackTransaction: unused,
     all: unused,
-    prepareQuery: unused,
     insert: unused,
     insertInTransaction: unused,
     restore: unused,

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, it } from "vitest";
 import {
-  schema,
+  app,
   conditionCases,
   seedTodosForConditions,
   assertConditionQuery,
@@ -15,7 +15,7 @@ describe("real RN local queries (shared browser scenarios)", () => {
   let fixture: Awaited<ReturnType<typeof createNativeRelayFixture>>;
   let db: Db;
   beforeAll(async () => {
-    fixture = await createNativeRelayFixture({ wasmSchema: schema });
+    fixture = await createNativeRelayFixture(app);
     db = await fixture.createDb();
     await seedTodosForConditions(db);
   });
@@ -33,7 +33,7 @@ describe("real RN local queries (shared browser scenarios)", () => {
     ["supports orderBy + limit + offset", assertWindowQuery],
   ] as const) {
     it(name, async () => {
-      await withNativeRelayFixture({ wasmSchema: schema }, async (fixture) => {
+      await withNativeRelayFixture(app, async (fixture) => {
         await scenario(await fixture.createDb());
       });
     });

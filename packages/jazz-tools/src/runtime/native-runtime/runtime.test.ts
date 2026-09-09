@@ -27,7 +27,7 @@ import {
 import {
   formatUuid,
   NativeRuntimeAdapter,
-  applySubscriptionDeltaWithRootDelta,
+  decodeSubscriptionDelta,
   type Transport,
 } from "./native-runtime-adapter.js";
 import { encodeSchema } from "./schema-codec.js";
@@ -311,7 +311,6 @@ describe("NativeRuntimeAdapter server transport", () => {
           fakeDb({
             all: () => encodeRows([]),
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -869,7 +868,6 @@ describe("NativeRuntimeAdapter server transport", () => {
           fakeDb({
             all: () => encodeRows([]),
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -957,7 +955,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             connectUpstream: () => transport,
-            prepareQuery: () => ({}),
             subscribe: () => subscription,
             tick: () => undefined,
           }),
@@ -989,111 +986,63 @@ describe("NativeRuntimeAdapter server transport", () => {
     expect(updates.mock.calls[0]).toHaveLength(1);
   });
 
-  it("settle-gates global native subscription chunks before app callbacks", () => {
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000123");
-    const events = [
-      {
-        type: "delta",
-        reset: true,
-        settled: false,
-        delta: encodeSubscriptionDelta({ added: [], updated: [], removed: [] }),
-      },
-      {
-        type: "delta",
-        reset: false,
-        settled: true,
-        delta: encodeSubscriptionDelta({
-          added: [{ table: "todos", rowId, title: "settled row" }],
-          updated: [],
-          removed: [],
-        }),
-      },
-    ];
-    const runtime = new NativeRuntimeAdapter(
-      {
-        openMemory: () =>
-          fakeDb({
-            prepareQuery: () => ({}),
-            subscribe: () => ({
-              readAll: () => events.splice(0),
-              close: () => true,
+  it.each(["local", "edge", "global"] as const)(
+    "forwards the core's ready %s subscription reset directly",
+    (tier) => {
+      const rowId = uuidBytes("00000000-0000-0000-0000-000000000123");
+      const events = [
+        {
+          type: "delta",
+          reset: true,
+          settled: true,
+          delta: encodeSubscriptionDelta({
+            added: [{ table: "todos", rowId, title: "settled row" }],
+            updated: [],
+            removed: [],
+          }),
+        },
+      ];
+      const runtime = new NativeRuntimeAdapter(
+        {
+          openMemory: () =>
+            fakeDb({
+              subscribe: () => ({
+                readAll: () => events.splice(0),
+                close: () => true,
+              }),
+              tick: () => undefined,
             }),
-            tick: () => undefined,
-          }),
-        openBrowser: async () => {
-          throw new Error("not used");
-        },
-      } as never,
-      testSchema,
-      new Uint8Array(16),
-      TEST_RUNTIME_AUTHOR,
-      1,
-      true,
-    );
+          openBrowser: async () => {
+            throw new Error("not used");
+          },
+        } as never,
+        testSchema,
+        new Uint8Array(16),
+        TEST_RUNTIME_AUTHOR,
+        1,
+        true,
+      );
 
-    const handle = runtime.createSubscription(JSON.stringify({ table: "todos" }), null, "global");
-    const updates = vi.fn();
-    runtime.executeSubscription(handle, updates);
+      const handle = runtime.createSubscription(JSON.stringify({ table: "todos" }), null, tier);
+      const updates = vi.fn();
+      runtime.executeSubscription(handle, updates);
 
-    expect(updates).toHaveBeenCalledTimes(1);
-    const decoded = decodeTestDeltas([updates.mock.calls[0]![0]]);
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0]).toHaveLength(1);
-    const firstDelta = decoded[0]![0]!;
-    expect(firstDelta).toMatchObject({
-      kind: 0,
-      id: "00000000-0000-0000-0000-000000000123",
-      index: 0,
-    });
-    if (firstDelta.kind !== 0) {
-      throw new Error(`expected added delta, got kind ${firstDelta.kind}`);
-    }
-    expect(firstDelta.row.values[0]).toEqual({ type: "Text", value: "settled row" });
-  });
-
-  it("does not replay deferred terminal history over a settle-gated canonical rebuild", () => {
-    const key = [10, ...uuidBytes("00000000-0000-0000-0000-000000000123")];
-    const terminalOperations = [{ root_key: key, path: [], edit: { Move: { key, index: 0 } } }];
-    const events = [
-      {
-        type: "delta",
-        reset: false,
-        settled: false,
-        delta: encodeSubscriptionDelta({ added: [], updated: [], removed: [] }),
-        terminalOperations,
-      },
-      {
-        type: "delta",
-        reset: false,
-        settled: true,
-        delta: encodeSubscriptionDelta({ added: [], updated: [], removed: [] }),
-      },
-    ];
-    const runtime = new NativeRuntimeAdapter(
-      {
-        openMemory: () =>
-          fakeDb({
-            prepareQuery: () => ({}),
-            subscribe: () => ({ readAll: () => events.splice(0), close: () => true }),
-            tick: () => undefined,
-          }),
-        openBrowser: async () => {
-          throw new Error("not used");
-        },
-      } as never,
-      testSchema,
-      new Uint8Array(16),
-      TEST_RUNTIME_AUTHOR,
-      1,
-      true,
-    );
-    const handle = runtime.createSubscription(JSON.stringify({ table: "todos" }), null, "global");
-    const updates = vi.fn();
-    runtime.executeSubscription(handle, updates);
-
-    expect(updates).toHaveBeenCalledTimes(1);
-    expect(updates.mock.calls[0]![0].terminalOperations).toBeUndefined();
-  });
+      expect(updates).toHaveBeenCalledTimes(1);
+      const decoded = decodeTestDeltas([updates.mock.calls[0]![0]]);
+      expect(decoded).toHaveLength(1);
+      expect(decoded[0]).toHaveLength(1);
+      const firstDelta = decoded[0]![0]!;
+      expect(firstDelta).toMatchObject({
+        kind: 0,
+        id: "00000000-0000-0000-0000-000000000123",
+        index: 0,
+      });
+      if (firstDelta.kind !== 0) {
+        throw new Error(`expected added delta, got kind ${firstDelta.kind}`);
+      }
+      expect(firstDelta.row.values[0]).toEqual({ type: "Text", value: "settled row" });
+    },
+  );
 
   it("uses the caller-supplied table for update and delete", () => {
     const calls: unknown[] = [];
@@ -1107,7 +1056,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => Uint8Array.from([0]),
-            prepareQuery: () => ({}),
             update: (table: string, rowId: Uint8Array, patch: Uint8Array) => {
               calls.push(["update", table, rowId, patch]);
               return write;
@@ -1154,7 +1102,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => Uint8Array.from([0]),
-            prepareQuery: () => ({}),
             updateLargeValues: (...args: unknown[]) => {
               calls.push(args);
               return fakeWrite();
@@ -1232,7 +1179,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => encodeRows([{ table: "todos", rowId, title: "A😀BC" }]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -1281,7 +1227,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                   title: "fresh local write",
                 },
               ]),
-            prepareQuery: () => ({}),
             insert: (_table: string, _cells: Uint8Array, options?: { rowId?: Uint8Array }) => {
               insertedRowIds.push(options?.rowId ?? new Uint8Array(16));
               return write;
@@ -1402,22 +1347,18 @@ describe("NativeRuntimeAdapter server transport", () => {
                   },
                 ])
               : encodeRows([]),
-          prepareQuery: () => ({}),
           subscribe: () => ({
             readAll: () => {
               if (!ticked || subscriptionDrained) return [];
               subscriptionDrained = true;
               return [
-                {
-                  type: "snapshot",
-                  rows: encodeRelationSnapshot([
-                    {
-                      table: "todos",
-                      rowId,
-                      title: "visible after scheduled tick",
-                    },
-                  ]),
-                },
+                subscriptionReset([
+                  {
+                    table: "todos",
+                    rowId,
+                    title: "visible after scheduled tick",
+                  },
+                ]),
               ];
             },
           }),
@@ -1501,7 +1442,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                 },
               ]);
             },
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -1535,6 +1475,55 @@ describe("NativeRuntimeAdapter server transport", () => {
     ]);
     expect(clientReads).toBe(1);
   });
+
+  it.each(["query", "subscription"] as const)(
+    "installs client correlation claims before opening a %s without preparing a native plan",
+    async (kind) => {
+      const app = s.defineApp({ todos: s.table({ title: s.string() }) });
+      let releaseClaims!: () => void;
+      const installed = new Promise<void>((resolve) => {
+        releaseClaims = resolve;
+      });
+      const setSessionClaims = vi.fn(() => installed);
+      const all = vi.fn(() => encodeRows([]));
+      const subscribe = vi.fn(() => ({ readAll: () => [], close: () => undefined }));
+      const runtime = new NativeRuntimeAdapter(
+        { openMemory: () => fakeDb({ setSessionClaims, all, subscribe }) } as never,
+        app.todos._schema,
+        new Uint8Array(16),
+        TEST_RUNTIME_AUTHOR,
+        1,
+        true,
+      );
+      const session = JSON.stringify({
+        user_id: "00000000-0000-0000-0000-0000000000a1",
+        issuer: "https://issuer.example",
+        authMode: "external",
+        claims: { role: "reader" },
+      });
+      const open = () =>
+        kind === "query"
+          ? runtime.query(app.todos._build(), session, "local")
+          : runtime.createSubscription(app.todos._build(), session, "local");
+      try {
+        const pending = open();
+        expect(setSessionClaims).toHaveBeenCalledOnce();
+        expect(setSessionClaims).toHaveBeenCalledWith(expect.objectContaining({ role: "reader" }));
+        expect(all).not.toHaveBeenCalled();
+        expect(subscribe).not.toHaveBeenCalled();
+        releaseClaims();
+        await pending;
+        const read = kind === "query" ? all : subscribe;
+        await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+        await open();
+        expect(read).toHaveBeenCalledTimes(2);
+        expect(setSessionClaims).toHaveBeenCalledOnce();
+      } finally {
+        releaseClaims();
+        await runtime.close();
+      }
+    },
+  );
 
   it("returns unknown locally without consulting hidden policy evidence", () => {
     let authoritativeChecks = 0;
@@ -1819,9 +1808,16 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: (_query: unknown, _opts: unknown, _tx: unknown, author: Uint8Array) => {
+            all: (
+              _query: unknown,
+              _opts: unknown,
+              _tx: unknown,
+              author: Uint8Array,
+              claims: Record<string, unknown>,
+            ) => {
               if (!author) throw new Error("trusted serving query must provide an author");
               authors.push(new TextDecoder().decode(author));
+              claimUpdates.push({ author: new TextDecoder().decode(author), claims });
               return encodeRows([
                 {
                   table: "todos",
@@ -1829,15 +1825,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                   title: "trusted serving",
                 },
               ]);
-            },
-            prepareQuery: (
-              _query: Uint8Array,
-              _kind: "query" | "relation",
-              author: Uint8Array,
-              claims: Record<string, unknown>,
-            ) => {
-              claimUpdates.push({ author: new TextDecoder().decode(author), claims });
-              return {};
             },
             tick: () => undefined,
           }),
@@ -1903,7 +1890,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                 },
               ]);
             },
-            prepareQuery: () => ({}),
             subscribe: () => {
               throw new Error("reserved public session must be rejected before subscribing");
             },
@@ -1978,7 +1964,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                 },
               ]);
             },
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2025,7 +2010,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all,
-            prepareQuery: () => ({}),
             setIdentityClaims,
             tick: () => undefined,
           }),
@@ -2085,7 +2069,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => encodeArrayRows(),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2123,16 +2106,15 @@ describe("NativeRuntimeAdapter server transport", () => {
     ]);
   });
 
-  it("lowers scalar comparison relation IR into the prepared native query", async () => {
+  it("carries scalar comparison relation IR in the prepared Query envelope", async () => {
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -2147,10 +2129,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       true,
     );
 
-    await runtime.query(
-      JSON.stringify({
-        table: "todos",
-        relation_ir: {
+    const relation = {
+      Limit: {
+        input: {
           Filter: {
             input: { TableScan: { table: "todos" } },
             predicate: {
@@ -2163,17 +2144,11 @@ describe("NativeRuntimeAdapter server transport", () => {
           },
         },
         limit: 5,
-      }),
-    );
+      },
+    };
+    await runtime.query(JSON.stringify({ table: "todos", relation_ir: relation }));
 
-    expect(readPreparedComparison(preparedBytes!)).toEqual({
-      table: "todos",
-      predicateTag: 6,
-      column: "title",
-      literalTag: 6,
-      value: "m",
-      limit: 5,
-    });
+    expect(preparedBytes).toEqual(queryWithPredicates("todos", [], { relation }));
   });
 
   it("trusts native prepared queries for simple equality relation filters", async () => {
@@ -2182,8 +2157,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () =>
-              encodeRows([
+            all: (query: Uint8Array) => {
+              preparedBytes = query;
+              return encodeRows([
                 {
                   table: "todos",
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -2194,10 +2170,7 @@ describe("NativeRuntimeAdapter server transport", () => {
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000002"),
                   title: "drop",
                 },
-              ]),
-            prepareQuery: (query: Uint8Array) => {
-              preparedBytes = query;
-              return {};
+              ]);
             },
             tick: () => undefined,
           }),
@@ -2212,24 +2185,20 @@ describe("NativeRuntimeAdapter server transport", () => {
       true,
     );
 
-    await expect(
-      runtime.query(
-        JSON.stringify({
-          table: "todos",
-          relation_ir: {
-            Filter: {
-              input: { TableScan: { table: "todos" } },
-              predicate: {
-                Cmp: {
-                  left: { column: "title" },
-                  op: "Eq",
-                  right: { Literal: { type: "Text", value: "keep" } },
-                },
-              },
-            },
+    const relation = {
+      Filter: {
+        input: { TableScan: { table: "todos" } },
+        predicate: {
+          Cmp: {
+            left: { column: "title" },
+            op: "Eq",
+            right: { Literal: { type: "Text", value: "keep" } },
           },
-        }),
-      ),
+        },
+      },
+    };
+    await expect(
+      runtime.query(JSON.stringify({ table: "todos", relation_ir: relation })),
     ).resolves.toEqual([
       {
         table: "todos",
@@ -2242,27 +2211,19 @@ describe("NativeRuntimeAdapter server transport", () => {
         values: [{ type: "Text", value: "drop" }],
       },
     ]);
-    expect(readPreparedComparison(preparedBytes!)).toEqual({
-      table: "todos",
-      predicateTag: 3,
-      column: "title",
-      literalTag: 6,
-      value: "keep",
-      limit: undefined,
-    });
+    expect(preparedBytes).toEqual(queryWithPredicates("todos", [], { relation }));
   });
 
-  it("lowers a payload enum match relation filter into the native prepared query", () => {
+  it("carries a payload enum match relation filter in the Query envelope", () => {
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new ReadableStream();
             },
-            subscribe: () => new ReadableStream(),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2325,18 +2286,31 @@ describe("NativeRuntimeAdapter server transport", () => {
 
     expect(handle).toBe(1);
     expect(preparedBytes).toEqual(
-      queryWithPredicates(
-        "events",
-        [
-          {
-            column: "event",
-            op: "EnumMatch",
-            case: "message",
-            payload: { column: "level", op: "Eq", value: { type: "Integer", value: 2 } },
+      queryWithPredicates("events", [], {
+        relation: {
+          Project: {
+            input: {
+              Filter: {
+                input: { TableScan: { table: "events" } },
+                predicate: {
+                  EnumMatch: {
+                    column: { column: "event", scope: "events" },
+                    case: "message",
+                    payload: {
+                      Cmp: {
+                        left: { column: "level" },
+                        op: "Eq",
+                        right: { Literal: { type: "Integer", value: 2 } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            columns: [{ alias: "event", expr: { Column: { column: "event", scope: "events" } } }],
           },
-        ],
-        { select: ["event"] },
-      ),
+        },
+      }),
     );
   });
 
@@ -2375,7 +2349,7 @@ describe("NativeRuntimeAdapter server transport", () => {
       // rejection here, which Vitest treats as a failed test run.
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(callback.mock.calls).toEqual([[error]]);
-      runtime.executeSubscription(handle, callback);
+      expect(() => runtime.executeSubscription(handle, callback)).toThrow("already been activated");
       expect(callback).toHaveBeenCalledTimes(1);
       if (kind !== "stream") expect(close).toHaveBeenCalledTimes(1);
       if (kind === "native-close-throws") {
@@ -2386,6 +2360,65 @@ describe("NativeRuntimeAdapter server transport", () => {
       } else expect(cleanupLog).not.toHaveBeenCalled();
       await runtime.close();
       cleanupLog.mockRestore();
+    },
+  );
+
+  it.each(["native", "stream"] as const)(
+    "activates a %s subscription once without replacing its callback or replaying rows",
+    async (kind) => {
+      const rowId = uuidBytes("00000000-0000-0000-0000-000000000123");
+      const opening = subscriptionReset([{ table: "todos", rowId, title: "initial" }]);
+      const change = {
+        type: "delta",
+        delta: encodeSubscriptionDelta({
+          added: [],
+          updated: [{ table: "todos", rowId, title: "updated" }],
+          removed: [],
+          updatedIndices: [4],
+        }),
+      };
+      const readAll = vi.fn().mockReturnValueOnce([opening, change]).mockReturnValue([]);
+      const source =
+        kind === "native"
+          ? { readAll, close: vi.fn() }
+          : new ReadableStream({
+              start(controller) {
+                controller.enqueue(opening);
+                controller.enqueue(change);
+              },
+            });
+      const runtime = runtimeWithSubscriptionSource(source);
+      const app = s.defineApp({ todos: s.table({ title: s.string() }) });
+      const handle = runtime.createSubscription(app.todos._build());
+      const replacement = vi.fn();
+      const callback = vi.fn(() => {
+        expect(() => runtime.executeSubscription(handle, replacement)).toThrow(
+          "already been activated",
+        );
+      });
+      try {
+        // Core wakes before activation must not consume the opening event.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(readAll).not.toHaveBeenCalled();
+        runtime.executeSubscription(handle, callback);
+        if (kind === "native") expect(callback).toHaveBeenCalledTimes(2);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(2));
+        expect(callback.mock.calls[0]).toEqual([expect.objectContaining({ reset: true })]);
+        expect(callback.mock.calls[1]).toEqual([
+          expect.objectContaining({
+            added: [],
+            updated: [expect.objectContaining({ index: 4 })],
+            removed: [],
+          }),
+        ]);
+        expect(() => runtime.executeSubscription(handle, replacement)).toThrow(
+          "already been activated",
+        );
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(replacement).not.toHaveBeenCalled();
+      } finally {
+        await runtime.close();
+      }
     },
   );
 
@@ -2416,23 +2449,21 @@ describe("NativeRuntimeAdapter server transport", () => {
     },
   );
 
-  it("trusts native subscription snapshots for simple equality relation filters", async () => {
+  it("trusts native reset deltas for simple equality relation filters", async () => {
     let controller: ReadableStreamDefaultController<unknown> | undefined;
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
-            },
-            subscribe: () =>
-              new ReadableStream({
+              return new ReadableStream({
                 start(streamController) {
                   controller = streamController;
                 },
-              }),
+              });
+            },
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2467,9 +2498,8 @@ describe("NativeRuntimeAdapter server transport", () => {
       deltas.push(delta);
     });
 
-    controller!.enqueue({
-      type: "snapshot",
-      rows: encodeRelationSnapshot([
+    controller!.enqueue(
+      subscriptionReset([
         {
           table: "todos",
           rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -2481,7 +2511,7 @@ describe("NativeRuntimeAdapter server transport", () => {
           title: "drop",
         },
       ]),
-    });
+    );
     await Promise.resolve();
 
     expect(decodeTestDeltas(deltas.slice(0, 2))).toEqual([
@@ -2506,17 +2536,10 @@ describe("NativeRuntimeAdapter server transport", () => {
         },
       ],
     ]);
-    expect(readPreparedComparison(preparedBytes!)).toEqual({
-      table: "todos",
-      predicateTag: 3,
-      column: "title",
-      literalTag: 6,
-      value: "keep",
-      limit: undefined,
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
-  it("routes Join relation IR to the native relation API", async () => {
+  it("routes Join relation IR through the canonical Query API", async () => {
     const calls: string[] = [];
     const runtime = new NativeRuntimeAdapter(
       {
@@ -2524,17 +2547,13 @@ describe("NativeRuntimeAdapter server transport", () => {
           fakeDb({
             all: () => {
               calls.push("all");
-              return encodeRelationSnapshot([
+              return encodeRows([
                 {
                   table: "todos",
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
                   title: "should not be read",
                 },
               ]);
-            },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
             },
             tick: () => undefined,
           }),
@@ -2558,20 +2577,19 @@ describe("NativeRuntimeAdapter server transport", () => {
         values: [{ type: "Text", value: "should not be read" }],
       },
     ]);
-    expect(calls).toEqual(["prepareQuery", "all"]);
+    expect(calls).toEqual(["all"]);
   });
 
-  it("preserves raw subscription literal number spellings in native relation bytes", () => {
-    let relationBytes: Uint8Array | undefined;
+  it("preserves raw subscription literal number spellings in the Query relation envelope", () => {
+    let queryBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (bytes: Uint8Array, kind: "query" | "relation") => {
-              if (kind === "relation") relationBytes = bytes;
-              return {};
+            subscribe: (bytes: Uint8Array) => {
+              queryBytes = bytes;
+              return new ReadableStream();
             },
-            subscribe: () => new ReadableStream(),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2586,28 +2604,24 @@ describe("NativeRuntimeAdapter server transport", () => {
     );
 
     runtime.createSubscription(
-      '{"relation_ir":{"Union":{"inputs":[{"label":"source","input":{"Filter":{"input":{"TableScan":{"table":"todos"}},"predicate":{"Cmp":{"left":{"column":"priority"},"op":"Eq","right":{"Literal":1.0}}}}}}]}}}',
+      '{"table":"todos","relation_ir":{"Union":{"inputs":[{"label":"source","input":{"Filter":{"input":{"TableScan":{"table":"todos"}},"predicate":{"Cmp":{"left":{"column":"priority"},"op":"Eq","right":{"Literal":1.0}}}}}}]}}}',
     );
 
-    expect(relationBytes).toBeDefined();
-    expect(Array.from(relationBytes!.slice(-10))).toEqual([
+    expect(queryBytes).toBeDefined();
+    expect(Array.from(queryBytes!.slice(-10))).toEqual([
       4, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x3f,
     ]);
   });
 
-  it("lowers simple Project relation IR while preparing the original subscription query", () => {
+  it("carries Project relation IR in the prepared Query envelope", () => {
     const calls: string[] = [];
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
-              calls.push("prepareQuery");
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
-            },
-            subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream();
             },
@@ -2628,23 +2642,19 @@ describe("NativeRuntimeAdapter server transport", () => {
       JSON.stringify({ table: "todos", relation_ir: unsupportedProjectRelationIr() }),
     );
     expect(handle).toBe(1);
-    expect(calls).toEqual(["prepareQuery", "subscribe"]);
-    expect(readPreparedSelect(preparedBytes!)).toEqual(["title"]);
+    expect(calls).toEqual(["subscribe"]);
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
-  it("subscribes to supported root relation IR as one prepared native query", () => {
+  it("subscribes to supported root relation IR through one Query envelope", () => {
     const calls: string[] = [];
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
-              calls.push("prepareQuery");
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
-            },
-            subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream();
             },
@@ -2703,15 +2713,8 @@ describe("NativeRuntimeAdapter server transport", () => {
     );
 
     expect(handle).toBe(1);
-    expect(calls).toEqual(["prepareQuery", "subscribe"]);
-    expect(readPreparedQueryShape(preparedBytes!)).toEqual({
-      table: "todos",
-      predicates: [{ column: "title", opTag: 3, literalTag: 6, value: "native" }],
-      orderBy: [{ column: "priority", directionTag: 1 }],
-      limit: 3,
-      offset: 2,
-    });
-    expect(readPreparedSelect(preparedBytes!)).toEqual(["title"]);
+    expect(calls).toEqual(["subscribe"]);
+    expectPreparedRelationEnvelope(preparedBytes!, "todos", ["title"]);
   });
 
   it("encodes public typed-builder root orderBy into native query bytes", () => {
@@ -2720,11 +2723,10 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new ReadableStream();
             },
-            subscribe: () => new ReadableStream(),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2764,11 +2766,10 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new ReadableStream();
             },
-            subscribe: () => new ReadableStream(),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -2807,12 +2808,7 @@ describe("NativeRuntimeAdapter server transport", () => {
       }),
     );
 
-    expect(readPreparedFirstLiteral(preparedBytes!)).toEqual({
-      column: "priority",
-      opTag: 8,
-      literalTag: 15,
-      value: -1,
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
   it("preserves signed i32 query literal boundaries and rejects overflow", () => {
@@ -2904,7 +2900,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     });
   });
 
-  it("materializes array subquery relation snapshots for subscriptions", async () => {
+  it("materializes array subquery reset deltas for subscriptions", async () => {
     const calls: string[] = [];
     let controller: ReadableStreamDefaultController<unknown> | undefined;
     const relationSchema = {
@@ -2919,10 +2915,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream({
@@ -2964,12 +2956,13 @@ describe("NativeRuntimeAdapter server transport", () => {
       deltas.push(delta);
     });
     controller!.enqueue({
-      type: "snapshot",
-      rows: encodeTerminalRelationSnapshot(relationSchema),
+      type: "delta",
+      reset: true,
+      delta: encodeTerminalSubscriptionDelta(relationSchema),
     });
     await Promise.resolve();
 
-    expect(calls).toEqual(["prepareQuery", "subscribe"]);
+    expect(calls).toEqual(["subscribe"]);
     const relationOutputColumns: ColumnDescriptor[] = [
       relationSchema.users.columns[0]!,
       {
@@ -3024,10 +3017,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             all: () => {
               calls.push("all");
               return encodeTerminalRelationSnapshot(relationSchema);
@@ -3064,7 +3053,7 @@ describe("NativeRuntimeAdapter server transport", () => {
       valuesByColumn?: Map<string, unknown>;
     }>;
 
-    expect(calls).toEqual(["prepareQuery", "all"]);
+    expect(calls).toEqual(["all"]);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.table).toBe("users");
     expect(rows[0]?.valuesByColumn?.get("todosViaOwner")).toEqual({
@@ -3110,10 +3099,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream({
@@ -3140,19 +3125,18 @@ describe("NativeRuntimeAdapter server transport", () => {
       deltas.push(delta);
     });
 
-    controller!.enqueue({
-      type: "snapshot",
-      rows: encodeRelationSnapshot([
+    controller!.enqueue(
+      subscriptionReset([
         {
           table: "todos",
           rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
           title: "native",
         },
       ]),
-    });
+    );
     await Promise.resolve();
 
-    expect(calls).toEqual(["prepareQuery", "subscribe"]);
+    expect(calls).toEqual(["subscribe"]);
     expect(decodeTestDeltas(deltas.slice(0, 2))).toEqual([
       [
         {
@@ -3174,10 +3158,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream();
@@ -3223,7 +3203,7 @@ describe("NativeRuntimeAdapter server transport", () => {
         }),
       ),
     ).toBe(1);
-    expect(calls).toEqual(["prepareQuery", "subscribe"]);
+    expect(calls).toEqual(["subscribe"]);
   });
 
   it("passes supported read tiers and propagation through native read options", async () => {
@@ -3236,7 +3216,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               readOptions.push(opts);
               return new Uint8Array([0]);
             },
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3264,33 +3243,22 @@ describe("NativeRuntimeAdapter server transport", () => {
 
   it("selects one backend authority context for plain, relation, subscription, and transaction reads", async () => {
     const calls: string[] = [];
-    let prepared = 0;
+    let reads = 0;
+    let subscriptions = 0;
     const nativeDb = fakeDb({
-      prepareQuery: (_bytes: Uint8Array, kind: "query" | "relation") => ({
-        kind,
-        sequence: prepared++,
-      }),
-      all: (
-        query: { kind: "query" | "relation"; sequence: number },
-        _opts: unknown,
-        openTransactionId: string,
-        author: Uint8Array,
-      ) => {
+      all: (_query: Uint8Array, _opts: unknown, openTransactionId: string, author: Uint8Array) => {
         if (author) throw new Error("backend authority must be implicit in its native open");
-        if (query.kind === "relation") {
-          calls.push("relation");
-          return encodeRelationSnapshot([]);
-        }
-        if (query.sequence === 2) {
+        const sequence = reads++;
+        if (sequence === 2 || sequence === 4) {
           calls.push(openTransactionId ? "transaction-snapshot" : "snapshot");
           return encodeRelationSnapshot([]);
         }
-        calls.push(openTransactionId ? "transaction" : "plain");
+        calls.push(sequence === 1 ? "relation" : openTransactionId ? "transaction" : "plain");
         return encodeRows([]);
       },
-      subscribe: (query: { kind: "query" | "relation" }, _opts: unknown, author: Uint8Array) => {
+      subscribe: (_query: Uint8Array, _opts: unknown, author: Uint8Array) => {
         if (author) throw new Error("backend authority must be implicit in its native open");
-        calls.push(query.kind === "relation" ? "relation-subscription" : "subscription");
+        calls.push(subscriptions++ === 0 ? "subscription" : "relation-subscription");
         return new ReadableStream();
       },
       tick: () => undefined,
@@ -3374,7 +3342,6 @@ describe("NativeRuntimeAdapter server transport", () => {
     const all = vi.fn(() => encodeRows([]));
     let nativeDb: ReturnType<typeof fakeDb>;
     nativeDb = fakeDb({
-      prepareQuery: () => ({}),
       all,
       registerSchema: () => nativeDb,
       tick: () => undefined,
@@ -3418,7 +3385,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               return encodeRows([row]);
             },
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3455,7 +3421,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               return encodeRows([]);
             },
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3494,7 +3459,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               readOptions.push(opts);
               return new Uint8Array([0]);
             },
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3533,7 +3497,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               return encodeRows([]);
             },
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3616,7 +3579,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               readOptions.push(opts);
               return new Uint8Array([0]);
             },
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3647,7 +3609,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               poll: () => (++polls < 2 ? null : encodeRows([])),
             }),
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3679,7 +3640,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               return encodeRows([]);
             },
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             setNonDurableClient: () => undefined,
             tick: () => {
               processed = true;
@@ -3718,7 +3678,6 @@ describe("NativeRuntimeAdapter server transport", () => {
           fakeDb({
             all: () => ({ poll: () => null }),
             connectUpstream: () => new FakeTransport([]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3770,10 +3729,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               calls.push("all");
               return new Uint8Array([0]);
             },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3808,10 +3763,6 @@ describe("NativeRuntimeAdapter server transport", () => {
               calls.push("all");
               return new Uint8Array([0]);
             },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -3845,10 +3796,6 @@ describe("NativeRuntimeAdapter server transport", () => {
             all: () => {
               calls.push("all");
               return new Uint8Array([0]);
-            },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
             },
             tick: () => undefined,
           }),
@@ -3893,7 +3840,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     expect(calls).toEqual([]);
   });
 
-  it("rejects JSON-only relation reads inside a transaction before ordinary relation APIs", async () => {
+  it("lets the core reject relation reads inside a transaction", async () => {
     const calls: string[] = [];
     const runtime = new NativeRuntimeAdapter(
       {
@@ -3901,7 +3848,7 @@ describe("NativeRuntimeAdapter server transport", () => {
           fakeDb({
             all: () => {
               calls.push("all");
-              return new Uint8Array();
+              throw new Error("relation reads inside a transaction are not supported");
             },
             tick: () => undefined,
           }),
@@ -3926,8 +3873,8 @@ describe("NativeRuntimeAdapter server transport", () => {
         undefined,
         opts,
       ),
-    ).rejects.toThrow("does not support relation reads inside a transaction");
-    expect(calls).toEqual([]);
+    ).rejects.toThrow("relation reads inside a transaction are not supported");
+    expect(calls).toEqual(["all"]);
   });
 
   it("rejects permission introspection in array subqueries before native snapshot prep", async () => {
@@ -3939,10 +3886,6 @@ describe("NativeRuntimeAdapter server transport", () => {
             all: () => {
               calls.push("all");
               return new Uint8Array([0]);
-            },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
             },
             tick: () => undefined,
           }),
@@ -3982,10 +3925,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             subscribe: () => {
               calls.push("subscribe");
               return new ReadableStream();
@@ -4015,7 +3954,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     expect(calls).toEqual([]);
   });
 
-  it("rejects permission introspection relation projections before native relation APIs", async () => {
+  it("rejects permission introspection relation projections before the native query API", async () => {
     const calls: string[] = [];
     const runtime = new NativeRuntimeAdapter(
       {
@@ -4076,10 +4015,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                 },
               ]);
             },
-            prepareQuery: () => {
-              calls.push("prepareQuery");
-              return {};
-            },
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -4096,7 +4031,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     await expect(
       runtime.query(JSON.stringify({ table: "todos", select_columns: ["title", "$createdAt"] })),
     ).resolves.toHaveLength(1);
-    expect(calls).toEqual(["prepareQuery", "all"]);
+    expect(calls).toEqual(["all"]);
   });
 
   it("passes local-only subscription propagation through native read options", () => {
@@ -4105,7 +4040,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => ({}),
             subscribe: (_query: unknown, opts: unknown) => {
               readOptions.push(opts);
               return new ReadableStream();
@@ -4207,7 +4141,6 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => ({}),
             subscribe: () =>
               new ReadableStream({
                 start(streamController) {
@@ -4232,9 +4165,8 @@ describe("NativeRuntimeAdapter server transport", () => {
       deltas.push(delta);
     });
 
-    controller!.enqueue({
-      type: "snapshot",
-      rows: encodeRelationSnapshot([
+    controller!.enqueue(
+      subscriptionReset([
         {
           table: "todos",
           rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -4246,7 +4178,7 @@ describe("NativeRuntimeAdapter server transport", () => {
           title: "second",
         },
       ]),
-    });
+    );
     await Promise.resolve();
 
     controller!.enqueue({
@@ -4280,10 +4212,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     });
     await Promise.resolve();
 
-    controller!.enqueue({
-      type: "snapshot",
-      rows: encodeRelationSnapshot([]),
-    });
+    controller!.enqueue(subscriptionReset([]));
     await Promise.resolve();
 
     expect(decodeTestDeltas(deltas.slice(0, 2))).toEqual([
@@ -4333,20 +4262,7 @@ describe("NativeRuntimeAdapter server transport", () => {
         },
       ],
     ]);
-    expect(decodeTestDeltas(deltas.slice(2))).toEqual([
-      [
-        {
-          kind: 1,
-          id: "00000000-0000-0000-0000-000000000002",
-          index: 0,
-        },
-        {
-          kind: 1,
-          id: "00000000-0000-0000-0000-000000000003",
-          index: 1,
-        },
-      ],
-    ]);
+    expect(deltas.at(-1)).toMatchObject({ reset: true, added: [], updated: [], removed: [] });
   });
 
   it("encodes public id equality relation filters into prepared native queries", async () => {
@@ -4355,8 +4271,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () =>
-              encodeRows([
+            all: (query: Uint8Array) => {
+              preparedBytes = query;
+              return encodeRows([
                 {
                   table: "todos",
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -4367,10 +4284,7 @@ describe("NativeRuntimeAdapter server transport", () => {
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000002"),
                   title: "native returned extra",
                 },
-              ]),
-            prepareQuery: (query: Uint8Array) => {
-              preparedBytes = query;
-              return {};
+              ]);
             },
             tick: () => undefined,
           }),
@@ -4417,14 +4331,7 @@ describe("NativeRuntimeAdapter server transport", () => {
         values: [{ type: "Text", value: "native returned extra" }],
       },
     ]);
-    expect(readPreparedUuidComparison(preparedBytes!)).toEqual({
-      table: "todos",
-      predicateTag: 3,
-      column: "id",
-      literalTag: 9,
-      value: "00000000-0000-0000-0000-000000000001",
-      limit: undefined,
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
   it("preserves raw provenance timestamps from native rows without Date.now fallbacks", async () => {
@@ -4445,7 +4352,6 @@ describe("NativeRuntimeAdapter server transport", () => {
                   updatedAt: updatedAtMs,
                 },
               ]),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -4510,7 +4416,6 @@ describe("NativeRuntimeAdapter server transport", () => {
         openMemory: () =>
           fakeDb({
             all: () => writer.finish(),
-            prepareQuery: () => ({}),
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -4539,10 +4444,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -4583,10 +4487,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -4630,10 +4533,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -4698,29 +4600,7 @@ describe("NativeRuntimeAdapter server transport", () => {
       }),
     );
 
-    expect(readPreparedInLiterals(preparedBytes!)).toEqual([
-      {
-        column: "count",
-        literals: [
-          { tag: 15, value: 5 },
-          { tag: 15, value: 10 },
-        ],
-      },
-      {
-        column: "ratio",
-        literals: [
-          { tag: 4, value: 1.5 },
-          { tag: 4, value: 2.5 },
-        ],
-      },
-      {
-        column: "createdAt",
-        literals: [
-          { tag: 3, value: 1767225600000 },
-          { tag: 3, value: 1767312000000 },
-        ],
-      },
-    ]);
+    expectPreparedRelationEnvelope(preparedBytes!, "metrics");
   });
 
   it("preserves relation IR range literal types for double and timestamp columns", async () => {
@@ -4729,10 +4609,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -4797,31 +4676,24 @@ describe("NativeRuntimeAdapter server transport", () => {
       }),
     );
 
-    expect(readPreparedComparisonLiterals(preparedBytes!)).toEqual([
-      { predicateTag: 6, column: "ratio", literal: { tag: 4, value: 1.5 } },
-      { predicateTag: 8, column: "ratio", literal: { tag: 4, value: 4.5 } },
-      { predicateTag: 6, column: "createdAt", literal: { tag: 3, value: 1770076800000 } },
-      { predicateTag: 8, column: "createdAt", literal: { tag: 3, value: 1770336000000 } },
-    ]);
+    expectPreparedRelationEnvelope(preparedBytes!, "metrics");
   });
 
-  it("does not filter native subscription snapshots by public id in JS", async () => {
+  it("does not filter native subscription reset deltas by public id in JS", async () => {
     let controller: ReadableStreamDefaultController<unknown> | undefined;
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: (query: Uint8Array) => {
+            subscribe: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
-            },
-            subscribe: () =>
-              new ReadableStream({
+              return new ReadableStream({
                 start(streamController) {
                   controller = streamController;
                 },
-              }),
+              });
+            },
             tick: () => undefined,
           }),
         openBrowser: async () => {
@@ -4858,9 +4730,8 @@ describe("NativeRuntimeAdapter server transport", () => {
       deltas.push(delta);
     });
 
-    controller!.enqueue({
-      type: "snapshot",
-      rows: encodeRelationSnapshot([
+    controller!.enqueue(
+      subscriptionReset([
         {
           table: "todos",
           rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -4872,17 +4743,11 @@ describe("NativeRuntimeAdapter server transport", () => {
           title: "extra from native",
         },
       ]),
-    });
+    );
     await Promise.resolve();
 
     expect(decodeTestDeltas(deltas)[0]).toHaveLength(2);
-    expect(readPreparedUuidComparison(preparedBytes!)).toMatchObject({
-      table: "todos",
-      predicateTag: 3,
-      column: "id",
-      literalTag: 9,
-      value: "00000000-0000-0000-0000-000000000001",
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
   it("delivers packed reset rows with the same public shape as legacy decode when native batches include internal fields", () => {
@@ -5040,261 +4905,6 @@ describe("NativeRuntimeAdapter server transport", () => {
     ordinary.close();
   });
 
-  it("publishes one canonical reset instead of replaying settle-gated packed Gather history", () => {
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000501");
-    const key = [10, ...rowId];
-    const terminalOperations = [{ root_key: key, path: [], edit: { Move: { key, index: 0 } } }];
-    const runtime = runtimeWithNativeRelationSubscriptionChunks([
-      {
-        ...relationSubscriptionChunk({
-          reset: true,
-          settled: false,
-          rootAdded: [{ table: "todos", rowId, title: "packed gather root" }],
-        }),
-        terminalOperations,
-      },
-      relationSubscriptionChunk({ settled: true }),
-    ]);
-    const deltas: RuntimeSubscriptionDelta[] = [];
-    const handle = runtime.createSubscription(
-      JSON.stringify({ table: "todos", relation_ir: supportedGatherRelationIr("todos") }),
-      null,
-      "global",
-      null,
-    );
-
-    runtime.executeSubscription(handle, (delta: RuntimeSubscriptionDelta) => deltas.push(delta));
-
-    expect(deltas).toHaveLength(1);
-    expect(deltas[0]!.reset).toBe(true);
-    expect(deltas[0]!.terminalOperations).toBeUndefined();
-    runtime.close();
-  });
-
-  it("buffers non-packed unsettled Gather resets until a settled row is public-shape compatible", () => {
-    const teamsSchema = {
-      teams: {
-        columns: [
-          { name: "name", column_type: { type: "Text" }, nullable: false },
-          { name: "org_id", column_type: { type: "Uuid" }, nullable: true },
-          { name: "parent_id", column_type: { type: "Uuid" }, nullable: true },
-        ],
-      },
-    } satisfies WasmSchema;
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000551");
-    const resultKey = typedOccurrenceKey("gather-root");
-    const runtime = runtimeWithNativeRelationSubscriptionChunks(
-      [
-        {
-          type: "delta",
-          reset: true,
-          settled: false,
-          delta: encodeTeamGatherSubscriptionDelta({
-            added: [{ rowId, name: null }],
-            addedOccurrenceKeys: [resultKey],
-          }),
-        },
-        {
-          type: "delta",
-          settled: true,
-          delta: encodeTeamGatherSubscriptionDelta({
-            updated: [{ rowId, name: "leaf" }],
-            updatedOccurrenceKeys: [resultKey],
-          }),
-        },
-      ],
-      teamsSchema,
-    );
-    const deltas: RuntimeSubscriptionDelta[] = [];
-    const handle = runtime.createSubscription(
-      JSON.stringify({ table: "teams", relation_ir: supportedGatherRelationIr("teams") }),
-      null,
-      null,
-      null,
-    );
-
-    runtime.executeSubscription(handle, (delta: RuntimeSubscriptionDelta) => deltas.push(delta));
-
-    expect(deltas).toHaveLength(1);
-    expect(deltas[0]!.reset).toBe(true);
-    expect(runtimeDeltaChanges(deltas[0]!)).toEqual([
-      {
-        kind: 0,
-        id: `result:${Array.from(resultKey, (byte) => byte.toString(16).padStart(2, "0")).join("")}`,
-        index: 0,
-        row: {
-          id: formatUuid(rowId),
-          values: [{ type: "Text", value: "leaf" }, { type: "Null" }, { type: "Null" }],
-        },
-      },
-    ]);
-    runtime.close();
-  });
-
-  it("fails loudly when a settled Gather chunk still carries unresolved placeholder rows", async () => {
-    const teamsSchema = {
-      teams: {
-        columns: [
-          { name: "name", column_type: { type: "Text" }, nullable: false },
-          { name: "org_id", column_type: { type: "Uuid" }, nullable: true },
-          { name: "parent_id", column_type: { type: "Uuid" }, nullable: true },
-        ],
-      },
-    } satisfies WasmSchema;
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000552");
-    const runtime = runtimeWithNativeRelationSubscriptionChunks(
-      [
-        {
-          type: "delta",
-          reset: true,
-          settled: true,
-          delta: encodeTeamGatherSubscriptionDelta({
-            added: [{ rowId, name: null }],
-            addedOccurrenceKeys: [typedOccurrenceKey("settled-unresolved")],
-          }),
-        },
-      ],
-      teamsSchema,
-    );
-    const callbacks: unknown[][] = [];
-    const handle = runtime.createSubscription(
-      JSON.stringify({ table: "teams", relation_ir: supportedGatherRelationIr("teams") }),
-      null,
-      null,
-      null,
-    );
-
-    runtime.executeSubscription(handle, (...args: unknown[]) => callbacks.push(args));
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(callbacks).toHaveLength(1);
-    const error = callbacks[0]![0];
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toContain(
-      "settled relation subscription chunk retained unresolved placeholder rows",
-    );
-    runtime.close();
-  });
-
-  it("silently closes unresolved Gather placeholder buffers before first visible delivery", async () => {
-    const teamsSchema = {
-      teams: {
-        columns: [
-          { name: "name", column_type: { type: "Text" }, nullable: false },
-          { name: "org_id", column_type: { type: "Uuid" }, nullable: true },
-          { name: "parent_id", column_type: { type: "Uuid" }, nullable: true },
-        ],
-      },
-    } satisfies WasmSchema;
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000553");
-    const runtime = runtimeWithNativeRelationSubscriptionChunks(
-      [
-        {
-          type: "delta",
-          reset: true,
-          settled: false,
-          delta: encodeTeamGatherSubscriptionDelta({
-            added: [{ rowId, name: null }],
-            addedOccurrenceKeys: [typedOccurrenceKey("close-before-visible")],
-          }),
-        },
-        { type: "closed" },
-      ],
-      teamsSchema,
-    );
-    const callbacks: unknown[][] = [];
-    const handle = runtime.createSubscription(
-      JSON.stringify({ table: "teams", relation_ir: supportedGatherRelationIr("teams") }),
-      null,
-      null,
-      null,
-    );
-
-    runtime.executeSubscription(handle, (...args: unknown[]) => callbacks.push(args));
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(callbacks).toEqual([]);
-    const subscription = (
-      runtime as unknown as {
-        subscriptions: Map<
-          number,
-          {
-            cancelled: boolean;
-            deferredVisiblePublication: boolean;
-            deferredVisibleReset: boolean;
-            deferredTerminalOperations: unknown[];
-            deferredPlaceholderChunks: number;
-            deferredPlaceholderRows: number;
-            deferredPlaceholderBytes: number;
-          }
-        >;
-      }
-    ).subscriptions.get(handle);
-    expect(subscription?.cancelled).toBe(true);
-    expect(subscription?.deferredVisiblePublication).toBe(false);
-    expect(subscription?.deferredVisibleReset).toBe(false);
-    expect(subscription?.deferredTerminalOperations).toEqual([]);
-    expect(subscription?.deferredPlaceholderChunks).toBe(0);
-    expect(subscription?.deferredPlaceholderRows).toBe(0);
-    expect(subscription?.deferredPlaceholderBytes).toBe(0);
-    runtime.close();
-  });
-
-  it("fails loudly when unresolved Gather placeholder buffering exceeds explicit bounds", async () => {
-    const teamsSchema = {
-      teams: {
-        columns: [
-          { name: "name", column_type: { type: "Text" }, nullable: false },
-          { name: "org_id", column_type: { type: "Uuid" }, nullable: true },
-          { name: "parent_id", column_type: { type: "Uuid" }, nullable: true },
-        ],
-      },
-    } satisfies WasmSchema;
-    const rowId = uuidBytes("00000000-0000-0000-0000-000000000554");
-    const resultKey = typedOccurrenceKey("buffer-limit");
-    const chunks = [
-      {
-        type: "delta" as const,
-        reset: true,
-        settled: false,
-        delta: encodeTeamGatherSubscriptionDelta({
-          added: [{ rowId, name: null }],
-          addedOccurrenceKeys: [resultKey],
-        }),
-      },
-      ...Array.from({ length: 16 }, () => ({
-        type: "delta" as const,
-        settled: false,
-        delta: encodeTeamGatherSubscriptionDelta({
-          updated: [{ rowId, name: null }],
-          updatedOccurrenceKeys: [resultKey],
-        }),
-      })),
-    ];
-    const runtime = runtimeWithNativeRelationSubscriptionChunks(chunks, teamsSchema);
-    const callbacks: unknown[][] = [];
-    const handle = runtime.createSubscription(
-      JSON.stringify({ table: "teams", relation_ir: supportedGatherRelationIr("teams") }),
-      null,
-      null,
-      null,
-    );
-
-    runtime.executeSubscription(handle, (...args: unknown[]) => callbacks.push(args));
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(callbacks).toHaveLength(1);
-    const error = callbacks[0]![0];
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toContain(
-      "relation subscription buffered unresolved placeholder rows beyond bounded limits",
-    );
-    runtime.close();
-  });
-
   it("rewraps user field option bytes when packed reset frames filter engine records", () => {
     const schema = {
       notes: {
@@ -5420,12 +5030,12 @@ describe("NativeRuntimeAdapter server transport", () => {
       ),
     );
 
-    const applied = applySubscriptionDeltaWithRootDelta([], nativeDelta, schema, true, {
+    const applied = decodeSubscriptionDelta(nativeDelta, schema, true, {
       rootTable: "notes",
       rootColumns: publicColumns,
     });
 
-    const [change] = runtimeDeltaChanges(applied.rootDelta);
+    const [change] = runtimeDeltaChanges(applied);
     expect(change?.kind).toBe(0);
     if (!change || change.kind !== 0) throw new Error("expected inserted row");
     expect(change.row.values).toEqual([
@@ -5487,7 +5097,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     );
 
     expect(() =>
-      applySubscriptionDeltaWithRootDelta([], nativeDelta, schema, true, {
+      decodeSubscriptionDelta(nativeDelta, schema, true, {
         rootTable: "notes",
         rootColumns: publicColumns,
       }),
@@ -5521,7 +5131,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     );
 
     expect(() =>
-      applySubscriptionDeltaWithRootDelta([], nativeDelta, schema, true, {
+      decodeSubscriptionDelta(nativeDelta, schema, true, {
         rootTable: "notes",
         rootColumns: publicColumns,
       }),
@@ -5534,8 +5144,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () =>
-              encodeRows([
+            all: (query: Uint8Array) => {
+              preparedBytes = query;
+              return encodeRows([
                 {
                   table: "todos",
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000001"),
@@ -5546,10 +5157,7 @@ describe("NativeRuntimeAdapter server transport", () => {
                   rowId: uuidBytes("00000000-0000-0000-0000-000000000002"),
                   title: "keep",
                 },
-              ]),
-            prepareQuery: (query: Uint8Array) => {
-              preparedBytes = query;
-              return {};
+              ]);
             },
             tick: () => undefined,
           }),
@@ -5596,13 +5204,7 @@ describe("NativeRuntimeAdapter server transport", () => {
         values: [{ type: "Text", value: "keep" }],
       },
     ]);
-    expect(readPreparedUuidComparison(preparedBytes!)).toMatchObject({
-      table: "todos",
-      predicateTag: 6,
-      column: "id",
-      literalTag: 9,
-      value: "00000000-0000-0000-0000-000000000001",
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
   it("pushes limits with native id predicates", async () => {
@@ -5611,10 +5213,9 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -5654,19 +5255,18 @@ describe("NativeRuntimeAdapter server transport", () => {
       }),
     );
 
-    expect(readPreparedLimit(preparedBytes!)).toBe(1);
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 
-  it("lowers root order and pagination into the prepared core query", async () => {
+  it("carries relation order and pagination in the Query envelope", async () => {
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
         openMemory: () =>
           fakeDb({
-            all: () => new Uint8Array([0]),
-            prepareQuery: (query: Uint8Array) => {
+            all: (query: Uint8Array) => {
               preparedBytes = query;
-              return {};
+              return new Uint8Array([0]);
             },
             tick: () => undefined,
           }),
@@ -5724,16 +5324,7 @@ describe("NativeRuntimeAdapter server transport", () => {
       }),
     );
 
-    expect(readPreparedQueryShape(preparedBytes!)).toEqual({
-      table: "todos",
-      predicates: [{ column: "title", opTag: 3, literalTag: 6, value: "ship it" }],
-      orderBy: [
-        { column: "priority", directionTag: 1 },
-        { column: "title", directionTag: 0 },
-      ],
-      limit: 10,
-      offset: 5,
-    });
+    expectPreparedRelationEnvelope(preparedBytes!, "todos");
   });
 });
 
@@ -6416,7 +6007,6 @@ function emptyNativeRuntime(): NativeRuntimeAdapter {
       openMemory: () =>
         fakeDb({
           all: () => new Uint8Array([0]),
-          prepareQuery: () => ({}),
           subscribe: () => new ReadableStream(),
           tick: () => undefined,
         }),
@@ -6437,7 +6027,6 @@ function runtimeWithSubscriptionSource(source: unknown): NativeRuntimeAdapter {
     {
       openMemory: () =>
         fakeDb({
-          prepareQuery: () => ({}),
           subscribe: () => source,
           tick: () => undefined,
         }),
@@ -6465,7 +6054,6 @@ function runtimeWithNativeSubscriptionChunk(
       openMemory: () =>
         fakeDb({
           all: () => new Uint8Array([0]),
-          prepareQuery: () => ({}),
           subscribe: () => ({
             readAll: () => chunks.splice(0),
             close: () => true,
@@ -6766,6 +6354,15 @@ function readPreparedQueryTail(
   return { select, orderBy, limit, offset };
 }
 
+function expectPreparedRelationEnvelope(query: Uint8Array, table: string, select?: string[]): void {
+  const reader = new PostcardReader(query);
+  expect(reader.string()).toBe(table);
+  expect(reader.readVec(() => undefined)).toEqual([]); // filters
+  const tail = readPreparedQueryTail(reader);
+  expect(tail).toEqual({ select, orderBy: [], limit: undefined, offset: 0 });
+  expect(reader.option(() => true)).toBe(true);
+}
+
 function readPreparedSelect(query: Uint8Array): string[] | undefined {
   const reader = new PostcardReader(query);
   reader.string();
@@ -6863,7 +6460,7 @@ function unsupportedProjectRelationIr(): unknown {
   return {
     Project: {
       input: { TableScan: { table: "todos" } },
-      columns: [{ source: { column: "title" }, alias: "title" }],
+      columns: [{ expr: { Column: { column: "title" } }, alias: "title" }],
     },
   };
 }
@@ -7030,6 +6627,14 @@ function encodeRelationSnapshot(rows: EncodedTestRow[], rootCount = rows.length)
   return writer.finish();
 }
 
+function subscriptionReset(rows: EncodedTestRow[]) {
+  return {
+    type: "delta",
+    reset: true,
+    delta: encodeSubscriptionDelta({ added: rows, updated: [], removed: [] }),
+  };
+}
+
 function encodeTerminalRelationSnapshot(schema: WasmSchema): Uint8Array {
   const childColumns = schema.todos!.columns;
   const rootColumns: ColumnDescriptor[] = [
@@ -7070,6 +6675,23 @@ function encodeTerminalRelationSnapshot(schema: WasmSchema): Uint8Array {
     }, 1);
   }, 1);
   return writer.finish();
+}
+
+function encodeTerminalSubscriptionDelta(schema: WasmSchema): Uint8Array {
+  const rowBatches = encodeTerminalRelationSnapshot(schema).subarray(1);
+  const suffix = new PostcardWriter();
+  suffix.vec(() => {}, 0); // updated rows
+  suffix.vec(() => {}, 0); // removed rows
+  const rowId = uuidBytes("00000000-0000-0000-0000-000000000001");
+  const resultKey = Uint8Array.from([1, ...rowId, 0, 0, 0, 0, 0, 0, 0, 0]);
+  suffix.vec((key) => key.bytes(resultKey), 1); // added occurrence keys
+  suffix.vec(() => {}, 0); // updated occurrence keys
+  suffix.vec(() => {}, 0); // removed occurrence keys
+  suffix.vec((index) => index.u64(0), 1); // added indices
+  suffix.vec(() => {}, 0); // updated previous indices
+  suffix.vec(() => {}, 0); // updated indices
+  suffix.vec(() => {}, 0); // removed indices
+  return concatBytes([rowBatches, suffix.finish()]);
 }
 
 function writeRowBatches(
@@ -7202,16 +6824,15 @@ it("keeps same-row union occurrences distinct through apply, removal, and reopen
       addedOccurrenceKeys: [direct, inherited],
     }),
   );
-  const first = applySubscriptionDeltaWithRootDelta([], initial, testSchema);
-  const firstDelta = runtimeDeltaChanges(first.rootDelta);
-  expect(first.rows).toHaveLength(2);
+  const first = decodeSubscriptionDelta(initial, testSchema);
+  const firstDelta = runtimeDeltaChanges(first);
   expect(firstDelta.map((change) => change.id)).toEqual([
     expect.stringContaining("result:01"),
     expect.stringContaining("result:01"),
   ]);
   expect(firstDelta[0]!.id).not.toBe(firstDelta[1]!.id);
   const manager = new SubscriptionManager<{ id: string; title: string }>();
-  const transformed = manager.handleDelta(first.rootDelta, (row) => ({
+  const transformed = manager.handleDelta(first, (row) => ({
     id: row.id,
     title: row.values[0]?.type === "Text" ? row.values[0].value : "",
   }));
@@ -7229,12 +6850,11 @@ it("keeps same-row union occurrences distinct through apply, removal, and reopen
       updatedOccurrenceKeys: [inherited],
     }),
   );
-  const afterUpdate = applySubscriptionDeltaWithRootDelta(first.rows, update, testSchema);
-  const updatedDelta = runtimeDeltaChanges(afterUpdate.rootDelta);
+  const afterUpdate = decodeSubscriptionDelta(update, testSchema);
+  const updatedDelta = runtimeDeltaChanges(afterUpdate);
   expect(updatedDelta).toHaveLength(1);
   expect(updatedDelta[0]!.id).toBe(firstDelta[1]!.id);
-  expect(afterUpdate.rows).toHaveLength(2);
-  const publicUpdate = manager.handleDelta(afterUpdate.rootDelta, (row) => ({
+  const publicUpdate = manager.handleDelta(afterUpdate, (row) => ({
     id: row.id,
     title: row.values[0]?.type === "Text" ? row.values[0].value : "",
   }));
@@ -7250,16 +6870,14 @@ it("keeps same-row union occurrences distinct through apply, removal, and reopen
       removedOccurrenceKeys: [direct],
     }),
   );
-  const second = applySubscriptionDeltaWithRootDelta(afterUpdate.rows, removal, testSchema);
-  expect(second.rows).toHaveLength(1);
-  expect(runtimeDeltaChanges(second.rootDelta)[0]!.id).toBe(firstDelta[0]!.id);
-  const publicRemoval = manager.handleDelta(second.rootDelta, (row) => ({ id: row.id, title: "" }));
+  const second = decodeSubscriptionDelta(removal, testSchema);
+  expect(runtimeDeltaChanges(second)[0]!.id).toBe(firstDelta[0]!.id);
+  const publicRemoval = manager.handleDelta(second, (row) => ({ id: row.id, title: "" }));
   expect(publicRemoval.all).toHaveLength(1);
   applySubscriptionDelta(publicRows, publicRemoval);
   expect(publicRows).toHaveLength(1);
 
-  const reopened = applySubscriptionDeltaWithRootDelta(
-    [],
+  const reopened = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: [{ table: "todos", rowId, title: "inherited" }],
@@ -7271,8 +6889,13 @@ it("keeps same-row union occurrences distinct through apply, removal, and reopen
     testSchema,
     true,
   );
-  expect(reopened.rows).toHaveLength(1);
-  expect(runtimeDeltaChanges(reopened.rootDelta)[0]!.id).toBe(firstDelta[1]!.id);
+  expect(runtimeDeltaChanges(reopened)[0]!.id).toBe(firstDelta[1]!.id);
+  const publicReset = manager.handleDelta(reopened, (row) => ({
+    id: row.id,
+    title: row.values[0]?.type === "Text" ? row.values[0].value : "",
+  }));
+  applySubscriptionDelta(publicRows, publicReset);
+  expect(publicRows).toEqual([{ id: formatUuid(rowId), title: "inherited" }]);
 });
 
 it("uses Rust's explicit indices for root replacement and movement", () => {
@@ -7282,8 +6905,7 @@ it("uses Rust's explicit indices for root replacement and movement", () => {
     return bytes;
   });
   const decode = (bytes: Uint8Array) => readNativeSubscriptionDelta(new PostcardReader(bytes));
-  const initial = applySubscriptionDeltaWithRootDelta(
-    [],
+  const initial = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: ids.map((rowId, index) => ({ table: "todos", rowId, title: `todo-${index}` })),
@@ -7293,9 +6915,12 @@ it("uses Rust's explicit indices for root replacement and movement", () => {
     ),
     testSchema,
   );
+  const manager = new SubscriptionManager<{ id: string }>();
+  const apply = (delta: RuntimeSubscriptionDelta) =>
+    manager.handleDelta(delta, (row) => ({ id: row.id })).all?.map((row) => row.id);
+  expect(apply(initial)).toEqual(ids.map((id) => formatUuid(id)));
   const replaced = ids[0]!;
-  const afterTitleOnlyReplacement = applySubscriptionDeltaWithRootDelta(
-    initial.rows,
+  const afterTitleOnlyReplacement = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: [],
@@ -7308,15 +6933,12 @@ it("uses Rust's explicit indices for root replacement and movement", () => {
     testSchema,
   );
 
-  expect(afterTitleOnlyReplacement.rows.map((row) => row.id)).toEqual(
-    ids.map((id) => formatUuid(id)),
-  );
-  expect(runtimeDeltaChanges(afterTitleOnlyReplacement.rootDelta)).toEqual([
+  expect(apply(afterTitleOnlyReplacement)).toEqual(ids.map((id) => formatUuid(id)));
+  expect(runtimeDeltaChanges(afterTitleOnlyReplacement)).toEqual([
     expect.objectContaining({ id: formatUuid(replaced), index: 0 }),
   ]);
 
-  const afterSortReplacement = applySubscriptionDeltaWithRootDelta(
-    afterTitleOnlyReplacement.rows,
+  const afterSortReplacement = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: [],
@@ -7328,15 +6950,14 @@ it("uses Rust's explicit indices for root replacement and movement", () => {
     ),
     testSchema,
   );
-  expect(afterSortReplacement.rows.map((row) => row.id)).toEqual([
+  expect(apply(afterSortReplacement)).toEqual([
     formatUuid(ids[1]!),
     formatUuid(ids[2]!),
     formatUuid(replaced),
   ]);
 
   const moved = ids[2]!;
-  const afterExplicitMove = applySubscriptionDeltaWithRootDelta(
-    afterSortReplacement.rows,
+  const afterExplicitMove = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: [],
@@ -7348,7 +6969,7 @@ it("uses Rust's explicit indices for root replacement and movement", () => {
     ),
     testSchema,
   );
-  expect(afterExplicitMove.rows.map((row) => row.id)).toEqual([
+  expect(apply(afterExplicitMove)).toEqual([
     formatUuid(moved),
     formatUuid(ids[1]!),
     formatUuid(replaced),
@@ -7359,8 +6980,7 @@ it("preserves the producer's explicit position over lazy relation state", () => 
   const rowId = new Uint8Array(16);
   rowId[15] = 3;
   const decode = (bytes: Uint8Array) => readNativeSubscriptionDelta(new PostcardReader(bytes));
-  const applied = applySubscriptionDeltaWithRootDelta(
-    [],
+  const applied = decodeSubscriptionDelta(
     decode(
       encodeSubscriptionDelta({
         added: [{ table: "todos", rowId, title: "third" }],
@@ -7374,7 +6994,7 @@ it("preserves the producer's explicit position over lazy relation state", () => 
     null,
   );
 
-  expect(runtimeDeltaChanges(applied.rootDelta)).toEqual([
+  expect(runtimeDeltaChanges(applied)).toEqual([
     expect.objectContaining({ id: formatUuid(rowId), index: 2 }),
   ]);
 });
@@ -7603,7 +7223,6 @@ function fakeDb<T extends object>(db: T): T & NativeDbForTest {
     // it. Individual tests can still explicitly set this to `undefined` when
     // exercising the missing-binding diagnostic.
     wireFeatures: () => CLIENT_WIRE_FEATURES,
-    prepareQuery: () => ({}),
     setTickScheduler: () => undefined,
     onMutationError: () => undefined,
     beginTransaction: (
@@ -7710,13 +7329,13 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-it("retains deferred admission failure until execute installs its callback", async () => {
-  const failure = new Error("planted preparation failure");
+it("retains deferred subscription failure until execute installs its callback", async () => {
+  const failure = new Error("planted subscription failure");
   const runtime = new NativeRuntimeAdapter(
     {
       openMemory: () =>
         fakeDb({
-          prepareQuery: () => ({
+          subscribe: () => ({
             poll: () => {
               throw failure;
             },
@@ -7744,7 +7363,7 @@ it("retains deferred admission failure until execute installs its callback", asy
 });
 
 it.each([null, undefined])(
-  "wakes pending admission while an async transport tick waits on its owner (pending %s)",
+  "wakes a pending subscription while an async transport tick waits on its owner (pending %s)",
   async (pendingResult) => {
     let polls = 0;
     let wake = () => {};
@@ -7756,7 +7375,7 @@ it.each([null, undefined])(
       {
         openMemory: () =>
           fakeDb({
-            prepareQuery: () => ({
+            subscribe: () => ({
               poll: () => {
                 polls++;
                 if (polls === 1) {
@@ -7764,7 +7383,7 @@ it.each([null, undefined])(
                   return pendingResult;
                 }
                 releaseOwner();
-                return {};
+                return new ReadableStream();
               },
               cancel: () => {},
               setWake: (callback: () => void) => {
@@ -7786,19 +7405,19 @@ it.each([null, undefined])(
     const inner = runtime as unknown as Record<string, any>;
     inner.serverTransport = { recvWireFrames: () => [], close: () => {} };
     inner.serverCarrier = { send: () => {}, close: () => {} };
-    const preparation = inner.prepareQueryForRead(JSON.stringify({ table: "todos" }), null);
+    const handle = runtime.createSubscription(JSON.stringify({ table: "todos" }));
     try {
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(polls).toBeGreaterThan(1);
     } finally {
       releaseOwner();
-      await preparation;
+      runtime.unsubscribe(handle);
       inner.closed = true;
     }
   },
 );
 
-it("cancels wake-driven admission before shutdown waits for its blocked tick", async () => {
+it("cancels a wake-driven subscription before shutdown waits for its blocked tick", async () => {
   let cancellations = 0;
   let releaseOwner!: () => void;
   const ownerReleased = new Promise<void>((resolve) => {
@@ -7808,7 +7427,7 @@ it("cancels wake-driven admission before shutdown waits for its blocked tick", a
     {
       openMemory: () =>
         fakeDb({
-          prepareQuery: () => ({
+          subscribe: () => ({
             poll: () => null,
             setWake: () => {},
             cancel: () => {
@@ -7831,22 +7450,19 @@ it("cancels wake-driven admission before shutdown waits for its blocked tick", a
   const inner = runtime as unknown as Record<string, any>;
   inner.serverTransport = { recvWireFrames: () => [], close: () => {} };
   inner.serverCarrier = { send: () => {}, close: () => {} };
-  const result = inner
-    .prepareQueryForRead(JSON.stringify({ table: "todos" }), null)
-    .catch((error: Error) => error);
+  runtime.createSubscription(JSON.stringify({ table: "todos" }));
   await runtime.close();
   expect(cancellations).toBeGreaterThan(0);
-  expect(await result).toEqual(new Error("native operation was cancelled"));
 });
 
-it("isolates throwing callbacks when replaying a deferred admission failure", async () => {
-  const failure = new Error("preparation rejected");
+it("isolates throwing callbacks when replaying a deferred subscription failure", async () => {
+  const failure = new Error("subscription rejected");
   const callbackFailure = new Error("user callback rejected");
   const runtime = new NativeRuntimeAdapter(
     {
       openMemory: () =>
         fakeDb({
-          prepareQuery: () => ({
+          subscribe: () => ({
             poll: () => {
               throw failure;
             },
@@ -7888,25 +7504,26 @@ it("isolates throwing callbacks when replaying a deferred admission failure", as
   }
 });
 
-it("keeps same-query admissions with different claims out of the shared prepared cache", async () => {
+it("passes different claims independently on same-query reads", async () => {
   const admitted: unknown[] = [];
   const setClaims = vi.fn();
   const runtime = new NativeRuntimeAdapter(
     {
       openMemory: () =>
         fakeDb({
-          prepareQuery: (
+          all: (
             _query: Uint8Array,
-            _kind: "query" | "relation",
+            _opts: unknown,
+            _transaction: unknown,
             identity: Uint8Array,
             claims: unknown,
           ) => {
-            const prepared = {
+            const admission = {
               identity: new Uint8Array(identity),
               claims: structuredClone(claims),
             };
-            admitted.push(prepared);
-            return { poll: () => prepared, setWake: () => {}, cancel: () => {} };
+            admitted.push(admission);
+            return encodeRows([]);
           },
           setIdentityClaims: setClaims,
           tick: () => undefined,
@@ -7922,21 +7539,20 @@ it("keeps same-query admissions with different claims out of the shared prepared
     true,
     { readAuthorizationHost: "trusted-serving" },
   );
-  const inner = runtime as unknown as Record<string, any>;
   const session = {
-    identity: TEST_RUNTIME_AUTHOR,
+    issuer: "https://issuer.example",
+    user_id: "same-query-reader",
     claims: { team: "team-a" },
-    backendAuthority: false,
+    authMode: "external",
   };
-  const a = await inner.prepareQueryForRead(JSON.stringify({ table: "todos" }), session);
-  const b = await inner.prepareQueryForRead(JSON.stringify({ table: "todos" }), {
-    ...session,
-    claims: { team: "team-b" },
-  });
-  expect(a).not.toBe(b);
+  await runtime.query(JSON.stringify({ table: "todos" }), JSON.stringify(session));
+  await runtime.query(
+    JSON.stringify({ table: "todos" }),
+    JSON.stringify({ ...session, claims: { team: "team-b" } }),
+  );
   expect(admitted).toHaveLength(2);
-  expect(a.claims).toEqual({ team: "team-a" });
-  expect(b.claims).toEqual({ team: "team-b" });
+  expect((admitted[0] as { claims: unknown }).claims).toMatchObject({ team: "team-a" });
+  expect((admitted[1] as { claims: unknown }).claims).toMatchObject({ team: "team-b" });
   expect(setClaims).not.toHaveBeenCalled();
   await runtime.close();
 });

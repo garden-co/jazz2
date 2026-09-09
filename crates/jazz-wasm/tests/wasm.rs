@@ -286,17 +286,12 @@ fn values_from_batches(batches: &[DecodedRowBatch]) -> BTreeMap<String, Value> {
 #[wasm_bindgen_test(async)]
 async fn public_wasm_large_values_hydrate_before_read_and_subscription_encoding() {
     // This is deliberately through the wasm-bindgen exported surface: public
-    // schema JSON + postcard open config, streaming mutation promises, prepared
-    // query, unified read promise, and ReadableStream pulls.
+    // schema JSON + postcard open config, streaming mutation promises,
+    // serialized queries, unified read promise, and ReadableStream pulls.
     let db = fixture_db();
-    let query = db
-        .prepare_query(
-            postcard::to_allocvec(&Query::from("values")).expect("encode query"),
-            "query".to_owned(),
-        )
-        .expect("prepare public query");
+    let query = postcard::to_allocvec(&Query::from("values")).expect("encode query");
     let reader = stream_reader(
-        db.subscribe(&query, JsValue::NULL, None)
+        db.subscribe(query.clone(), JsValue::NULL, None, JsValue::UNDEFINED)
             .expect("create public subscription"),
     );
 
@@ -395,7 +390,7 @@ async fn public_wasm_large_values_hydrate_before_read_and_subscription_encoding(
     let sync_opts = serde_wasm_bindgen::to_value(&serde_json::json!({ "sync": true }))
         .expect("encode synchronous read options");
     let synchronous_error = db
-        .all(&query, sync_opts, None, None)
+        .all(query.clone(), sync_opts, None, None, JsValue::UNDEFINED)
         .expect_err("synchronous public read must reject an indirect scalar");
     assert!(
         synchronous_error
@@ -405,7 +400,7 @@ async fn public_wasm_large_values_hydrate_before_read_and_subscription_encoding(
     );
 
     let read = db
-        .all(&query, JsValue::NULL, None, None)
+        .all(query, JsValue::NULL, None, None, JsValue::UNDEFINED)
         .expect("start public read")
         .dyn_into::<js_sys::Promise>()
         .expect("asynchronous all returns a promise");
@@ -414,8 +409,9 @@ async fn public_wasm_large_values_hydrate_before_read_and_subscription_encoding(
         .dyn_into::<js_sys::Uint8Array>()
         .expect("read resolves Uint8Array")
         .to_vec();
-    let read_values =
-        values_from_batches(&postcard::from_bytes(&read_bytes).expect("decode public read rows"));
+    let batches: Vec<DecodedRowBatch> =
+        postcard::from_bytes(&read_bytes).expect("decode public read rows");
+    let read_values = values_from_batches(&batches);
     assert_eq!(read_values.get("text"), Some(&Value::String(text)));
     assert_eq!(read_values.get("bytes"), Some(&Value::Bytes(bytes)));
     assert_eq!(read_values.get("json"), Some(&Value::String(json)));

@@ -248,7 +248,7 @@ fn server_reset_subscription_materializes_without_local_snapshot_eval() {
 
     let query = Query::from("todos");
     let mut subscription = prepared_subscribe(&client, &query, global_subscribe_opts()).unwrap();
-    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+    assert!(subscription.try_next_event().is_none());
 
     client.tick().unwrap();
     server.tick().unwrap();
@@ -269,7 +269,7 @@ fn server_reset_subscription_materializes_without_local_snapshot_eval() {
         "authoritative server reset should not re-run the subscription query locally"
     );
 
-    let event = block_on(subscription.next_raw()).unwrap();
+    let event = next_settled_opening(&mut subscription);
     let SubscriptionEvent::Delta {
         reset,
         added,
@@ -564,12 +564,12 @@ fn client_tier_routing_scans_local_overlay_but_uses_global_settled_members_at_ed
     db.detach_query(reattached);
     let mut edge_subscription =
         block_on(db.subscribe(&prepared, edge_subscribe_opts())).expect("open edge subscription");
-    assert!(opened_rows(block_on(edge_subscription.next_raw()).unwrap()).is_empty());
+    assert!(edge_subscription.try_next_event().is_none());
     db.tick().unwrap();
     server.tick().unwrap();
     db.tick().unwrap();
     assert_eq!(
-        ids(opened_rows(block_on(edge_subscription.next_raw()).unwrap())),
+        ids(opened_rows(next_settled_opening(&mut edge_subscription))),
         BTreeSet::from([published]),
         "Edge maintained facades consume Global result members instead of raw local rows"
     );

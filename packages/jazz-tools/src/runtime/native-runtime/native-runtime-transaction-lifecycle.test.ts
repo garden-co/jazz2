@@ -151,7 +151,6 @@ it("quiesces foreground mutation admission before capturing its final HLC", asyn
         fakeDb({
           foregroundTxTimeHighWater: () => 41n,
           insert,
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -197,7 +196,6 @@ it("drains an already admitted streaming mutation before returning its foregroun
         fakeDb({
           foregroundTxTimeHighWater: () => highWater,
           beginStreamingMutation,
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -258,7 +256,6 @@ it("waits for a failed stream's native abort before foreground handoff", async (
             finish: () => fakeWrite(),
             abort,
           }),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -320,7 +317,6 @@ it("does not let a concurrent close preempt foreground HLC capture", async () =>
             finish: () => fakeWrite(),
             abort: () => true,
           }),
-          prepareQuery: () => ({}),
           tick: () => undefined,
           close: () => {
             order.push("close");
@@ -367,7 +363,6 @@ it("awaits the binding-owned native close promise", async () => {
       openMemory: () =>
         fakeDb({
           foregroundTxTimeHighWater: () => 0n,
-          prepareQuery: () => ({}),
           tick: () => undefined,
           close: () => closeGate,
         }),
@@ -416,7 +411,6 @@ it("waits for every concurrently admitted stream before foreground handoff", asy
             },
             abort: () => true,
           }),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -486,7 +480,6 @@ it("stages authenticated client mutations through the optimistic local core path
             staged.push(table);
             return { ...fakeWrite(), rowId: options?.rowId ?? new Uint8Array(16) };
           },
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -534,7 +527,6 @@ it("preserves logical user columns that share names with native storage metadata
             ...fakeWrite(),
             rowId: options?.rowId ?? new Uint8Array(16),
           }),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -586,7 +578,6 @@ it("uses identity-aware core txs only on an explicit trusted-serving host", () =
             staged.push(table);
             return options?.rowId ?? new Uint8Array(16);
           },
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -631,7 +622,6 @@ it("binds a trusted-serving exclusive transaction to its opening identity", () =
       openMemory: () => {
         const db = fakeDb({
           all: () => encodeRows([]),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }) as unknown as {
           beginTransaction(
@@ -694,9 +684,11 @@ it("uses the opening identity for trusted-serving transaction reads", async () =
             _opts: unknown,
             receivedTransactionId: string,
             receivedIdentity: Uint8Array,
+            receivedClaims: unknown,
           ) => {
             expect(receivedTransactionId).toBe(transactionId);
             expect(new TextDecoder().decode(receivedIdentity)).toBe(`["${issuer}","${alice}"]`);
+            expect(receivedClaims).toMatchObject({ team: "opening-team" });
             return encodeRows([
               {
                 table: "todos",
@@ -704,16 +696,6 @@ it("uses the opening identity for trusted-serving transaction reads", async () =
                 title: "Alice's pending row",
               },
             ]);
-          },
-          prepareQuery: (
-            _query: Uint8Array,
-            _kind: "query" | "relation",
-            identity: Uint8Array,
-            claims: unknown,
-          ) => {
-            expect(new TextDecoder().decode(identity)).toBe(`["${issuer}","${alice}"]`);
-            expect(claims).toMatchObject({ team: "opening-team" });
-            return {};
           },
           tick: () => undefined,
         }),
@@ -1146,7 +1128,6 @@ it("passes caller-supplied updatedAt into staged mergeable transaction writes", 
             _rowId: Uint8Array,
             options?: { updatedAtMs?: number },
           ) => staged.push({ op: "delete", updatedAtMs: options?.updatedAtMs }),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -1194,7 +1175,6 @@ it("preserves the full branch view for staged mergeable upserts", () => {
           ) => {
             received = options;
           },
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -1228,7 +1208,6 @@ it("rejects mixed identities within one trusted-serving mergeable transaction", 
       openMemory: () =>
         fakeDb({
           all: () => encodeRows([]),
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {
@@ -1293,7 +1272,6 @@ it("keeps session-scoped transaction reads on the client-local native method", a
               },
             ]);
           },
-          prepareQuery: () => ({}),
           tick: () => undefined,
         }),
       openBrowser: async () => {

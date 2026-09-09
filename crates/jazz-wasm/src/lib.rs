@@ -21,9 +21,9 @@ use idb_tree::IndexedDbPageStore;
 use jazz::db::{
     block_on, ConnectionSessionContext, Db, DbConfig, DbIdentity, Error, ErrorCode,
     InitialSyncFlushCadence, LargeValueUpdate, LocalUpdates, MutationErrorCallback, PeerConnection,
-    PermissionAdvice, PreparedQuery, Propagation, QueryAttachment, ReadOpts, RowCells,
-    SeededRowIdSource, StreamingMutationKind, StreamingValueUpload, SubscriptionEvent,
-    TickScheduler, TickUrgency, WireTransportAdapter, WriteHandle,
+    PermissionAdvice, Propagation, ReadOpts, RowCells, SeededRowIdSource, SerializedReadResult,
+    SerializedSubscriptionAuthorization, StreamingMutationKind, StreamingValueUpload,
+    SubscriptionEvent, TickScheduler, TickUrgency, WireTransportAdapter, WriteHandle,
 };
 use jazz::groove::records::Value;
 #[cfg(target_arch = "wasm32")]
@@ -31,7 +31,6 @@ use jazz::groove::storage::IdbStorage;
 use jazz::groove::storage::{MemoryStorage, OrderedKvStorage, ReopenableStorage};
 use jazz::ids::{AuthorSubject, NodeUuid, RowUuid};
 use jazz::protocol::{BranchSelector, BranchViewBase, PermissionAdviceAction, ReadViewSpec};
-use jazz::query::{Query, RelationQuery};
 use jazz::schema::JazzSchema;
 use jazz::tools::{OpenTransactionId, TransactionId};
 use jazz::tx::DurabilityTier;
@@ -240,12 +239,6 @@ pub struct WasmWriteResult {
     tx_id: jazz::tx::TxId,
 }
 
-#[wasm_bindgen]
-pub struct WasmPreparedQuery {
-    inner: PreparedQuery,
-    is_relation: bool,
-}
-
 type WasmReadFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, JsValue>> + 'static>>;
 
 #[wasm_bindgen(js_name = PendingNativeRead)]
@@ -302,49 +295,6 @@ fn pending_operation_waker(callback: js_sys::Function) -> Waker {
 type PendingWasmOperation<T> = RefCell<Option<Pin<Box<dyn Future<Output = Result<T, JsValue>>>>>>;
 
 #[wasm_bindgen]
-pub struct WasmPendingPreparation {
-    future: PendingWasmOperation<WasmPreparedQuery>,
-    wake: RefCell<Option<Waker>>,
-}
-
-impl WasmPendingPreparation {
-    fn poll_once(&self) -> Result<Option<WasmPreparedQuery>, JsValue> {
-        let Some(mut future) = self.future.borrow_mut().take() else {
-            return Err(to_js_error("native operation is complete or cancelled"));
-        };
-        let wake = self
-            .wake
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| Waker::noop().clone());
-        let mut context = Context::from_waker(&wake);
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => result.map(Some),
-            Poll::Pending => {
-                *self.future.borrow_mut() = Some(future);
-                Ok(None)
-            }
-        }
-    }
-}
-
-#[wasm_bindgen]
-impl WasmPendingPreparation {
-    #[wasm_bindgen(js_name = setWake)]
-    pub fn set_wake(&self, callback: js_sys::Function) {
-        *self.wake.borrow_mut() = Some(pending_operation_waker(callback));
-    }
-
-    pub fn poll(&self) -> Result<Option<WasmPreparedQuery>, JsValue> {
-        self.poll_once()
-    }
-    pub fn cancel(&self) {
-        self.future.borrow_mut().take();
-        self.wake.borrow_mut().take();
-    }
-}
-
-#[wasm_bindgen]
 pub struct WasmPendingSubscription {
     future: PendingWasmOperation<JsValue>,
     wake: RefCell<Option<Waker>>,
@@ -384,19 +334,6 @@ impl WasmPendingSubscription {
     pub fn cancel(&self) {
         self.future.borrow_mut().take();
         self.wake.borrow_mut().take();
-    }
-}
-
-struct WasmQueryCoverageGuard {
-    db: WasmDbInner,
-    attachment: Option<QueryAttachment>,
-}
-
-impl Drop for WasmQueryCoverageGuard {
-    fn drop(&mut self) {
-        if let Some(attachment) = self.attachment.take() {
-            self.db.detach_query(attachment);
-        }
     }
 }
 
@@ -696,18 +633,6 @@ impl Clone for WasmDbInner {
 }
 
 impl WasmDbInner {
-    async fn hydrate_relation_snapshot_for_binding(
-        &self,
-        snapshot: &mut jazz::node::RelationSnapshot,
-    ) -> Result<(), jazz::db::Error> {
-        match self {
-            Self::Memory(db) => db.hydrate_relation_snapshot_for_binding(snapshot).await,
-            #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => db.hydrate_relation_snapshot_for_binding(snapshot).await,
-            Self::Closed => panic!("WasmDb is closed"),
-        }
-    }
-
     async fn hydrate_subscription_event_for_binding(
         &self,
         event: &mut SubscriptionEvent,
@@ -975,62 +900,68 @@ impl WasmDbInner {
         }
     }
 
-    fn all(
+    #[allow(clippy::too_many_arguments)]
+    async fn all_serialized_query(
         &self,
-        query: &PreparedQuery,
+        query: Vec<u8>,
         opts: ReadOpts,
-    ) -> Result<Vec<jazz::node::CurrentRow>, jazz::db::Error> {
-        with_wasm_db!(self, |db| block_on(db.all(query, opts)))
-    }
-
-    fn all_for_identity(
-        &self,
-        query: &PreparedQuery,
-        opts: ReadOpts,
-        author: AuthorSubject,
-    ) -> Result<Vec<jazz::node::CurrentRow>, jazz::db::Error> {
-        with_wasm_db!(self, |db| block_on(
-            db.all_for_identity(query, opts, author)
-        ))
-    }
-
-    async fn all_async(
-        &self,
-        query: &PreparedQuery,
-        opts: ReadOpts,
-    ) -> Result<Vec<jazz::node::CurrentRow>, jazz::db::Error> {
+        open_tx: Option<OpenTransactionId>,
+        request_scope: Option<(AuthorSubject, BTreeMap<String, Value>)>,
+        author: Option<AuthorSubject>,
+        require_coverage: bool,
+        coverage_deadline_ms: f64,
+    ) -> Result<SerializedReadResult, Error> {
+        macro_rules! read {
+            ($db:expr) => {{
+                let owner = Rc::clone($db);
+                let release_db = Rc::clone($db);
+                let future = async move {
+                    owner
+                        .all_serialized_query(
+                            &query,
+                            opts,
+                            open_tx,
+                            request_scope,
+                            author,
+                            require_coverage,
+                            || js_sys::Date::now() >= coverage_deadline_ms,
+                            move |attachment| release_db.detach_query(attachment),
+                        )
+                        .await
+                };
+                if let Some(open_tx) = open_tx {
+                    let pending = $db.enqueue_transaction_read(open_tx, future);
+                    #[allow(unused_variables)]
+                    if let WasmDbInner::Memory(memory) = self {
+                        memory.drive_queued_mutation_once();
+                    }
+                    pending.await.map_err(transaction_read_cancelled)?
+                } else {
+                    future.await
+                }
+            }};
+        }
         match self {
-            Self::Memory(db) => db.all(query, opts).await,
+            Self::Memory(db) => read!(db),
             #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => db.all(query, opts).await,
-            Self::Closed => panic!("WasmDb is closed"),
+            Self::Browser(db) => read!(db),
+            Self::Closed => Err(Error {
+                code: ErrorCode::Protocol,
+                message: "WasmDb is closed".into(),
+            }),
         }
     }
 
-    async fn all_for_identity_async(
+    async fn subscribe_serialized_query(
         &self,
-        query: &PreparedQuery,
+        query: Vec<u8>,
         opts: ReadOpts,
-        author: AuthorSubject,
-    ) -> Result<Vec<jazz::node::CurrentRow>, jazz::db::Error> {
-        match self {
-            Self::Memory(db) => db.all_for_identity(query, opts, author).await,
-            #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => db.all_for_identity(query, opts, author).await,
-            Self::Closed => panic!("WasmDb is closed"),
-        }
-    }
-
-    async fn hydrate_rows_for_binding(
-        &self,
-        rows: &mut [jazz::node::CurrentRow],
-    ) -> Result<(), jazz::db::Error> {
-        match self {
-            Self::Memory(db) => db.hydrate_rows_for_binding(rows).await,
-            #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => db.hydrate_rows_for_binding(rows).await,
-            Self::Closed => panic!("WasmDb is closed"),
-        }
+        request_scope: Option<(AuthorSubject, BTreeMap<String, Value>)>,
+        authorization: SerializedSubscriptionAuthorization,
+    ) -> Result<jazz::db::SubscriptionStream, Error> {
+        with_wasm_db!(self, |db| db
+            .subscribe_serialized_query(&query, opts, request_scope, authorization)
+            .await)
     }
 
     fn begin_exclusive(
@@ -1069,56 +1000,6 @@ impl WasmDbInner {
             #[cfg(target_arch = "wasm32")]
             Self::Browser(db) => db.enqueue_begin_mergeable(id, author, attribution),
             Self::Closed => panic!("WasmDb is closed"),
-        }
-    }
-
-    async fn transaction_rows(
-        &self,
-        tx_id: OpenTransactionId,
-        query: PreparedQuery,
-        author: Option<AuthorSubject>,
-        opts: ReadOpts,
-    ) -> Result<Vec<jazz::node::CurrentRow>, Error> {
-        match self {
-            Self::Memory(db) => {
-                let pending = start_transaction_rows(db, tx_id, query, author, opts);
-                db.drive_queued_mutation_once();
-                pending.await.map_err(transaction_read_cancelled)?
-            }
-            #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => {
-                let pending = start_transaction_rows(db, tx_id, query, author, opts);
-                pending.await.map_err(transaction_read_cancelled)?
-            }
-            Self::Closed => Err(Error {
-                code: ErrorCode::Protocol,
-                message: "WasmDb is closed".into(),
-            }),
-        }
-    }
-
-    async fn transaction_relation_snapshot(
-        &self,
-        tx_id: OpenTransactionId,
-        query: PreparedQuery,
-        author: Option<AuthorSubject>,
-        opts: ReadOpts,
-    ) -> Result<jazz::node::RelationSnapshot, Error> {
-        match self {
-            Self::Memory(db) => {
-                let pending = start_transaction_relation_snapshot(db, tx_id, query, author, opts);
-                db.drive_queued_mutation_once();
-                pending.await.map_err(transaction_read_cancelled)?
-            }
-            #[cfg(target_arch = "wasm32")]
-            Self::Browser(db) => {
-                let pending = start_transaction_relation_snapshot(db, tx_id, query, author, opts);
-                pending.await.map_err(transaction_read_cancelled)?
-            }
-            Self::Closed => Err(Error {
-                code: ErrorCode::Protocol,
-                message: "WasmDb is closed".into(),
-            }),
         }
     }
 
@@ -1176,47 +1057,8 @@ impl WasmDbInner {
         }
     }
 
-    async fn all_relation_snapshot(
-        &self,
-        query: &PreparedQuery,
-        opts: ReadOpts,
-    ) -> Result<jazz::node::RelationSnapshot, jazz::db::Error> {
-        with_wasm_db!(self, |db| db.all_relation_snapshot(query, opts).await)
-    }
-
-    async fn all_relation_snapshot_for_identity(
-        &self,
-        query: &PreparedQuery,
-        opts: ReadOpts,
-        author: AuthorSubject,
-    ) -> Result<jazz::node::RelationSnapshot, jazz::db::Error> {
-        with_wasm_db!(self, |db| db
-            .all_relation_snapshot_for_identity(query, opts, author)
-            .await)
-    }
-
     fn set_identity_claims(&self, author: AuthorSubject, claims: BTreeMap<String, Value>) {
         with_wasm_db!(self, |db| db.set_identity_claims(author, claims))
-    }
-
-    async fn attach_query(
-        &self,
-        query: &PreparedQuery,
-        opts: ReadOpts,
-        open_tx: Option<OpenTransactionId>,
-        author: Option<AuthorSubject>,
-    ) -> Result<QueryAttachment, jazz::db::Error> {
-        with_wasm_db!(self, |db| db
-            .attach_query_with_opts_async(query, opts, open_tx, author)
-            .await)
-    }
-
-    fn query_attachment_is_covered(&self, attachment: &QueryAttachment) -> bool {
-        with_wasm_db!(self, |db| db.query_attachment_is_covered(attachment))
-    }
-
-    fn detach_query(&self, attachment: QueryAttachment) {
-        with_wasm_db!(self, |db| db.detach_query(attachment))
     }
 
     fn set_tick_scheduler(&self, callback: js_sys::Function) {
@@ -1241,42 +1083,6 @@ impl WasmDbInner {
     async fn tick(&self) -> Result<(), jazz::db::Error> {
         with_wasm_db!(self, |db| db.tick().await)
     }
-}
-
-fn start_transaction_rows<S>(
-    db: &Rc<Db<S>>,
-    tx_id: OpenTransactionId,
-    query: PreparedQuery,
-    author: Option<AuthorSubject>,
-    opts: ReadOpts,
-) -> oneshot::Receiver<Result<Vec<jazz::node::CurrentRow>, Error>>
-where
-    S: OrderedKvStorage + ReopenableStorage + 'static,
-{
-    let owner = Rc::clone(db);
-    db.enqueue_transaction_read(tx_id, async move {
-        owner
-            .all_in_open_transaction(tx_id, &query, opts, author)
-            .await
-    })
-}
-
-fn start_transaction_relation_snapshot<S>(
-    db: &Rc<Db<S>>,
-    tx_id: OpenTransactionId,
-    query: PreparedQuery,
-    author: Option<AuthorSubject>,
-    opts: ReadOpts,
-) -> oneshot::Receiver<Result<jazz::node::RelationSnapshot, Error>>
-where
-    S: OrderedKvStorage + ReopenableStorage + 'static,
-{
-    let owner = Rc::clone(db);
-    db.enqueue_transaction_read(tx_id, async move {
-        owner
-            .relation_snapshot_in_open_transaction(tx_id, &query, opts, author)
-            .await
-    })
 }
 
 fn transaction_read_cancelled(_: oneshot::Canceled) -> Error {
@@ -1892,67 +1698,14 @@ impl WasmDb {
             .map_err(to_js_error)
     }
 
-    #[wasm_bindgen(js_name = prepareQuery)]
-    pub fn prepare_query(
-        &self,
-        query: Vec<u8>,
-        kind: String,
-        author: Option<Vec<u8>>,
-        claims: JsValue,
-    ) -> Result<JsValue, JsValue> {
-        enum Input {
-            Query(Box<Query>),
-            Relation(RelationQuery),
-        }
-
-        let admission = author
-            .map(|author| {
-                let author = author_id_from_bytes(&author)?;
-                Ok::<_, JsValue>((author, claims_from_js(author, claims)?))
-            })
-            .transpose()?;
-        let input = match kind.as_str() {
-            "query" => Input::Query(Box::new(
-                jazz::wire::decode_postcard_exact(&query)
-                    .map_err(|err| to_js_error(format!("decode query: {err}")))?,
-            )),
-            "relation" => Input::Relation(relation_query_from_bytes(&query)?),
-            _ => {
-                return Err(JsValue::from_str(
-                    "prepared query kind must be query or relation",
-                ));
-            }
-        };
-        let is_relation = kind == "relation";
-        let db = self.open_inner()?;
-        let pending = WasmPendingPreparation {
-            wake: RefCell::new(None),
-            future: RefCell::new(Some(Box::pin(async move {
-                let inner = with_wasm_db!(&db, |db| match input {
-                    Input::Query(query) => db.prepare_query_async(&query).await,
-                    Input::Relation(query) => db.prepare_relation_query_async(&query).await,
-                })
-                .map_err(to_js_error)?;
-                let inner = match admission {
-                    Some((author, claims)) => inner.with_identity_claims(author, claims),
-                    None => inner,
-                };
-                Ok(WasmPreparedQuery { inner, is_relation })
-            }))),
-        };
-        match pending.poll_once()? {
-            Some(query) => Ok(query.into()),
-            None => Ok(pending.into()),
-        }
-    }
-
     #[wasm_bindgen(js_name = all)]
     pub fn all(
         &self,
-        query: &WasmPreparedQuery,
+        query: Vec<u8>,
         opts: JsValue,
         open_transaction_id: Option<String>,
         author: Option<Vec<u8>>,
+        claims: JsValue,
     ) -> Result<JsValue, JsValue> {
         let inner = self.open_inner()?;
         let tier_is_explicit = if opts.is_null() || opts.is_undefined() {
@@ -1960,28 +1713,21 @@ impl WasmDb {
         } else {
             optional_string_prop(&opts, "tier")?.is_some()
         };
-        let synchronous = optional_bool_prop(&opts, "sync")?.unwrap_or(false);
         let opts = read_opts_from_js(opts)?;
+        let has_explicit_author = author.is_some();
         let author = self.read_author(author)?;
+        let admission = if has_explicit_author {
+            author
+                .map(|author| Ok::<_, JsValue>((author, claims_from_js(author, claims)?)))
+                .transpose()?
+        } else {
+            None
+        };
         let open_tx = open_transaction_id
             .map(|id| id.parse::<OpenTransactionId>())
             .transpose()
             .map_err(|error| JsValue::from_str(&error))?;
-        let is_relation = query.is_relation;
-        let query = query.inner.clone();
         let non_durable_client = self.non_durable_client.get();
-        if synchronous
-            && open_tx.is_none()
-            && !is_relation
-            && query.shape().query().array_subqueries.is_empty()
-        {
-            let rows = match author {
-                Some(author) => inner.all_for_identity(&query, opts, author),
-                None => inner.all(&query, opts),
-            }
-            .map_err(to_js_error)?;
-            return bytes_to_js(encode_synchronous_rows(&rows)?);
-        }
         let preceding_writes = open_tx
             .is_none()
             .then(|| with_wasm_db!(&inner, |db| db.queued_mutation_barrier()));
@@ -1996,161 +1742,23 @@ impl WasmDb {
                 && (non_durable_client
                     || (opts.tier >= DurabilityTier::Edge
                         && opts.propagation == Propagation::Full));
-
-            // Output-changing relation plans are maintained through the
-            // subscription compiler. Consume its first settled reset for a
-            // one-shot read so the worker-owned coverage and the returned
-            // relation use the same binding. This remains an implementation
-            // detail of the single public `all` operation.
-            let mut relation_subscription_covered = false;
-            if is_relation && open_tx.is_none() && requires_coverage {
-                let mut stream = with_wasm_db!(&inner, |db| match author {
-                    Some(author) =>
-                        db.subscribe_for_identity(&query, opts.clone(), author)
-                            .await,
-                    None => db.subscribe(&query, opts.clone()).await,
-                })
-                .map_err(to_js_error)?;
-                while let Some(event) = stream.next().await {
-                    match event {
-                        SubscriptionEvent::Delta {
-                            reset: true,
-                            publishable: true,
-                            settled: true,
-                            ..
-                        } => {
-                            relation_subscription_covered = true;
-                            break;
-                        }
-                        SubscriptionEvent::Rejected { reason } => {
-                            return Err(JsValue::from_str(&format!(
-                                "query subscription rejected: {reason:?}"
-                            )));
-                        }
-                        SubscriptionEvent::Closed => {
-                            return Err(JsValue::from_str(
-                                "query subscription closed before its settled result",
-                            ));
-                        }
-                        SubscriptionEvent::Delta { .. } => {}
-                    }
-                }
-                if !relation_subscription_covered {
-                    return Err(JsValue::from_str(
-                        "query subscription ended before its settled result",
-                    ));
-                }
-            }
-
-            let coverage = if requires_coverage && !relation_subscription_covered {
-                let attachment = inner
-                    .attach_query(&query, opts.clone(), open_tx, author)
-                    .await
-                    .map_err(to_js_error)?;
-                Some(WasmQueryCoverageGuard {
-                    db: inner.clone(),
-                    attachment: Some(attachment),
-                })
-            } else {
-                None
-            };
-            if let Some(coverage) = coverage.as_ref() {
-                let coverage_deadline_ms = js_sys::Date::now() + 15_000.0;
-                futures_util::future::poll_fn(|_| {
-                    if inner.query_attachment_is_covered(
-                        coverage
-                            .attachment
-                            .as_ref()
-                            .expect("live coverage guard must own its attachment"),
-                    ) {
-                        Poll::Ready(Ok(()))
-                    } else if js_sys::Date::now() >= coverage_deadline_ms {
-                        Poll::Ready(Err(JsValue::from_str(
-                            "Timed out waiting for query coverage",
-                        )))
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await?;
-            }
-
-            if let Some(tx_id) = open_tx {
-                if query.shape().query().array_subqueries.is_empty() {
-                    let mut rows = inner
-                        .transaction_rows(tx_id, query, author, opts)
-                        .await
-                        .map_err(to_js_error)?;
-                    if is_relation {
-                        inner
-                            .hydrate_rows_for_binding(&mut rows)
-                            .await
-                            .map_err(to_js_error)?;
-                        let snapshot = jazz::node::RelationSnapshot {
-                            root_count: rows.len(),
-                            rows,
-                            edges: Vec::new(),
-                        };
-                        return encode_relation_snapshot(&snapshot).map_err(to_js_error);
-                    }
-                    return encode_rows(&rows).map_err(to_js_error);
-                }
-                let snapshot = inner
-                    .transaction_relation_snapshot(tx_id, query, author, opts)
-                    .await
-                    .map_err(to_js_error)?;
-                return encode_relation_snapshot(&snapshot).map_err(to_js_error);
-            }
-
-            if is_relation {
-                // Relation programs change the root row set itself (for example,
-                // Union + OrderBy). Execute that prepared program through the
-                // ordinary row path so its occurrence order is retained, then wrap
-                // those roots in the one canonical relation-result envelope.
-                let mut rows = match author {
-                    Some(author) => inner.all_for_identity_async(&query, opts, author).await,
-                    None => inner.all_async(&query, opts).await,
-                }
-                .map_err(to_js_error)?;
-                inner
-                    .hydrate_rows_for_binding(&mut rows)
-                    .await
-                    .map_err(to_js_error)?;
-                let snapshot = jazz::node::RelationSnapshot {
-                    root_count: rows.len(),
-                    rows,
-                    edges: Vec::new(),
-                };
-                return encode_relation_snapshot(&snapshot).map_err(to_js_error);
-            }
-
-            if !query.shape().query().array_subqueries.is_empty() {
-                let mut snapshot = match author {
-                    Some(author) => {
-                        inner
-                            .all_relation_snapshot_for_identity(&query, opts, author)
-                            .await
-                    }
-                    None => inner.all_relation_snapshot(&query, opts).await,
-                }
-                .map_err(to_js_error)?;
-                inner
-                    .hydrate_relation_snapshot_for_binding(&mut snapshot)
-                    .await
-                    .map_err(to_js_error)?;
-                return encode_relation_snapshot(&snapshot).map_err(to_js_error);
-            }
-
-            let mut rows = match author {
-                Some(author) => inner.all_for_identity_async(&query, opts, author).await,
-                None => inner.all_async(&query, opts).await,
-            }
-            .map_err(to_js_error)?;
-            inner
-                .hydrate_rows_for_binding(&mut rows)
+            let result = inner
+                .all_serialized_query(
+                    query,
+                    opts,
+                    open_tx,
+                    admission,
+                    author,
+                    requires_coverage,
+                    js_sys::Date::now() + 15_000.0,
+                )
                 .await
                 .map_err(to_js_error)?;
-            encode_rows(&rows).map_err(to_js_error)
+            match result {
+                SerializedReadResult::Rows(rows) => encode_rows(&rows),
+                SerializedReadResult::Relation(snapshot) => encode_relation_snapshot(&snapshot),
+            }
+            .map_err(to_js_error)
         });
         wasm_read_or_pending(future)
     }
@@ -2198,22 +1806,33 @@ impl WasmDb {
     #[wasm_bindgen(js_name = subscribe)]
     pub fn subscribe(
         &self,
-        query: &WasmPreparedQuery,
+        query: Vec<u8>,
         opts: JsValue,
         author: Option<Vec<u8>>,
+        claims: JsValue,
     ) -> Result<JsValue, JsValue> {
         let opts = read_opts_from_js(opts)?;
+        let has_explicit_author = author.is_some();
         let author = self.read_author(author)?;
+        let admission = if has_explicit_author {
+            author
+                .map(|author| Ok::<_, JsValue>((author, claims_from_js(author, claims)?)))
+                .transpose()?
+        } else {
+            None
+        };
         let db = self.open_inner()?;
-        let query = query.inner.clone();
         let pending = WasmPendingSubscription {
             wake: RefCell::new(None),
             future: RefCell::new(Some(Box::pin(async move {
-                let stream = with_wasm_db!(&db, |db| match author {
-                    Some(author) => db.subscribe_for_identity(&query, opts, author).await,
-                    None => db.subscribe(&query, opts).await,
-                })
-                .map_err(to_js_error)?;
+                let authorization = match author {
+                    Some(author) => SerializedSubscriptionAuthorization::TrustedServing(author),
+                    None => SerializedSubscriptionAuthorization::ClientLocal,
+                };
+                let stream = db
+                    .subscribe_serialized_query(query, opts, admission, authorization)
+                    .await
+                    .map_err(to_js_error)?;
                 subscription_stream_to_js(db, stream)
             }))),
         };
@@ -3169,10 +2788,6 @@ fn decode_public_schema(schema: &[u8]) -> Result<JazzSchema, JsValue> {
     jazz::tools::public_schema_convert::decode_public_schema_json(schema).map_err(to_js_error)
 }
 
-fn relation_query_from_bytes(query_bytes: &[u8]) -> Result<RelationQuery, JsValue> {
-    jazz::query::decode_relation_query_postcard(query_bytes).map_err(to_js_error)
-}
-
 async fn open_db<S>(
     schema: JazzSchema,
     storage: S,
@@ -3562,31 +3177,6 @@ fn encode_rows(rows: &[jazz::node::CurrentRow]) -> Result<Vec<u8>, postcard::Err
     jazz::binding_codec::encode_rows(rows)
 }
 
-/// Synchronous WASM reads cannot suspend for a missing immutable chunk. Until
-/// their API is made asynchronous, fail at the binding boundary instead of
-/// handing a physical `Value::Large` tag to JavaScript's logical row decoder.
-/// Relation reads and subscriptions already use the async materialization path.
-fn encode_synchronous_rows(rows: &[jazz::node::CurrentRow]) -> Result<Vec<u8>, JsValue> {
-    for row in rows {
-        let (descriptor, raw) = row.encoded_record();
-        let values = descriptor.bind(raw).to_values().map_err(to_js_error)?;
-        if values.iter().any(value_contains_indirect_scalar) {
-            return Err(JsValue::from_str(
-                "synchronous WASM all/transaction reads cannot materialize a large value; use an async relation read or subscription instead",
-            ));
-        }
-    }
-    encode_rows(rows).map_err(to_js_error)
-}
-
-fn value_contains_indirect_scalar(value: &Value) -> bool {
-    match value {
-        Value::Large(_) => true,
-        Value::Nullable(Some(value)) => value_contains_indirect_scalar(value),
-        _ => false,
-    }
-}
-
 fn encode_relation_snapshot(
     snapshot: &jazz::node::RelationSnapshot,
 ) -> Result<Vec<u8>, postcard::Error> {
@@ -3768,7 +3358,6 @@ fn subscription_chunk_to_js(event: SubscriptionEvent) -> Result<JsValue, JsValue
     match event {
         SubscriptionEvent::Delta {
             reset,
-            publishable,
             added,
             updated,
             removed,
@@ -3804,7 +3393,6 @@ fn subscription_chunk_to_js(event: SubscriptionEvent) -> Result<JsValue, JsValue
                     .map_err(to_js_error)?,
             )?;
             set_prop(&object, "reset", JsValue::from_bool(reset))?;
-            set_prop(&object, "publishable", JsValue::from_bool(publishable))?;
             set_prop(&object, "settled", JsValue::from_bool(settled))?;
             set_prop(&object, "tier", JsValue::from_str(&format!("{tier:?}")))?;
         }
@@ -4881,14 +4469,20 @@ mod dynamic_schema_view_tests {
             },
         ))
         .unwrap();
-        let prepared = view.prepare_query(&view.table("items")).unwrap();
-        let rows = block_on(WasmDbInner::Memory(Rc::clone(&view)).transaction_rows(
-            batch,
-            prepared,
-            None,
+        let query = postcard::to_allocvec(&view.table("items")).unwrap();
+        let result = block_on(WasmDbInner::Memory(Rc::clone(&view)).all_serialized_query(
+            query,
             ReadOpts::default(),
+            Some(batch),
+            None,
+            None,
+            false,
+            f64::INFINITY,
         ))
         .unwrap();
+        let SerializedReadResult::Rows(rows) = result else {
+            panic!("plain transaction query must return rows")
+        };
         assert_eq!(rows.len(), 1, "the attached view reads staged rows");
         block_on(owner.commit_mergeable_handle(batch)).unwrap();
 
@@ -4969,11 +4563,22 @@ mod dynamic_schema_view_tests {
             )
             .await
             .expect("attached facade preserves the owner batch");
-        let attached_query = view.prepare_query(&view.table("items")).unwrap();
-        let attached_rows = WasmDbInner::Memory(Rc::clone(&view))
-            .transaction_rows(attached_batch, attached_query, None, ReadOpts::default())
+        let attached_query = postcard::to_allocvec(&view.table("items")).unwrap();
+        let attached_result = WasmDbInner::Memory(Rc::clone(&view))
+            .all_serialized_query(
+                attached_query,
+                ReadOpts::default(),
+                Some(attached_batch),
+                None,
+                None,
+                false,
+                f64::INFINITY,
+            )
             .await
             .expect("attached facade reads its staged row");
+        let SerializedReadResult::Rows(attached_rows) = attached_result else {
+            panic!("plain transaction query must return rows")
+        };
         assert_eq!(
             attached_rows.len(),
             1,
@@ -5029,25 +4634,29 @@ mod dynamic_schema_view_tests {
             non_durable_client: Rc::new(Cell::new(false)),
             trusted_backend: false,
         };
-        let view_query = WasmPreparedQuery {
-            inner: view.prepare_query(&view.table("items")).unwrap(),
-            is_relation: false,
-        };
+        let view_query = postcard::to_allocvec(&view.table("items")).expect("encode query");
 
         // The consolidated transaction read owns its pending operation. The
         // view shares its owner's transaction runtime, so every read resolves.
         let all = view_binding
-            .all(&view_query, JsValue::NULL, Some(tx_id.to_string()), None)
+            .all(
+                view_query.clone(),
+                JsValue::NULL,
+                Some(tx_id.to_string()),
+                None,
+                JsValue::UNDEFINED,
+            )
             .expect("create all transaction read");
         resolve_wasm_read(all)
             .await
             .expect("all transaction read resolves");
         let attributed_all = view_binding
             .all(
-                &view_query,
+                view_query,
                 JsValue::NULL,
                 Some(tx_id.to_string()),
                 Some(alice.canonical().as_bytes().to_vec()),
+                JsValue::UNDEFINED,
             )
             .expect("create attributed all transaction read");
         resolve_wasm_read(attributed_all)
@@ -5058,16 +4667,14 @@ mod dynamic_schema_view_tests {
         // caller cannot reuse Alice's transaction capability while asking the
         // runtime to evaluate the read as Bob.
         let bob = AuthorSubject::for_test_bytes([0xb7; 16]);
-        let owner_query = WasmPreparedQuery {
-            inner: owner.prepare_query(&owner.table("items")).unwrap(),
-            is_relation: false,
-        };
+        let owner_query = postcard::to_allocvec(&owner.table("items")).expect("encode query");
         let mismatched_all = binding
             .all(
-                &owner_query,
+                owner_query,
                 JsValue::NULL,
                 Some(tx_id.to_string()),
                 Some(bob.canonical().as_bytes().to_vec()),
+                JsValue::UNDEFINED,
             )
             .expect("identity mismatch is reported by the transaction read");
         let identity_error = resolve_wasm_read(mismatched_all)
