@@ -972,17 +972,7 @@ pub(super) fn physical_version_storage_tables(
 /// `ColumnSchema` by schema lowering; raw cells and public query bindings never
 /// choose it.
 fn physical_storage_value_type(column: &ColumnSchema) -> records::ValueType {
-    match column.large_value_kind {
-        // Text and bytes already have their own contextual scalar codecs at
-        // the Groove logical type boundary. JSON shares String logically, so
-        // only it needs an internal physical descriptor context.
-        crate::schema::LargeValueSemanticKind::Json => {
-            groove::large_values::physical_storage_value_type(
-                groove::large_values::LargeValueKind::Json,
-            )
-        }
-        _ => column.column_type.clone(),
-    }
+    crate::schema::storage_column_type(column)
 }
 
 fn variant_payload_fields_for_names(

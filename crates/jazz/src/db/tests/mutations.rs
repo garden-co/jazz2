@@ -4047,3 +4047,43 @@ fn queued_resident_insert_publishes_subscription_in_one_admission_turn() {
     assert_eq!(added.len(), 1);
     assert_eq!(added[0].row.row_uuid(), write.row_uuid());
 }
+
+/// Alice inserts, populates, and clears an optional JSON cell. SQL null must
+/// remain distinct from a JSON document whose contents are the literal null.
+#[test]
+fn nullable_json_round_trips_null_and_populated_cells() {
+    let schema = build_public_db_test_schema(
+        PublicSchemaBuilder::new().table(
+            PublicTableSchemaBuilder::new("documents")
+                .nullable_column("metadata", PublicColumnType::Json { schema: None }),
+        ),
+    );
+    let db = open_db(0x6d, AuthorSubject::SYSTEM, &schema);
+    let inserted = db
+        .insert(
+            "documents",
+            BTreeMap::from([("metadata".to_owned(), Value::Nullable(None))]),
+            Default::default(),
+        )
+        .unwrap()
+        .row_uuid();
+    let query = db.prepare_query(&db.table("documents")).unwrap();
+    let values = [
+        Value::Nullable(None),
+        Value::Nullable(Some(Box::new(Value::String("{\"answer\":42}".into())))),
+        Value::Nullable(None),
+        Value::Nullable(Some(Box::new(Value::String("null".into())))),
+    ];
+    for value in values {
+        db.update(
+            "documents",
+            inserted,
+            BTreeMap::from([("metadata".to_owned(), value.clone())]),
+            Default::default(),
+        )
+        .unwrap();
+        let rows = db.read(&query).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cell(&schema.tables[0], "metadata"), Some(value));
+    }
+}

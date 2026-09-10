@@ -283,6 +283,14 @@ new durable storage encoding or compatibility fallback.
 inline/indirect records. Rust checks exact bytes, decoded values, roundtrips,
 and rejection of the old descriptor before storage.
 
+Optional JSON columns additionally retain their column-level nullable wrapper
+inside the version record's independent authored/omitted wrapper (#2733).
+`fixtures/nullable_json_wire_v1.json` pins distinct bytes for an omitted cell,
+SQL null, JSON literal null, and a populated object using the existing v1 codecs.
+This pre-freeze descriptor correction requires matching peers and fresh data
+for affected optional JSON schemas; it does not add a legacy decoding fallback.
+The non-nullable JSON corpus remains unchanged.
+
 The wire-protocol v1 frozen corpora are `crates/jazz/fixtures/wire_message_frames.json` and
 `crates/jazz/fixtures/wire_hello_frames.json`:
 Rust independently decodes every hard-coded frame, re-encodes the semantic

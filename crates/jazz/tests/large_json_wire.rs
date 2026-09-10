@@ -123,3 +123,79 @@ fn json_version_records_freeze_inline_and_indirect_semantics() {
         "schema admission rejects the old inline JSON descriptor"
     );
 }
+
+/// Alice's explicit SQL null, JSON literal null, and omitted update have distinct
+/// version-record bytes for Bob. The descriptor names the existing v1 nullable
+/// and stored-JSON codecs; no new scalar tag or implicit serializer is introduced.
+#[test]
+fn nullable_json_version_records_preserve_presence_and_nullability() {
+    let schema = JazzSchema::new(
+        &SchemaBuilder::new()
+            .table(
+                TableSchemaBuilder::new("documents")
+                    .nullable_column("payload", ColumnType::Json { schema: None }),
+            )
+            .build(),
+    )
+    .unwrap();
+    let table = &schema.tables[0];
+    let author = AuthorSubject::for_test_bytes([0x33; 16]);
+    let values = [
+        ("omitted", None),
+        ("sql_null", Some(Value::Nullable(None))),
+        (
+            "json_null",
+            Some(Value::Nullable(Some(Box::new(Value::String(
+                "null".into(),
+            ))))),
+        ),
+        (
+            "object",
+            Some(Value::Nullable(Some(Box::new(Value::String(
+                "{\"answer\":42}".into(),
+            ))))),
+        ),
+    ];
+    let mut corpus = serde_json::Map::new();
+    for (name, value) in values {
+        let record = VersionRecord::encode(
+            table,
+            SchemaVersionId::from_bytes([0x22; 16]),
+            RowUuid::from_bytes([0x44; 16]),
+            vec![],
+            author,
+            7,
+            author,
+            8,
+            &[value.clone()],
+            None,
+        )
+        .unwrap();
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        let decoded: VersionRecord = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.record().descriptor(),
+            &table.wire_record_descriptor()
+        );
+        assert_eq!(
+            decoded.record().borrowed().get("_app_payload").unwrap(),
+            Value::Nullable(value.map(Box::new)),
+        );
+        assert_eq!(postcard::to_allocvec(&decoded).unwrap(), bytes);
+        corpus.insert(name.into(), hex(&bytes).into());
+    }
+    if std::env::var_os("JAZZ_UPDATE_WIRE_FIXTURES").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fixtures/nullable_json_wire_v1.json"
+            ),
+            serde_json::to_string_pretty(&corpus).unwrap() + "\n",
+        )
+        .unwrap();
+    } else {
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/nullable_json_wire_v1.json")).unwrap();
+        assert_eq!(serde_json::Value::Object(corpus), expected);
+    }
+}

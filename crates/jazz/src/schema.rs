@@ -881,9 +881,18 @@ fn large_value_kind_for_type(column_type: &GrooveColumnType) -> LargeValueSemant
 /// JSON descriptor cannot be mistaken for text.
 pub(crate) fn storage_column_type(column: &ColumnSchema) -> GrooveColumnType {
     match column.large_value_kind {
-        LargeValueSemanticKind::Json => groove::large_values::physical_storage_value_type(
-            groove::large_values::LargeValueKind::Json,
-        ),
+        LargeValueSemanticKind::Json => {
+            let physical = groove::large_values::physical_storage_value_type(
+                groove::large_values::LargeValueKind::Json,
+            );
+            // Column nullability is distinct from the enclosing version record's
+            // "this column was authored" nullable slot. Keep both wrappers.
+            if matches!(column.column_type, GrooveColumnType::Nullable(_)) {
+                physical.nullable()
+            } else {
+                physical
+            }
+        }
         _ => column.column_type.clone(),
     }
 }
