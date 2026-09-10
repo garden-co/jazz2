@@ -126,13 +126,14 @@ fn lower_correlated_path_plan(
                 parent_key_nullable_depth,
             );
             let (parent_keys, child_keys) =
-                correlation_keys_with_routes(parent_key, child_key, &shared_route_fields);
+                correlation_keys_with_routes(parent_key.clone(), child_key, &shared_route_fields);
             Ok(LoweredRelationInput {
-                graph: GraphBuilder::semi_join(parent, child_graph, parent_keys, child_keys)
-                    .project_fields(project_source_fields_with_routes(
-                        root_source,
-                        &root_source.routing_fields,
-                    )),
+                graph: restore_correlation_parent_shape(
+                    GraphBuilder::semi_join(parent, child_graph, parent_keys, child_keys),
+                    root_source,
+                    &parent_key,
+                    parent_key_nullable_depth,
+                ),
                 root_source: Some(root_source.clone()),
                 fields: source_fields(root_source).collect(),
                 nullable_fields: source_nullable_fields(root_source),
@@ -150,12 +151,17 @@ fn lower_correlated_path_plan(
                 parent,
                 child_graph,
                 root_source,
-                parent_key,
+                parent_key.clone(),
                 child_key,
                 &shared_route_fields,
             )
             .map(|graph| LoweredRelationInput {
-                graph,
+                graph: restore_correlation_parent_shape(
+                    graph,
+                    root_source,
+                    &parent_key,
+                    parent_key_nullable_depth,
+                ),
                 root_source: Some(root_source.clone()),
                 fields: source_fields(root_source).collect(),
                 nullable_fields: source_nullable_fields(root_source),
@@ -197,6 +203,33 @@ fn lower_required_nested_parent_graph(
                 .graph;
     }
     Ok(parent)
+}
+
+/// Required-match joins unwrap nullable keys to reject null correlations. Their
+/// output still represents the original parent row, including its field identity,
+/// routing carriers, and every nullable wrapper expected by collector union arms.
+fn restore_correlation_parent_shape(
+    mut graph: GraphBuilder,
+    source: &ResolvedSource,
+    key: &str,
+    nullable_depth: usize,
+) -> GraphBuilder {
+    if nullable_depth == 0 {
+        return graph.project_fields(project_source_fields_with_routes(
+            source,
+            &source.routing_fields,
+        ));
+    }
+    for _ in 0..nullable_depth {
+        let mut fields = project_source_fields_with_routes(source, &source.routing_fields);
+        for field in &mut fields {
+            if field.output_name == key {
+                field.expression = groove::ivm::ProjectExpr::Nullable(FieldRef::stored_name(key));
+            }
+        }
+        graph = graph.project_fields(fields);
+    }
+    graph
 }
 
 fn correlation_keys_with_routes(

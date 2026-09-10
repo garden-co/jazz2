@@ -3371,3 +3371,95 @@ fn prepared_request_claim_presence_keeps_policy_branches_isolated() {
     block_on(denied.close()).unwrap();
     block_on(admitted.close()).unwrap();
 }
+
+/// Alice requires an optional detail and its optional leaf. Required filtering
+/// must preserve nullable parent cells in both empty and populated collectors.
+#[test]
+fn required_nested_nullable_includes_preserve_parent_descriptors() {
+    use crate::query::ArraySubqueryRequirement;
+    for requirement in [
+        ArraySubqueryRequirement::AtLeastOne,
+        ArraySubqueryRequirement::MatchCorrelationCardinality,
+    ] {
+        let schema = build_public_db_test_schema(
+            PublicSchemaBuilder::new()
+                .table(
+                    PublicTableSchemaBuilder::new("roots")
+                        .nullable_fk_column("detailId", "details"),
+                )
+                .table(
+                    PublicTableSchemaBuilder::new("details").nullable_fk_column("leafId", "leaves"),
+                )
+                .table(
+                    PublicTableSchemaBuilder::new("leaves").column("name", PublicColumnType::Text),
+                ),
+        );
+        let db = open_db(0xd7, AuthorSubject::SYSTEM, &schema);
+        let query = Query::from("roots").array_subquery(
+            ArraySubquery::new("detail", "details", "id", "detailId")
+                .requirement(requirement)
+                .nested(
+                    ArraySubquery::new("leaf", "leaves", "id", "leafId").requirement(requirement),
+                ),
+        );
+        let prepared = db.prepare_query(&query).unwrap();
+        let empty = block_on(db.all_relation_snapshot(&prepared, ReadOpts::default())).unwrap();
+        assert!(empty.rows.is_empty());
+        let leaf = db
+            .insert(
+                "leaves",
+                BTreeMap::from([("name".into(), Value::String("Alice".into()))]),
+                Default::default(),
+            )
+            .unwrap()
+            .row_uuid();
+        let optional_ref =
+            |id: Option<RowUuid>| Value::Nullable(id.map(|id| Box::new(Value::Uuid(id.0))));
+        let detail = db
+            .insert(
+                "details",
+                BTreeMap::from([("leafId".into(), optional_ref(Some(leaf)))]),
+                Default::default(),
+            )
+            .unwrap()
+            .row_uuid();
+        let root = db
+            .insert(
+                "roots",
+                BTreeMap::from([("detailId".into(), optional_ref(Some(detail)))]),
+                Default::default(),
+            )
+            .unwrap()
+            .row_uuid();
+        db.insert(
+            "roots",
+            BTreeMap::from([("detailId".into(), optional_ref(None))]),
+            Default::default(),
+        )
+        .unwrap();
+        let snapshot = block_on(db.all_relation_snapshot(&prepared, ReadOpts::default())).unwrap();
+        assert_eq!(row_ids(&snapshot.rows), vec![root]);
+        let root_table = schema
+            .tables
+            .iter()
+            .find(|table| table.name == "roots")
+            .unwrap();
+        assert_eq!(
+            snapshot.rows[0].cell(root_table, "detailId"),
+            Some(optional_ref(Some(detail)))
+        );
+        assert_eq!(
+            terminal_nested_values(&snapshot, root, "detail", "row_uuid"),
+            vec![Value::Uuid(detail.0)]
+        );
+        db.update(
+            "details",
+            detail,
+            BTreeMap::from([("leafId".into(), optional_ref(None))]),
+            Default::default(),
+        )
+        .unwrap();
+        let removed = block_on(db.all_relation_snapshot(&prepared, ReadOpts::default())).unwrap();
+        assert!(removed.rows.is_empty());
+    }
+}
