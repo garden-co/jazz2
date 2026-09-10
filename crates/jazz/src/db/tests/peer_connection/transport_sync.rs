@@ -1153,6 +1153,401 @@ fn default_current_subscription_reconciles_deletion_witness_without_reset() {
 }
 
 #[test]
+fn default_local_subscription_reconciles_deletion_witness_without_reset() {
+    let schema = schema();
+    let owner = AuthorSubject::for_test_bytes([0x50; 16]);
+    let client_author = AuthorSubject::for_test_bytes([0x51; 16]);
+    let server = open_core(0x52, AuthorSubject::SYSTEM, &schema);
+    let client = open_db(0x53, client_author, &schema);
+    let current_row = RowUuid::from_bytes([0x54; 16]);
+    server
+        .insert_with_id("todos", current_row, cells("current", false, owner))
+        .unwrap();
+    let survivor = RowUuid::from_bytes([0x55; 16]);
+    server
+        .insert_with_id("todos", survivor, cells("survivor", false, owner))
+        .unwrap();
+    let query = Query::from("todos");
+    let current_view = ReadViewSpec::default();
+    assert_eq!(
+        row_ids(&serving_rows_in_read_view(
+            &server,
+            &schema,
+            &query,
+            client_author,
+            &current_view,
+        )),
+        vec![current_row, survivor]
+    );
+
+    let (client_transport, server_transport) = duplex();
+    let _upstream = crate::db::block_on(client.connect_upstream(client_transport));
+    let _subscriber = server.accept_subscriber(server_transport, client_author);
+    let mut subscription = prepared_subscribe(&client, &query, ReadOpts::default()).unwrap();
+    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+
+    let mut snapshot = RelationSnapshot::default();
+    for _ in 0..10 {
+        client.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            apply_subscription_event(&mut snapshot, event);
+        }
+        if row_ids(&snapshot.rows) == vec![current_row, survivor] {
+            break;
+        }
+    }
+    assert_eq!(row_ids(&snapshot.rows), vec![current_row, survivor]);
+
+    write_deletion_register(&server, "todos", current_row, BranchSelector::default());
+    let mut saw_removal = false;
+    for _ in 0..10 {
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            match &event {
+                SubscriptionEvent::Delta {
+                    reset,
+                    added,
+                    removed,
+                    ..
+                } => {
+                    assert!(!reset, "deletion-witness reconcile must remain a delta");
+                    assert!(
+                        added.is_empty(),
+                        "default/current deletion reconcile must not add rows"
+                    );
+                    saw_removal |= removed
+                        .iter()
+                        .any(|removed| removed.row_uuid == current_row);
+                }
+                SubscriptionEvent::Rejected { reason } => {
+                    panic!("default/current subscription was rejected: {reason:?}")
+                }
+                SubscriptionEvent::Closed => panic!("default/current subscription closed"),
+            }
+            apply_subscription_event(&mut snapshot, event);
+            assert!(
+                row_ids(&snapshot.rows).contains(&survivor),
+                "every post-delete snapshot must retain the survivor"
+            );
+        }
+        if saw_removal {
+            break;
+        }
+    }
+    assert!(
+        saw_removal,
+        "default/current reconcile must remove the deleted row"
+    );
+    assert_eq!(row_ids(&snapshot.rows), vec![survivor]);
+    let fresh = serving_rows_in_read_view(&server, &schema, &query, client_author, &current_view);
+    assert_eq!(row_ids(&snapshot.rows), row_ids(&fresh));
+}
+
+#[test]
+fn owner_local_subscription_reconciles_peer_delete_without_reset() {
+    let policy = public_session_eq("owner", &["claims", "sub"]);
+    let schema = build_public_db_test_schema(
+        PublicSchemaBuilder::new().table(
+            PublicTableSchemaBuilder::new("todos")
+                .column("title", PublicColumnType::Text)
+                .column("done", PublicColumnType::Boolean)
+                .column("owner", PublicColumnType::Uuid)
+                .policies(public_legacy_write_policy(policy.clone()).with_select(policy)),
+        ),
+    );
+    let owner = AuthorSubject::for_test_bytes([0x50; 16]);
+    let client_author = owner;
+    let server = open_core(0x52, AuthorSubject::SYSTEM, &schema);
+    server.server.enable_authoritative_scalar_exit_refresh();
+    server
+        .node()
+        .borrow_mut()
+        .set_test_provider_claims(owner, test_provider_claims(owner));
+    let writer = open_db(0x56, owner, &schema);
+    let (writer_up, writer_down) = duplex();
+    let _writer_up = block_on(writer.connect_upstream(writer_up));
+    let _writer_down = server.accept_subscriber(writer_down, owner);
+    let client = open_db(0x53, client_author, &schema);
+    let current_row = RowUuid::from_bytes([0x54; 16]);
+    server
+        .insert_with_id("todos", current_row, cells("current", false, owner))
+        .unwrap();
+    let survivor = RowUuid::from_bytes([0x55; 16]);
+    server
+        .insert_with_id("todos", survivor, cells("survivor", false, owner))
+        .unwrap();
+    let query = Query::from("todos");
+    let current_view = ReadViewSpec::default();
+    assert_eq!(
+        row_ids(&serving_rows_in_read_view(
+            &server,
+            &schema,
+            &query,
+            client_author,
+            &current_view,
+        )),
+        vec![current_row, survivor]
+    );
+
+    let (client_transport, server_transport) = duplex();
+    let _upstream = crate::db::block_on(client.connect_upstream(client_transport));
+    let _subscriber = server.accept_subscriber(server_transport, client_author);
+    let mut subscription = prepared_subscribe(&client, &query, ReadOpts::default()).unwrap();
+    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+
+    let mut snapshot = RelationSnapshot::default();
+    for _ in 0..10 {
+        client.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            apply_subscription_event(&mut snapshot, event);
+        }
+        if row_ids(&snapshot.rows) == vec![current_row, survivor] {
+            break;
+        }
+    }
+    assert_eq!(row_ids(&snapshot.rows), vec![current_row, survivor]);
+
+    let mut writer_stream = prepared_subscribe(&writer, &query, ReadOpts::default()).unwrap();
+    let mut writer_snapshot = RelationSnapshot::default();
+    for _ in 0..32 {
+        writer.tick().unwrap();
+        server.tick().unwrap();
+        writer.tick().unwrap();
+        while let Some(event) = writer_stream.try_next_event() {
+            apply_subscription_event(&mut writer_snapshot, event);
+        }
+        if row_ids(&writer_snapshot.rows) == vec![current_row, survivor] {
+            break;
+        }
+    }
+    assert_eq!(row_ids(&writer_snapshot.rows), vec![current_row, survivor]);
+    writer
+        .delete("todos", current_row, Default::default())
+        .unwrap();
+    let mut saw_removal = false;
+    for _ in 0..32 {
+        writer.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            match &event {
+                SubscriptionEvent::Delta {
+                    reset,
+                    added,
+                    removed,
+                    ..
+                } => {
+                    assert!(!reset, "deletion-witness reconcile must remain a delta");
+                    assert!(
+                        added.is_empty(),
+                        "default/current deletion reconcile must not add rows"
+                    );
+                    saw_removal |= removed
+                        .iter()
+                        .any(|removed| removed.row_uuid == current_row);
+                }
+                SubscriptionEvent::Rejected { reason } => {
+                    panic!("default/current subscription was rejected: {reason:?}")
+                }
+                SubscriptionEvent::Closed => panic!("default/current subscription closed"),
+            }
+            apply_subscription_event(&mut snapshot, event);
+            assert!(
+                row_ids(&snapshot.rows).contains(&survivor),
+                "every post-delete snapshot must retain the survivor"
+            );
+        }
+        if saw_removal {
+            break;
+        }
+    }
+    assert!(
+        saw_removal,
+        "default/current reconcile must remove the deleted row"
+    );
+    assert_eq!(row_ids(&snapshot.rows), vec![survivor]);
+    let fresh = serving_rows_in_read_view(&server, &schema, &query, client_author, &current_view);
+    assert_eq!(row_ids(&snapshot.rows), row_ids(&fresh));
+}
+
+#[test]
+fn account_owned_local_subscription_reconciles_peer_delete_without_reset() {
+    assert_account_owned_subscription_reconciles_peer_delete(ReadOpts::default());
+}
+
+#[test]
+fn account_owned_branch_subscription_reconciles_peer_delete_without_reset() {
+    assert_account_owned_subscription_reconciles_peer_delete(
+        ReadOpts::default().branch_view(BranchSelector::default(), None),
+    );
+}
+
+fn assert_account_owned_subscription_reconciles_peer_delete(opts: ReadOpts) {
+    let policy = public_session_eq("$createdBy.account", &["user", "account"]);
+    let schema = build_public_db_test_schema(
+        PublicSchemaBuilder::new().table(
+            PublicTableSchemaBuilder::new("todos")
+                .column("title", PublicColumnType::Text)
+                .column("done", PublicColumnType::Boolean)
+                .column("owner", PublicColumnType::Uuid)
+                .policies(public_legacy_write_policy(policy.clone()).with_select(policy)),
+        ),
+    );
+    let owner = AuthorSubject::for_test_bytes([0x50; 16]);
+    let client_author = owner;
+    let server = open_core(0x52, owner, &schema);
+    server.server.enable_authoritative_scalar_exit_refresh();
+    server
+        .node()
+        .borrow_mut()
+        .set_test_provider_claims(owner, test_provider_claims(owner));
+    let writer = open_db(0x56, owner, &schema);
+    let (writer_up, writer_down) = duplex();
+    let _writer_up = block_on(writer.connect_upstream(writer_up));
+    let _writer_down = server.accept_subscriber(writer_down, owner);
+    let client = open_db(0x53, client_author, &schema);
+    let current_row = RowUuid::from_bytes([0x54; 16]);
+    server
+        .insert_with_id("todos", current_row, cells("current", false, owner))
+        .unwrap();
+    let survivor = RowUuid::from_bytes([0x55; 16]);
+    server
+        .insert_with_id("todos", survivor, cells("survivor", false, owner))
+        .unwrap();
+    let query = Query::from("todos");
+    let current_view = opts.read_view.clone();
+    assert_eq!(
+        row_ids(&serving_rows_in_read_view(
+            &server,
+            &schema,
+            &query,
+            client_author,
+            &current_view,
+        )),
+        vec![current_row, survivor]
+    );
+
+    let (client_transport, server_transport) = duplex();
+    let _upstream = crate::db::block_on(client.connect_upstream(client_transport));
+    let _subscriber = server.accept_subscriber(server_transport, client_author);
+    let mut subscription = prepared_subscribe(&client, &query, opts.clone()).unwrap();
+    assert!(opened_rows(block_on(subscription.next_raw()).unwrap()).is_empty());
+
+    let mut snapshot = RelationSnapshot::default();
+    for _ in 0..10 {
+        client.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            apply_subscription_event(&mut snapshot, event);
+        }
+        if row_ids(&snapshot.rows) == vec![current_row, survivor] {
+            break;
+        }
+    }
+    assert_eq!(row_ids(&snapshot.rows), vec![current_row, survivor]);
+
+    let mut writer_stream = prepared_subscribe(&writer, &query, opts).unwrap();
+    let mut writer_snapshot = RelationSnapshot::default();
+    for _ in 0..32 {
+        writer.tick().unwrap();
+        server.tick().unwrap();
+        writer.tick().unwrap();
+        while let Some(event) = writer_stream.try_next_event() {
+            apply_subscription_event(&mut writer_snapshot, event);
+        }
+        if row_ids(&writer_snapshot.rows) == vec![current_row, survivor] {
+            break;
+        }
+    }
+    assert_eq!(row_ids(&writer_snapshot.rows), vec![current_row, survivor]);
+    writer
+        .update(
+            "todos",
+            current_row,
+            BTreeMap::from([("done".to_owned(), Value::Bool(true))]),
+            Default::default(),
+        )
+        .unwrap();
+    for _ in 0..32 {
+        writer.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            apply_subscription_event(&mut snapshot, event);
+        }
+    }
+    assert_eq!(
+        snapshot
+            .rows
+            .iter()
+            .find(|row| row.row_uuid() == current_row)
+            .unwrap()
+            .application_field("done"),
+        Some(Value::Nullable(Some(Box::new(Value::Bool(true)))))
+    );
+    let survivor_before = snapshot
+        .rows
+        .iter()
+        .find(|row| row.row_uuid() == survivor)
+        .unwrap()
+        .clone();
+    writer
+        .delete("todos", current_row, Default::default())
+        .unwrap();
+    let mut saw_removal = false;
+    for _ in 0..32 {
+        writer.tick().unwrap();
+        server.tick().unwrap();
+        client.tick().unwrap();
+        while let Some(event) = subscription.try_next_event() {
+            match &event {
+                SubscriptionEvent::Delta {
+                    reset,
+                    added,
+                    removed,
+                    ..
+                } => {
+                    assert!(!reset, "deletion-witness reconcile must remain a delta");
+                    assert!(
+                        added.is_empty(),
+                        "default/current deletion reconcile must not add rows"
+                    );
+                    saw_removal |= removed
+                        .iter()
+                        .any(|removed| removed.row_uuid == current_row);
+                }
+                SubscriptionEvent::Rejected { reason } => {
+                    panic!("default/current subscription was rejected: {reason:?}")
+                }
+                SubscriptionEvent::Closed => panic!("default/current subscription closed"),
+            }
+            apply_subscription_event(&mut snapshot, event);
+            assert_eq!(
+                snapshot.rows.iter().find(|row| row.row_uuid() == survivor),
+                Some(&survivor_before),
+                "every post-delete snapshot must retain the exact survivor"
+            );
+        }
+        if saw_removal {
+            break;
+        }
+    }
+    assert!(
+        saw_removal,
+        "default/current reconcile must remove the deleted row"
+    );
+    assert_eq!(row_ids(&snapshot.rows), vec![survivor]);
+    let fresh = serving_rows_in_read_view(&server, &schema, &query, client_author, &current_view);
+    assert_eq!(row_ids(&snapshot.rows), row_ids(&fresh));
+}
+
+#[test]
 fn delayed_row_repair_does_not_replace_a_newer_supporting_snapshot() {
     // INV-SYNC-46: exercise the complete-snapshot receiver contract.
     let schema = schema();

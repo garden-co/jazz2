@@ -502,15 +502,22 @@ where
                             .graph
                     }
                 };
+                let (graph, descriptor, metadata) = with_requested_author_paths(
+                    graph,
+                    include_deleted_current_row_descriptor(&table),
+                    BTreeMap::new(),
+                    &request.requirements,
+                )
+                .map_err(|_| source_resolution_error(request, SourceGap::Coverage))?;
                 return Ok(ResolvedSource {
                     stored_column_ids: self.stored_column_ids_for_read_table(request, &table)?,
                     table_schema: table.clone(),
                     graph,
                     row_shape: SourceRowShape {
                         source: request.source.clone(),
-                        descriptor: include_deleted_current_row_descriptor(&table),
+                        descriptor,
                         row_uuid_field: "row_uuid".to_owned(),
-                        metadata: BTreeMap::new(),
+                        metadata,
                     },
                     routing_fields: BTreeSet::new(),
                     requires_result_payload: false,
@@ -1588,6 +1595,15 @@ where
             )
             .map_err(|error| source_resolution_error_from_policy_proof(request, error))?
         };
+        // Own pending deletions carry only winner coordinates and need no
+        // read-policy proof. Never manufacture author data for that overlay.
+        let (graph, descriptor, metadata) =
+            if request.visibility == RowVisibility::IncludeDeleted && !pending_overlay {
+                with_requested_author_paths(graph, descriptor, metadata, &request.requirements)
+                    .map_err(|_| source_resolution_error(request, SourceGap::Coverage))?
+            } else {
+                (graph, descriptor, metadata)
+            };
         let deletion_register = if snapshot_source {
             // The snapshot is immutable and already excludes rows whose
             // deletion winner is visible at its cut. It cannot later need a
@@ -3520,6 +3536,64 @@ pub(super) fn trace_capability_compile(
         "backtrace:\n{}",
         std::backtrace::Backtrace::force_capture()
     );
+}
+
+/// Expose requested nested-author fields on policy preimages that retain
+/// complete author records, including head-over-current branch preimages.
+fn with_requested_author_paths(
+    graph: GraphBuilder,
+    descriptor: RecordDescriptor,
+    mut metadata: BTreeMap<SourceMetadataRequirement, SourceMetadataFields>,
+    requirements: &SourceRequirements,
+) -> Result<
+    (
+        GraphBuilder,
+        RecordDescriptor,
+        BTreeMap<SourceMetadataRequirement, SourceMetadataFields>,
+    ),
+    Error,
+> {
+    let missing = requirements
+        .metadata
+        .iter()
+        .filter_map(|requirement| match requirement {
+            SourceMetadataRequirement::AuthorPath(name) if !metadata.contains_key(requirement) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok((graph, descriptor, metadata));
+    }
+    let mut fields = descriptor.fields().to_vec();
+    let mut projection = descriptor_field_names(&descriptor)?
+        .into_iter()
+        .map(ProjectField::named)
+        .collect::<Vec<_>>();
+    for name in missing {
+        let (root, path) = AuthorSubject::metadata_path(&name).expect("validated author path");
+        projection.push(ProjectField::record_field(
+            root,
+            path.iter().copied(),
+            name.clone(),
+        ));
+        fields.push(records::DescriptorField::new(
+            name.clone(),
+            AuthorSubject::metadata_type(&name)
+                .expect("validated author path")
+                .clone(),
+        ));
+        metadata.insert(
+            SourceMetadataRequirement::AuthorPath(name.clone()),
+            SourceMetadataFields::Provenance { field: name },
+        );
+    }
+    Ok((
+        graph.project_fields(projection),
+        RecordDescriptor::new_with_fields(fields),
+        metadata,
+    ))
 }
 
 fn resolved_current_source_graph<S>(

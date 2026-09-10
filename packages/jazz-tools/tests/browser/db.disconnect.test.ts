@@ -128,6 +128,83 @@ describe("Db disconnect/reconnect", () => {
     60_000,
   );
 
+  it("removes a remotely deleted owned row from the current default local worker snapshot", async () => {
+    const label = uniqueDbName("local-worker-live-delete");
+    const server = await getJazzServerInfo(label);
+    await deploy({
+      ...server,
+      schema: app,
+      permissions: s.definePermissions(app, ({ policy, session }) => {
+        policy.todos.allowRead.where({ "$createdBy.account": session.user.account });
+        policy.todos.allowInsert.always();
+        policy.todos.allowUpdate.where({ "$createdBy.account": session.user.account });
+        policy.todos.allowDelete.where({ "$createdBy.account": session.user.account });
+      }),
+    });
+    const secret = generateAuthSecret();
+    const db = await createWorkerDb(ctx, `${label}-reader`, secret, server);
+    const peer = await createWorkerDb(ctx, `${label}-writer`, secret, server);
+    let current: Todo[] = [];
+    let preserveSurvivor = false;
+    const subsequentSnapshots: Todo[][] = [];
+    ctx.trackSubscription(
+      db.subscribe(todos, (rows) => {
+        current = rows;
+        if (preserveSurvivor) subsequentSnapshots.push(rows);
+      }),
+    );
+    const row = await db.insert(todos, { title: label, done: false }).wait({ tier: "global" });
+    const survivor = await db
+      .insert(todos, { title: `${label}-survivor`, done: false })
+      .wait({ tier: "global" });
+    await waitForCondition(
+      async () => current.some((item) => item.id === row.id),
+      SYNC_OPERATION_TIMEOUT_MS,
+      "reader must first show the row",
+    );
+    let peerCurrent: Todo[] = [];
+    ctx.trackSubscription(
+      peer.subscribe(todos, (rows) => {
+        peerCurrent = rows;
+      }),
+    );
+    await waitForCondition(
+      async () =>
+        peerCurrent.some((item) => item.id === row.id) &&
+        peerCurrent.some((item) => item.id === survivor.id),
+      SYNC_OPERATION_TIMEOUT_MS,
+      "writer must hydrate both rows through default local query",
+    );
+    await peer.update(todos, row.id, { done: true }).wait({ tier: "global" });
+    await waitForCondition(
+      async () =>
+        current.some((item) => item.id === row.id && item.title === label && item.done) &&
+        current.some(
+          (item) => item.id === survivor.id && item.title === `${label}-survivor` && !item.done,
+        ),
+      SYNC_OPERATION_TIMEOUT_MS,
+      "reader must see the remote update before deletion",
+    );
+    preserveSurvivor = true;
+    await peer.delete(todos, row.id).wait({ tier: "global" });
+    await waitForCondition(
+      async () =>
+        !current.some((item) => item.id === row.id) &&
+        current.some(
+          (item) => item.id === survivor.id && item.title === `${label}-survivor` && !item.done,
+        ),
+      SYNC_OPERATION_TIMEOUT_MS,
+      "current local subscription must remove target and preserve survivor",
+    );
+    expect(subsequentSnapshots.length).toBeGreaterThan(0);
+    for (const rows of subsequentSnapshots) {
+      expect(rows.find((item) => item.id === survivor.id)).toMatchObject({
+        title: `${label}-survivor`,
+        done: false,
+      });
+    }
+  }, 60_000);
+
   describe("server-backed subscriptions", () => {
     it.each(["edge", "global"] as const)(
       "keeps a disconnected %s subscription pending, then hydrates its local write",
